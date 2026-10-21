@@ -36,6 +36,12 @@ the updater reads a stable address and the download page needs no GitHub API cal
 `download/update.json` there, downloads the new exe, checks its signature, replaces itself and
 restarts (`src-tauri/src/selfupdate.rs`).
 
+On Linux, updates come from the signed Flatpak repository https://shu-app.com/flatpak/repo/,
+shared with Atelier: release.sh then runs `flatpak/publish.sh` from Shhu/shhu.github.io (cloned
+to `~/dev/shu-app`), which imports the latest bundle of each app and signs the repository with
+the key in `~/.tauri/shu-flatpak-gpg`. Users install with
+`flatpak install --user https://shu-app.com/flatpak/facteur.flatpakref`.
+
 The APK is signed with `~/.tauri/facteur-android.jks` (settings in
 `~/.tauri/facteur-android.properties`).
 

@@ -117,6 +117,6 @@ What remains to be done, by theme. Decisions already made are noted under each i
   `shu-app.com` means verifying that domain in Search Console and a new brand verification.
 - Public since 0.8.1 (fresh history, 2026-10-21). Left: `contacts.readonly` on the Google
   consent screen.
-- Flathub: app id `com.shu_app.facteur`, offline build ready (`scripts/flatpak-sources.sh`,
-  `scripts/flathub-manifest.sh`); submit the manifest to github.com/flathub/flathub, then verify
-  the app on shu-app.com. Then the site's Linux section points to Flathub.
+- Linux: signed Flatpak repository on shu-app.com, shared with Atelier (`flatpak/publish.sh` in
+  Shhu/shhu.github.io, run by release.sh; key in `~/.tauri/shu-flatpak-gpg`). Flathub set aside:
+  its rules exclude AI-written manifests and submissions, and young projects.

@@ -208,8 +208,13 @@ notes_args=(--notes "facteur $version")
 [[ -n "$notes" ]] && notes_args=(--notes-file "$notes")
 gh release create "$tag" "$out"/* --title "facteur $version" "${notes_args[@]}"
 stage=published
+# The shu-app.com Flatpak repository (facteur and Atelier), rebuilt from the latest releases.
+shared="$HOME/dev/shu-app/flatpak/publish.sh"
+if [[ -x "$shared" ]]; then
+  "$shared" || echo "Flatpak repository not updated: run $shared again" >&2
+else
+  echo "Flatpak repository not updated: $shared missing (clone Shhu/shhu.github.io to ~/dev/shu-app)" >&2
+fi
 echo
 echo "Release $tag published; the website copies its files within a few minutes:"
 echo "  https://shu-app.com/facteur/"
-echo
-echo "Flathub: scripts/flathub-manifest.sh $tag, then copy target/flathub/* into the flathub/com.shu_app.facteur repository"
