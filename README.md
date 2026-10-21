@@ -26,8 +26,10 @@ scripts/release.sh 0.3.0 --android          # + the signed Android APK
 
 Everything is built locally. The script bumps the version, builds `facteur.exe`, signs it with the
 update key (`~/.tauri/facteur.key` and its password `~/.tauri/facteur.key.password`, outside the
-repository), builds the Flatpak bundle (`scripts/build-flatpak.sh`: needs `flatpak-builder`, the
-GNOME SDK and the `rust-stable` extension it names), writes `update.json`, then commits, tags
+repository), builds the Flatpak bundle offline as Flathub does (`scripts/flatpak-sources.sh` lists
+the crates and pnpm packages from the lockfiles, then `scripts/build-flatpak.sh`: needs
+`flatpak-builder`, the GNOME SDK and the `rust-stable` and `node24` extensions it names), writes
+`update.json`, then commits, tags
 `vX.Y.Z`, pushes and creates the release with `gh`. The `.github/workflows/pages.yml` workflow
 (no compilation) copies the latest release's files to https://shu-app.com/facteur/, so that
 the updater reads a stable address and the download page needs no GitHub API call. The exe reads

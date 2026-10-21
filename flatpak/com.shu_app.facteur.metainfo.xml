@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.shu_app.facteur</id>
+  <name>facteur</name>
+  <summary>Fast, private mail client that keeps your mail on your computer</summary>
+  <summary xml:lang="fr">Client mail rapide et privé, qui garde votre courrier sur votre ordinateur</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <developer id="com.shu_app">
+    <name>Shhu</name>
+  </developer>
+  <description>
+    <p>facteur is a mail client for IMAP, Gmail and Outlook accounts. All your mail is kept in a local cache, so it opens instantly and stays readable offline.</p>
+    <p xml:lang="fr">facteur est un client mail pour les comptes IMAP, Gmail et Outlook. Tout votre courrier est gardé en local : il s'ouvre aussitôt et reste lisible hors ligne.</p>
+    <ul>
+      <li>Several accounts and a unified inbox</li>
+      <li xml:lang="fr">Plusieurs comptes et une boîte unifiée</li>
+      <li>A screener that holds the first message of new senders until you decide</li>
+      <li xml:lang="fr">Un filtre qui retient le premier message des nouveaux expéditeurs jusqu'à votre décision</li>
+      <li>Calendars and contacts from Google, Outlook and CalDAV/CardDAV</li>
+      <li xml:lang="fr">Agendas et contacts Google, Outlook et CalDAV/CardDAV</li>
+      <li>Links and senders checked before you trust them</li>
+      <li xml:lang="fr">Liens et expéditeurs vérifiés avant que vous leur fassiez confiance</li>
+      <li>Incremental backups of your mailboxes</li>
+      <li xml:lang="fr">Sauvegardes incrémentales de vos boîtes</li>
+    </ul>
+    <p>Passwords and tokens stay in the system keyring. facteur has no analytics, no advertising and no account to create.</p>
+    <p xml:lang="fr">Mots de passe et jetons restent dans le trousseau du système. facteur n'a ni statistiques, ni publicité, ni compte à créer.</p>
+  </description>
+  <launchable type="desktop-id">com.shu_app.facteur.desktop</launchable>
+  <url type="homepage">https://shu-app.com/facteur/</url>
+  <url type="bugtracker">https://github.com/Shhu/facteur/issues</url>
+  <url type="vcs-browser">https://github.com/Shhu/facteur</url>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Unified inbox with the reading pane</caption>
+      <image>https://shu-app.com/facteur/screens/flathub/inbox-light.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Home: what needs an answer, at a glance</caption>
+      <image>https://shu-app.com/facteur/screens/flathub/home-light.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Calendars from every account</caption>
+      <image>https://shu-app.com/facteur/screens/flathub/calendar-light.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Writing a message</caption>
+      <image>https://shu-app.com/facteur/screens/flathub/compose-dark.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>The screener for new senders</caption>
+      <image>https://shu-app.com/facteur/screens/flathub/screener-dark.png</image>
+    </screenshot>
+  </screenshots>
+  <content_rating type="oars-1.1"/>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+  <branding>
+    <color type="primary" scheme_preference="light">#ccfbf1</color>
+    <color type="primary" scheme_preference="dark">#134e4a</color>
+  </branding>
+  <releases>
+    <release version="0.8.1" date="2026-10-21"/>
+    <release version="0.8.0" date="2026-10-21"/>
+    <release version="0.7.0" date="2026-10-20"/>
+  </releases>
+</component>

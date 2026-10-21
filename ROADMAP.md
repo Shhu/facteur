@@ -115,8 +115,8 @@ What remains to be done, by theme. Decisions already made are noted under each i
   (2026-10-21) with the `shhu.github.io` links, which redirect to `shu-app.com`. Left: the
   restricted Gmail scopes' own verification (security assessment); moving the console links to
   `shu-app.com` means verifying that domain in Search Console and a new brand verification.
-- **Going public**: fresh history from the next release (one initial commit), old tags and
-  releases removed (the latest kept for the site and the updater), `contacts.readonly` added to
-  the Google consent screen.
-- Flatpak: check the update command on a real Linux (`flatpak install --user
-  --reinstall`).
+- Public since 0.8.1 (fresh history, 2026-10-21). Left: `contacts.readonly` on the Google
+  consent screen.
+- Flathub: app id `com.shu_app.facteur`, offline build ready (`scripts/flatpak-sources.sh`,
+  `scripts/flathub-manifest.sh`); submit the manifest to github.com/flathub/flathub, then verify
+  the app on shu-app.com. Then the site's Linux section points to Flathub.

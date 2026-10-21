@@ -92,7 +92,8 @@ on_exit() {
   [[ $status -ne 0 ]] || return 0
   case "$stage" in
     bumped)
-      git checkout -q -- src-tauri/tauri.conf.json Cargo.toml Cargo.lock flatpak/dev.facteur.mail.metainfo.xml
+      git checkout -q -- src-tauri/tauri.conf.json Cargo.toml Cargo.lock flatpak/com.shu_app.facteur.metainfo.xml \
+        flatpak/cargo-sources.json flatpak/node-sources.json
       echo "release.sh failed: version change undone." >&2 ;;
     committed)
       cat >&2 <<EOF
@@ -134,7 +135,7 @@ assert n == 1, 'workspace version not found in Cargo.toml'
 open(path, 'w').write(text)
 # Software centres (GNOME Software, Discover) show the installed version from here.
 import datetime
-path = 'flatpak/dev.facteur.mail.metainfo.xml'
+path = 'flatpak/com.shu_app.facteur.metainfo.xml'
 text = open(path).read()
 entry = f'    <release version="{version}" date="{datetime.date.today().isoformat()}"/>\n'
 text, n = re.subn(r'(  <releases>\n)', lambda m: m.group(1) + entry, text, count=1)
@@ -174,7 +175,10 @@ if [[ $android == 1 ]]; then
 fi
 
 # ── Linux Flatpak ───────────────────────────────────────────────────────
-# A bundle installed by hand (no update channel yet); the site links the stable name.
+# A bundle installed by hand, the site links the stable name; Flathub builds its own from the tag
+# (scripts/flathub-manifest.sh). Both build offline from the source lists, regenerated here so
+# that the tag carries lists matching its lockfiles.
+scripts/flatpak-sources.sh
 scripts/build-flatpak.sh
 cp "target/flatpak/facteur-$version.flatpak" "$out/"
 cp "$out/facteur-$version.flatpak" "$out/facteur.flatpak"
@@ -207,3 +211,5 @@ stage=published
 echo
 echo "Release $tag published; the website copies its files within a few minutes:"
 echo "  https://shu-app.com/facteur/"
+echo
+echo "Flathub: scripts/flathub-manifest.sh $tag, then copy target/flathub/* into the flathub/com.shu_app.facteur repository"
