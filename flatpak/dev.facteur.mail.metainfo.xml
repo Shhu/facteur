@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.facteur.mail</id>
+  <name>facteur</name>
+  <summary>Mail client with a complete local cache</summary>
+  <summary xml:lang="fr">Client de messagerie avec tout le courrier en local</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <developer id="dev.facteur">
+    <name>Yann</name>
+  </developer>
+  <description>
+    <p>IMAP and SMTP mail client: unified inbox, screener for new senders, calendars, backups.</p>
+    <p xml:lang="fr">Client IMAP et SMTP : boîte unifiée, filtre des nouveaux expéditeurs, agendas, sauvegardes.</p>
+  </description>
+  <launchable type="desktop-id">dev.facteur.mail.desktop</launchable>
+  <url type="homepage">https://shu-app.com/facteur/</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.8.0" date="2026-10-21"/>
+    <release version="0.7.0" date="2026-10-20"/>
+  </releases>
+</component>

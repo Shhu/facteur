@@ -1,0 +1,74 @@
+name: Website
+on:
+  push:
+    branches: [main]
+    paths: [site/**, .github/workflows/pages.yml]
+  release:
+    types: [published]
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: true
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      # The site serves copies of the latest release's files (exe, APK, update.json read by the
+      # updater) at a stable address, plus release.json for the page (version, date, sizes).
+      - name: Latest release files
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p site/download
+          cd site/download
+          # No release yet is fine (the page says so); any other error fails the job rather than
+          # publishing a site without its downloads (and without update.json).
+          if ! latest="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName,publishedAt,assets 2> "$RUNNER_TEMP/gh.err")"; then
+            cat "$RUNNER_TEMP/gh.err" >&2
+            if grep -qi 'release not found' "$RUNNER_TEMP/gh.err"; then
+              echo "No release yet."
+              exit 0
+            fi
+            exit 1
+          fi
+          tag="$(jq -r .tagName <<< "$latest")"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern '*'
+          # The previous version's exe too: an update.json still cached by the CDN for a few minutes
+          # names it, and its download must not end in a 404.
+          previous="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=10" --jq '[.[] | select((.draft or .prerelease) | not)][1].tag_name // empty')"
+          if [[ -n "$previous" ]]; then
+            gh release download "$previous" --repo "$GITHUB_REPOSITORY" --pattern 'facteur-*.exe' || echo "no versioned exe in $previous"
+          fi
+          # Notes of the latest releases, for the site's release notes.
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=10" \
+            --jq '[.[] | select((.draft or .prerelease) | not) | {tag: .tag_name, published: .published_at, body}]' > notes.json
+          jq '{tag: .tagName, published: .publishedAt, assets: [.assets[] | {name, size}]}' <<< "$latest" > release.json
+          # A release made without --android has no APK: the most recent release that has one,
+          # if any, provides it.
+          if ! jq -e 'any(.assets[]; .name | endswith(".apk"))' <<< "$latest" > /dev/null; then
+            apk="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '
+              [.[] | select((.draft or .prerelease) | not) | select(any(.assets[]; .name | endswith(".apk")))][0] // empty
+              | {tag: .tag_name, assets: [.assets[] | select(.name | endswith(".apk")) | {name, size}]}')"
+            if [[ -n "$apk" ]]; then
+              apk_tag="$(jq -r .tag <<< "$apk")"
+              echo "APK from $apk_tag"
+              gh release download "$apk_tag" --repo "$GITHUB_REPOSITORY" --pattern '*.apk'
+              jq --argjson apk "$apk" '.assets += $apk.assets | .apk_tag = $apk.tag' release.json > "$RUNNER_TEMP/release.json"
+              mv "$RUNNER_TEMP/release.json" release.json
+            fi
+          fi
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4

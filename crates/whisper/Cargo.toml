@@ -1,0 +1,15 @@
+[package]
+name = "facteur-whisper"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "whisper.cpp (vendored, MIT) built against llama.cpp's ggml: one ggml in the program"
+links = "facteur_whisper"
+
+[dependencies]
+# Its ggml (0.26.0, the one whisper.cpp v1.9.5 was released with) is the one whisper links to.
+llama-cpp-sys-2 = { version = "=0.1.160", default-features = false }
+
+[build-dependencies]
+bindgen = "0.72.1"
+cc = "1.8.0"

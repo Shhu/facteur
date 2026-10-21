@@ -1,0 +1,8 @@
+/target
+node_modules
+.nuxt
+.output
+.data
+dist
+src-tauri/gen/schemas
+.env

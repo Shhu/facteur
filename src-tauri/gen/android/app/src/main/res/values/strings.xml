@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">"facteur"</string>
+    <string name="main_activity_title">"facteur"</string>
+    <string name="listener_channel">Background listening</string>
+    <string name="listener_title">facteur is listening</string>
+    <string name="listener_text">New mail arrives right away. Can be turned off in Settings.</string>
+</resources>

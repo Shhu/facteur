@@ -1,0 +1,76 @@
+[package]
+name = "facteur-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+ammonia = "4.2.3"
+async-imap = { version = "0.12.0", default-features = false, features = ["runtime-tokio"] }
+base64 = "0.23.1"
+chrono = "0.4.45"
+chrono-tz = "0.10.4"
+# Already there through chrono: the computer's IANA zone, written into repeating events.
+iana-time-zone = "0.1.65"
+# Text attachments in a legacy charset, shown as UTF-8.
+encoding_rs = "0.8.35"
+futures = "0.3.34"
+hickory-resolver = "0.26"
+html-escape = "0.3.0"
+# Already there through idna: NFD, for searches that ignore accents (`store::fold`).
+icu_normalizer = { version = "2.3", default-features = false, features = ["compiled_data"] }
+idna = "1.1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "ico", "bmp"] }
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "webpki-roots", "hostname"] }
+# `full_encoding`: multibyte charsets (Shift_JIS, GBK, Big5, EUC-KR, ISO-2022-JP), not left to
+# another dependency turning it on.
+mail-parser = { version = "0.11.9", features = ["full_encoding"] }
+# DKIM signatures checked locally when the provider's verdict cannot be used. Its crypto runs on
+# ring, already the TLS provider here (no second stack); only its DKIM verification is used.
+mail-auth = { version = "0.13.3", default-features = false, features = ["ring"] }
+psl = "2.1"
+rand = "0.9"
+minisign-verify = "0.2.5"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "charset"] }
+resvg = { version = "0.48", default-features = false }
+roxmltree = "0.21"
+# Already there through walkdir: tells whether two backup files are one file on the disk
+# (hard links), for the backup size and the merging of copies.
+same-file = "1.0.6"
+rusqlite = { version = "0.40.2", features = ["bundled", "functions"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.10"
+socket2 = "0.6"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "logging", "tls12"] }
+tracing = "0.1.44"
+url = "2.5.8"
+webpki-roots = "1.0.9"
+
+# Local AI (`ai`): llama.cpp built in, with no OpenMP (the exe would need Microsoft's vcomp DLL);
+# `common` catches llama.cpp's C++ exceptions (a grammar dead end), which would abort the app.
+# Its build needs CMake and libclang.
+llama-cpp-2 = { version = "0.1.160", default-features = false, features = ["common"], optional = true }
+# Dictation: whisper.cpp on the same ggml.
+facteur-whisper = { version = "0.1.0", path = "../whisper", optional = true }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+# System keychain: the OS one on desktop, the Keystore on Android.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
+
+# Already there through tokio: the computer's memory, for the local AI's model.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+keyring-core = "1"
+android-native-keyring-store = "1"
+
+[features]
+# Performance tracing for local builds (scripts/build-windows.sh --perf); never in a release.
+perf = ["rusqlite/trace"]
+local-ai = ["dep:llama-cpp-2", "dep:facteur-whisper"]

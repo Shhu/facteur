@@ -1,0 +1,504 @@
+{
+  "mail": {
+    "page": {
+      "done": "Traités",
+      "unified": "Boîte unifiée",
+      "toDo": "À traiter",
+      "filter": {
+        "all": "Tous",
+        "unread": "Non lus",
+        "flagged": "Épinglés"
+      },
+      "to": "À : {who}",
+      "historyUnavailable": "Historique indisponible",
+      "serverSearchFailed": "Recherche sur le serveur impossible",
+      "snoozeMany": "Mettre {n} conversations de côté",
+      "snoozeUntil": "Mettre de côté jusqu'à…",
+      "backOn": "De retour {when}",
+      "toInboxDone": "Remis en boîte de réception | {n} conversations remises en boîte de réception",
+      "doneDone": "Traité | {n} conversations traitées",
+      "archived": "Archivé | {n} conversations archivées",
+      "deleted": "Supprimé | {n} conversations supprimées",
+      "movedTo": "Déplacé vers {folder}",
+      "searchAll": "Rechercher dans tous les comptes",
+      "search": "Rechercher",
+      "searchIn": "Rechercher dans {account}",
+      "searchAccount": "Rechercher dans ce compte",
+      "selectAll": "Tout sélectionner",
+      "selectedCount": "{n} sélectionné | {n} sélectionnés",
+      "toInbox": "Remettre dans la boîte",
+      "markDone": "Traité",
+      "archive": "Archiver",
+      "trash": "Supprimer",
+      "readToggle": "Lu / non lu",
+      "readToggleAria": "Lu ou non lu",
+      "later": "Plus tard",
+      "pin": "Épingler",
+      "move": "Déplacer",
+      "clearSelection": "Annuler la sélection",
+      "includeBins": "Inclure la corbeille et les indésirables",
+      "searchServer": "Chercher sur le serveur",
+      "searchServerToo": "Chercher aussi sur le serveur",
+      "serverSearched": "Recherche faite aussi sur le serveur ({n} trouvé) | Recherche faite aussi sur le serveur ({n} trouvé) | Recherche faite aussi sur le serveur ({n} trouvés)",
+      "empty": {
+        "noResultsServer": "Aucun résultat, même sur le serveur",
+        "noResultsCache": "Aucun résultat dans les messages en cache",
+        "allRead": "Tout est lu",
+        "noPinned": "Aucun message épinglé",
+        "noDone": "Aucun message traité",
+        "allDone": "Tout est traité",
+        "nothingSnoozed": "Rien de côté",
+        "inboxEmpty": "Boîte de réception vide",
+        "noMessages": "Aucun message",
+        "noNewSenders": "Aucun message d'un nouvel expéditeur"
+      },
+      "historyComplete": "Tout l'historique de ce dossier est chargé",
+      "loadingOlder": "Chargement des messages plus anciens…",
+      "retryOlder": "Réessayer de charger les messages plus anciens",
+      "selectConversation": "Sélectionnez une conversation",
+      "hint": {
+        "navigate": "pour naviguer",
+        "select": "pour sélectionner",
+        "compose": "pour écrire"
+      },
+      "category": {
+        "people": "Personnes",
+        "notification": "Notifications",
+        "newsletter": "Newsletters",
+        "all": "Tout"
+      }
+    },
+    "threadList": {
+      "pinned": "Épinglés",
+      "conversations": "{n} conversations",
+      "toInbox": "Remettre dans la boîte de réception",
+      "done": "Traité",
+      "archive": "Archiver",
+      "unsnooze": "Revenir maintenant",
+      "later": "Plus tard",
+      "trash": "Supprimer",
+      "markRead": "Marquer comme lu",
+      "markUnread": "Marquer comme non lu",
+      "unpin": "Désépingler",
+      "pin": "Épingler"
+    },
+    "threadRow": {
+      "select": "Sélectionner",
+      "unread": "Non lu",
+      "woken": "Revenu de « Plus tard »"
+    },
+    "threadView": {
+      "folded": "{n} message de plus | {n} messages de plus",
+      "openFailed": "Impossible d'ouvrir le message",
+      "toInbox": "Remettre dans la boîte",
+      "markDone": "Traité",
+      "archive": "Archiver",
+      "movedToInbox": "Remis en boîte de réception",
+      "doneDone": "Traité",
+      "archived": "Archivé",
+      "deleted": "Supprimé",
+      "snoozeUntil": "Mettre de côté jusqu'à…",
+      "backOn": "De retour {when}",
+      "notJunk": "Ce n'est pas un indésirable",
+      "reportJunk": "Signaler comme indésirable",
+      "reportedJunk": "Signalé comme indésirable",
+      "deleteSimilar": "Messages similaires…",
+      "createRule": "Créer une règle pour cet expéditeur…",
+      "block": "Bloquer {who}",
+      "blockConfirm": "Les messages de {email}, reçus et à venir, iront directement dans les indésirables.",
+      "blockTitle": "Bloquer l'expéditeur",
+      "movedTo": "Déplacé vers {folder}",
+      "back": "Retour",
+      "unsnooze": "Revenir maintenant",
+      "later": "Plus tard",
+      "trash": "Supprimer",
+      "more": "Plus",
+      "move": "Déplacer",
+      "markUnread": "Marquer comme non lu",
+      "unread": "Non lu",
+      "unpin": "Désépingler",
+      "pin": "Épingler",
+      "mute": "Ignorer la conversation",
+      "unmute": "Ne plus ignorer la conversation",
+      "muted": "Conversation ignorée : ses prochains messages seront archivés",
+      "unmuted": "La conversation n'est plus ignorée",
+      "outgoing": {
+        "you": "Vous",
+        "pending": "envoi dans quelques secondes",
+        "sending": "envoi…",
+        "sent": "envoyé",
+        "failed": "échec de l'envoi : voir la boîte d'envoi"
+      },
+      "mutedBadge": "Ignorée",
+      "ai": {
+        "summarize": "Résumer le fil",
+        "short": "IA",
+        "title": "IA locale",
+        "summaryTitle": "Résumé (IA locale)",
+        "summarizing": "Résumé en cours sur cet ordinateur…",
+        "event": "Créer un événement depuis ce message",
+        "noEvent": "Aucun rendez-vous trouvé dans ce message",
+        "checkDate": "Date à vérifier : elle n'a pas été comprise"
+      }
+    },
+    "messageCard": {
+      "imagesAlways": "Images toujours affichées",
+      "imagesAlwaysDesc": "Pour {key}. Modifiable dans les réglages.",
+      "show": "Afficher",
+      "alwaysFor": "Toujours pour {key}",
+      "remoteConfirm": "Ce message est peu fiable. Afficher ses images distantes signale à l'expéditeur que vous l'avez ouvert.",
+      "remoteConfirmTitle": "Afficher les images",
+      "reportedJunk": "Signalé comme indésirable",
+      "unsubConfirm": "Ne plus recevoir les envois de {who} ?",
+      "unsubscribe": "Se désabonner",
+      "unsubMailConfirm": "facteur va envoyer un message à {address}\nObjet : « {subject} »\n\nEnvoyer ?",
+      "unsubMailTitle": "Désabonnement par e-mail",
+      "unsubPageOpened": "Page de désabonnement ouverte",
+      "unsubPageDesc": "Terminez la démarche dans le navigateur.",
+      "unsubscribed": "Désabonné",
+      "unsubSent": "Demande envoyée à {address}",
+      "unsubDone": "{who} ne devrait plus vous écrire.",
+      "unsubFailed": "Désabonnement impossible",
+      "print": {
+        "message": "Message",
+        "from": "De",
+        "to": "À",
+        "cc": "Cc",
+        "date": "Date",
+        "attachments": "Pièces jointes",
+        "action": "Imprimer ou enregistrer en PDF…"
+      },
+      "darken": "Assombrir le message",
+      "originalColors": "Couleurs d'origine",
+      "showSource": "Afficher la source",
+      "verified": "Expéditeur vérifié · {reasons}",
+      "untrusted": "Message peu fiable",
+      "downloading": "Téléchargement du message…",
+      "fraudTitle": "Prudence : ce message pourrait être frauduleux",
+      "reportJunk": "Signaler comme indésirable",
+      "fraudAdvice": "Ne répondez pas, n'ouvrez pas les pièces jointes et ne vous désabonnez pas : cela confirmerait votre adresse.",
+      "bulk": "Envoi groupé (newsletter, liste de diffusion)",
+      "remoteBlocked": "Images distantes bloquées pour protéger votre vie privée.",
+      "reply": "Répondre",
+      "replyAll": "Répondre à tous",
+      "forward": "Transférer",
+      "others": "et {n} autre | et {n} autres",
+      "repliesTo": "Réponse à {who}",
+      "addToCalendar": "Ajouter à l'agenda",
+      "addToCalendarShort": "Agenda",
+      "to": "À",
+      "cc": "Cc",
+      "replyTo": "Répondre à",
+      "less": "Moins"
+    },
+    "mailFrame": {
+      "loading": "Chargement du message…",
+      "deceptive": "Ce lien affiche « {shown} » mais mène en réalité vers « {host} ». C'est une technique d'hameçonnage courante.\n\nOuvrir quand même ?",
+      "cautious": "Ce message est peu fiable. Le lien mène vers « {host} ».\n\nOuvrir quand même ?",
+      "deceptiveTitle": "Lien trompeur",
+      "cautiousTitle": "Lien d'un message peu fiable",
+      "openFailed": "Impossible d'ouvrir le lien",
+      "frameTitle": "Contenu du message"
+    },
+    "linkPreview": {
+      "trusted": "Lien fiable",
+      "check": "Lien à vérifier",
+      "suspicious": "Lien suspect",
+      "created": "Domaine créé en {date}",
+      "seenIn": "Présent dans {n} autre message | Présent dans {n} autres messages",
+      "neverSeen": "Jamais vu dans vos messages",
+      "tracking": "Pistage : {list}",
+      "openFailed": "Impossible d'ouvrir le lien",
+      "copied": "Lien copié",
+      "copyFailed": "Copie impossible",
+      "label": "Aperçu du lien",
+      "analysisFailed": "Analyse impossible",
+      "analyzing": "Analyse du lien…",
+      "redirectsTo": "Redirige vers",
+      "openAnyway": "Ouvrir quand même",
+      "open": "Ouvrir",
+      "noTracking": "Sans pistage",
+      "copy": "Copier",
+      "sender": {
+        "title": "Ce qui manque à {domain} pour authentifier ses messages :",
+        "noDmarc": "aucune politique DMARC publiée",
+        "noSpf": "aucun enregistrement SPF publié",
+        "noDkim": "ce message n'est pas signé (DKIM)",
+        "badDkim": "la signature DKIM de ce message est invalide",
+        "otherDkim": "ce message est signé par {domain}, pas par son propre domaine (DKIM)",
+        "advice": "Son adresse peut donc être imitée. À signaler à l'expéditeur : c'est à corriger dans son DNS ou chez son hébergeur."
+      },
+      "announced": {
+        "created": "Domaine annoncé « {domain} » : créé en {date}",
+        "seenIn": "Domaine annoncé « {domain} » : présent dans {n} autre message | Domaine annoncé « {domain} » : présent dans {n} autres messages",
+        "neverSeen": "Domaine annoncé « {domain} » : jamais vu dans vos messages",
+        "sender": "Domaine annoncé « {domain} » : celui de l'expéditeur"
+      }
+    },
+    "attachment": {
+      "trusted": "Fichier fiable",
+      "check": "Fichier à vérifier",
+      "suspicious": "Fichier suspect",
+      "analysisFailed": "Analyse impossible",
+      "analyzing": "Analyse de la pièce jointe…",
+      "contains": "Contient {n} fichier : | Contient {n} fichiers :",
+      "openInApp": "Ouvrir dans facteur",
+      "saveAnyway": "Enregistrer quand même",
+      "download": "Télécharger"
+    },
+    "pdf": {
+      "zoomOut": "Réduire",
+      "percent": "{n} %",
+      "zoomIn": "Agrandir",
+      "fitWidth": "Pleine largeur",
+      "pages": "{n} page | {n} pages",
+      "unreadable": "PDF illisible : {error}",
+      "opening": "Ouverture du PDF…",
+      "page": "Page {n}"
+    },
+    "invite": {
+      "range": "du {from} au {to}",
+      "maybe": "Peut-être",
+      "organizer": "l'organisateur",
+      "responseSent": "Réponse envoyée",
+      "responseTo": "À {to}",
+      "responseFailed": "Réponse non envoyée",
+      "eventSaved": "Événement enregistré",
+      "eventSavedDesc": "Ouvrez-le pour l'ajouter à votre agenda.",
+      "cancelled": "Événement annulé",
+      "reply": "Réponse à une invitation",
+      "invitation": "Invitation",
+      "recurring": "Récurrent",
+      "untitled": "(sans titre)",
+      "organizedBy": "Organisé par {who}",
+      "band": {
+        "accepted": "Vous participez",
+        "tentative": "Vous avez répondu peut-être",
+        "declined": "Vous avez décliné",
+        "pending": "Invitation · en attente de votre réponse"
+      },
+      "updated": "Mise à jour",
+      "updatedWhat": "Mise à jour · {what}",
+      "changed": "Modification : {what}",
+      "header": {
+        "updated": "Invitation mise à jour",
+        "cancelled": "Invitation annulée"
+      },
+      "tag": {
+        "update": "Mise à jour",
+        "cancelled": "Annulée",
+        "accepted": "Participe",
+        "tentative": "Peut-être",
+        "declined": "Décline",
+        "delegated": "A délégué",
+        "none": "Sans réponse"
+      },
+      "allDayOnly": "Journée entière",
+      "durationH": "{h} h",
+      "durationHM": "{h} h {m}",
+      "durationM": "{m} min",
+      "days": "{n} jour | {n} jours",
+      "zone": "heure de {city}",
+      "otherZoneTime": "soit {time} à {city}",
+      "join": "Rejoindre",
+      "joinProvider": "Rejoindre {provider}",
+      "guests": "{n} invité | {n} invités",
+      "acceptCount": "{n} accepte | {n} acceptent",
+      "maybeCount": "{n} peut-être",
+      "declineCount": "{n} décline | {n} déclinent",
+      "noReplyCount": "{n} sans réponse",
+      "seeAll": "Voir tout",
+      "seeAllCount": "Voir les {n} personnes",
+      "hideAll": "Masquer",
+      "you": "vous",
+      "organizes": "organise",
+      "yes": "Oui",
+      "no": "Non",
+      "yourResponse": "Votre réponse",
+      "addToCalendar": "Ajouter à l'agenda",
+      "provider": {
+        "google": "Google Agenda"
+      },
+      "showOriginal": "Afficher l'e-mail d'origine de {from}",
+      "showOriginalElided": "Afficher l'e-mail d'origine d'{from}",
+      "hideOriginal": "Masquer l'e-mail d'origine",
+      "excerpt": "« {text} »",
+      "to": "à",
+      "free": "Libre à ce moment",
+      "nextOccurrence": "Prochaine occurrence : {date}",
+      "conflict": "En conflit avec : {what}",
+      "conflictMore": "En conflit avec : {what} et {n} autre | En conflit avec : {what} et {n} autres",
+      "yourDay": "Votre agenda ce jour-là"
+    },
+    "source": {
+      "unavailable": "Source indisponible",
+      "copied": "Copié",
+      "copyFailed": "Copie impossible",
+      "saved": "Message enregistré",
+      "title": "Source du message",
+      "headers": "En-têtes",
+      "full": "Source complète",
+      "copy": "Copier",
+      "saveEml": "Enregistrer (.eml)",
+      "loading": "Chargement…"
+    },
+    "followUps": {
+      "title": "Sans réponse",
+      "dismiss": "Ne plus rappeler",
+      "less": "Moins",
+      "more": "{n} de plus"
+    },
+    "searchSuggest": {
+      "label": "Suggestions de recherche",
+      "from": "expéditeur (adresse ou nom)",
+      "to": "destinataire",
+      "with": "échanges avec quelqu'un",
+      "subject": "dans l'objet",
+      "in": "dans un dossier",
+      "after": "après une date (2026-03-01)",
+      "before": "avant une date",
+      "attachment": "avec pièce jointe",
+      "unread": "non lus",
+      "read": "lus",
+      "pinned": "épinglés",
+      "labelled": "rangé dans un de vos dossiers",
+      "unlabelled": "rangé dans aucun de vos dossiers",
+      "dates": {
+        "today": "Aujourd'hui",
+        "yesterday": "Hier",
+        "week": "Il y a 7 jours",
+        "month": "Il y a 1 mois",
+        "quarter": "Il y a 3 mois",
+        "year": "Il y a 1 an"
+      }
+    },
+    "searchField": {
+      "edit": "Modifier {chip}",
+      "remove": "Retirer {chip}"
+    },
+    "searchHelp": {
+      "ops": {
+        "from": {
+          "op": "de:marie",
+          "desc": "expéditeur (adresse ou nom)"
+        },
+        "to": {
+          "op": "à:paul",
+          "desc": "destinataire"
+        },
+        "with": {
+          "op": "avec:anthony",
+          "desc": "échanges avec quelqu'un : de lui ou adressés à lui"
+        },
+        "subject": {
+          "op": "objet:\"devis 2026\"",
+          "desc": "dans l'objet"
+        },
+        "attachment": {
+          "op": "pj",
+          "desc": "avec pièce jointe"
+        },
+        "read": {
+          "op": "non-lu · lu",
+          "desc": "état de lecture"
+        },
+        "pinned": {
+          "op": "épinglé",
+          "desc": "messages épinglés"
+        },
+        "labels": {
+          "op": "étiqueté · sans-étiquette",
+          "desc": "rangé dans vos dossiers, ou non"
+        },
+        "after": {
+          "op": "après:2026-01-01",
+          "desc": "à partir de cette date"
+        },
+        "before": {
+          "op": "avant:31/03/2026",
+          "desc": "avant cette date"
+        },
+        "in": {
+          "op": "dans:envoyés",
+          "desc": "un dossier (rôle ou nom) ou un libellé Gmail, aussi label: ; dans:corbeille la cherche même interrupteur coupé"
+        }
+      },
+      "savedToast": "Recherche enregistrée",
+      "savedToastDesc": "Elle apparaît dans la barre latérale.",
+      "saveSearch": "Enregistrer la recherche",
+      "help": "Aide de la recherche",
+      "alreadySaved": "Recherche déjà enregistrée",
+      "saveThis": "Enregistrer cette recherche",
+      "name": "Nom de la recherche",
+      "save": "Enregistrer",
+      "operators": "Opérateurs",
+      "footer": "Combinables entre eux et avec du texte libre. Aussi en anglais : from:, to:, with:, subject:, has:attachment, is:unread, before:, after:, in:."
+    },
+    "address": {
+      "copy": "Copier l'adresse",
+      "copied": "Adresse copiée",
+      "copyFailed": "Copie impossible",
+      "write": "Écrire",
+      "messages": "Vos échanges",
+      "rule": "Créer une règle",
+      "block": "Bloquer",
+      "blocked": "Expéditeur bloqué",
+      "blockConfirm": "Les messages de {email}, reçus et à venir, iront directement dans les indésirables.",
+      "classify": "Classer cet expéditeur dans",
+      "classified": "{who} est rangé dans {category}"
+    },
+    "list": {
+      "unread": "{n} non lu | {n} non lus",
+      "accounts": "{n} compte | {n} comptes"
+    },
+    "reader": {
+      "messageCount": "{n} message | {n} messages",
+      "verified": "Vérifié",
+      "showQuoted": "Afficher le message cité | Afficher les {n} messages cités",
+      "hideQuoted": "Masquer les messages cités"
+    },
+    "screener": {
+      "title": "Nouveaux expéditeurs",
+      "intro": "Leur premier message attend ici votre décision. Accepté, un expéditeur arrive dans la boîte de réception ; refusé, ses messages vont dans « Refusés ».",
+      "swipeHint": "Glissez à droite pour accepter, à gauche pour refuser.",
+      "hint": {
+        "move": "naviguer",
+        "accept": "accepter",
+        "refuse": "refuser",
+        "open": "ouvrir"
+      },
+      "empty": "Aucun nouvel expéditeur",
+      "emptyHint": "Les premiers messages des personnes qui ne vous ont jamais écrit attendront ici.",
+      "offHint": "Le filtre des nouveaux expéditeurs s'active dans les réglages de chaque compte.",
+      "openSettings": "Ouvrir les réglages",
+      "messages": "{n} message | {n} messages",
+      "accept": "Accepter",
+      "acceptAs": "Accepter autrement",
+      "asNewsletter": "Accepter comme newsletter",
+      "asNotification": "Accepter comme notification",
+      "refuse": "Refuser",
+      "wholeDomain": "Tout le domaine ({domain})",
+      "lowTrust": "Ce message présente des signes de fraude : vérifiez-le avant d'accepter cet expéditeur.",
+      "openLatest": "Ouvrir le dernier message",
+      "accepted": "Accepté : {name}",
+      "acceptedNewsletter": "Accepté comme newsletter : {name}",
+      "acceptedNotification": "Accepté comme notification : {name}",
+      "refused": "Refusé : {name}",
+      "banner": "{n} nouvel expéditeur | {n} nouveaux expéditeurs",
+      "review": "Trier",
+      "held": "Nouvel expéditeur : {name}"
+    },
+    "quit": {
+      "sending": "Envoi de {n} message avant de quitter… | Envoi de {n} messages avant de quitter…",
+      "sendingHint": "Fermez à nouveau pour quitter sans attendre."
+    },
+    "labels": {
+      "title": "Libellés",
+      "add": "Libellé",
+      "none": "Aucun libellé sur ce compte",
+      "added": "Libellé « {label} » ajouté",
+      "removed": "Libellé « {label} » retiré",
+      "remove": "Retirer le libellé {label}"
+    }
+  }
+}

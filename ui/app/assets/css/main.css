@@ -1,0 +1,153 @@
+@import "tailwindcss";
+@import "@nuxt/ui";
+
+@theme static {
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+html, body {
+  overscroll-behavior: none;
+}
+
+.viz-root {
+  --viz-series-1: #2a78d6;
+  --viz-series-2: #eb6834;
+  --viz-grid: #e1e0d9;
+  --viz-axis: #c3c2b7;
+  --viz-muted: #898781;
+  --viz-hover: rgba(11, 11, 11, 0.04);
+}
+.dark .viz-root {
+  --viz-series-1: #3987e5;
+  --viz-series-2: #d95926;
+  --viz-grid: #2c2c2a;
+  --viz-axis: #383835;
+  --viz-muted: #898781;
+  --viz-hover: rgba(255, 255, 255, 0.05);
+}
+
+.tiptap [data-resize-container] {
+  max-width: 100%;
+}
+.tiptap [data-resize-wrapper] {
+  outline: 2px solid transparent;
+  outline-offset: 1px;
+}
+.tiptap [data-resize-container]:hover [data-resize-wrapper],
+.tiptap .ProseMirror-selectednode [data-resize-wrapper],
+.tiptap [data-resize-state="true"] [data-resize-wrapper] {
+  outline-color: var(--ui-primary);
+}
+.tiptap [data-resize-handle] {
+  width: 10px;
+  height: 10px;
+  margin: -5px;
+  border-radius: 2px;
+  border: 1px solid var(--ui-primary);
+  background: var(--ui-bg);
+  opacity: 0;
+  z-index: 1;
+}
+.tiptap [data-resize-handle="top-left"], .tiptap [data-resize-handle="bottom-right"] { cursor: nwse-resize; }
+.tiptap [data-resize-handle="top-right"], .tiptap [data-resize-handle="bottom-left"] { cursor: nesw-resize; }
+.tiptap [data-resize-container]:hover [data-resize-handle],
+.tiptap .ProseMirror-selectednode [data-resize-handle],
+.tiptap [data-resize-state="true"] [data-resize-handle] {
+  opacity: 1;
+}
+
+.tiptap table.facteur-columns {
+  margin: 0.25rem 0;
+}
+.tiptap td.facteur-column {
+  outline: 1px dashed var(--ui-border-accented);
+  outline-offset: -1px;
+  min-width: 40px;
+}
+.tiptap td.facteur-column > div {
+  padding: 2px 4px;
+}
+.tiptap [data-column-handle] {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 1;
+}
+.tiptap [data-column-handle]:hover {
+  background: var(--ui-primary);
+}
+
+/* Light: white text on the 500 shades, and those shades as text on white, lack contrast; the
+   semantic colours go darker. Dark mode keeps Nuxt UI's 400 shades, set again here since this
+   unlayered rule would otherwise win over its `.dark` one too. */
+:root {
+  --ui-primary: var(--ui-color-primary-700);
+  --ui-success: var(--ui-color-success-700);
+  --ui-warning: var(--ui-color-warning-700);
+  --ui-error: var(--ui-color-error-600);
+}
+.dark {
+  --ui-primary: var(--ui-color-primary-400);
+  --ui-success: var(--ui-color-success-400);
+  --ui-warning: var(--ui-color-warning-400);
+  --ui-error: var(--ui-color-error-400);
+}
+
+/* Keyboard focus on our own controls. Nuxt UI's components (they carry `data-slot`) draw their
+   own ring; in the base layer, any utility on the element (`outline-none`, a ring) wins. */
+@layer base {
+  :where(button, a, [tabindex]):where(:not([data-slot])):focus-visible {
+    outline: 2px solid var(--ui-primary);
+    outline-offset: 2px;
+  }
+  /* An app, not a web page: links and images are not dragged out (it showed the internal URL).
+     Elements made draggable on purpose (thread rows, accounts) still are. */
+  :where(a, img):not([draggable='true']) {
+    -webkit-user-drag: none;
+  }
+}
+
+/* Solid red confirm of a destructive action, with `color="error"` on a UButton: white on red-600
+   in both themes (the error colour alone turns pale with dark text in dark mode). */
+@utility btn-danger {
+  background-color: var(--ui-color-error-600) !important;
+  color: white !important;
+  &:not(:disabled, [aria-disabled='true']):hover,
+  &:not(:disabled, [aria-disabled='true']):active {
+    background-color: var(--ui-color-error-700) !important;
+  }
+}
+
+:root {
+  --surface-side: var(--ui-color-neutral-50);
+  --surface-list: var(--ui-bg);
+  --surface-read: var(--ui-color-neutral-100);
+  --surface-card: var(--ui-bg);
+}
+.dark {
+  --surface-side: color-mix(in oklab, var(--ui-color-neutral-900) 45%, var(--ui-color-neutral-950));
+  --surface-list: var(--ui-color-neutral-900);
+  --surface-read: var(--ui-color-neutral-950);
+  --surface-card: var(--ui-color-neutral-900);
+}
+
+/* Centred like in the sent mail: no gap below a logo. */
+.tiptap [data-resize-container] {
+  vertical-align: middle;
+}
+
+.cal-tint {
+  background: color-mix(in oklab, var(--ev) 15%, var(--surface-card));
+}
+.dark .cal-tint {
+  background: color-mix(in oklab, var(--ev) 24%, var(--surface-card));
+}
+
+/* While a panel is being resized, the message frames (iframes) let the mouse through: over one,
+   the window would stop hearing the pointer and the resize would stall. */
+body:has([data-dragging="true"]) iframe {
+  pointer-events: none;
+}

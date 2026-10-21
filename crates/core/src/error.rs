@@ -1,0 +1,189 @@
+use serde::Serialize;
+
+#[derive(Debug)]
+pub enum Error {
+    Db(rusqlite::Error),
+    Imap(async_imap::error::Error),
+    Io(std::io::Error),
+    Tls(String),
+    Smtp(String),
+    Mime(String),
+    Secret(String),
+    NotFound(String),
+    Other(String),
+    Auth(String),
+    /// Sending was cut off midway: the message may have gone out.
+    Uncertain(String),
+    /// The SMTP server refused the message for good (5xx reply, or a message it cannot take):
+    /// sending it again unchanged would fail the same way, so it is not retried on its own.
+    Rejected(String),
+    /// The folder was recreated on the server: its UIDs no longer name the same messages.
+    Stale(String),
+    /// The server closed the session or refused a command on it while the account itself is fine
+    /// (too many connections, a session cut on its side): a new connection is worth one more try.
+    Dropped(String),
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// A silent server or a half-dead connection (sleep, Wi-Fi change) must not block forever.
+pub(crate) async fn bounded<T>(secs: u64, what: &str, job: impl Future<Output = Result<T>>) -> Result<T> {
+    tokio::time::timeout(std::time::Duration::from_secs(secs), job)
+        .await
+        .map_err(|_| Error::Other(crate::tr!("{what} : le serveur ne répond plus", "{what}: the server stopped responding")))?
+}
+
+// Hand-written rather than thiserror: the prefixes follow the chosen language.
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Category prefix as (French, English); `None` for a message that is already complete. A
+        // text written in both languages (`i18n::both`) shows the language of the moment.
+        let text = |e: &String| crate::i18n::pick(e).to_string();
+        let (prefix, detail): (Option<(&str, &str)>, String) = match self {
+            Error::Db(e) if let Some(sentence) = db_sentence(e) => return f.write_str(&sentence),
+            Error::Db(e) => (Some(("base de données", "database")), e.to_string()),
+            Error::Imap(e) => (Some(("IMAP", "IMAP")), e.to_string()),
+            Error::Io(e) if e.kind() == std::io::ErrorKind::StorageFull => {
+                return f.write_str(&crate::tr!("disque plein : libérez de la place puis réessayez", "disk full: free some space, then try again"));
+            }
+            Error::Io(e) if is_local(e) => (Some(("fichier", "file")), e.to_string()),
+            Error::Io(e) => (Some(("réseau", "network")), e.to_string()),
+            Error::Tls(e) => (Some(("TLS", "TLS")), text(e)),
+            Error::Smtp(e) => (Some(("SMTP", "SMTP")), text(e)),
+            Error::Rejected(e) => (Some(("refusé par le serveur d'envoi", "refused by the sending server")), text(e)),
+            Error::Mime(e) => (Some(("message invalide", "invalid message")), text(e)),
+            Error::Secret(e) => (Some(("trousseau", "keychain")), text(e)),
+            Error::NotFound(e) => (Some(("introuvable", "not found")), text(e)),
+            Error::Other(e) | Error::Auth(e) => (None, text(e)),
+            Error::Stale(e) => (Some(("opération périmée", "stale operation")), text(e)),
+            Error::Dropped(e) => (Some(("connexion coupée par le serveur", "connection dropped by the server")), text(e)),
+            // What to check before sending again depends on the provider: added by the outbox
+            // (see `smtp::maybe_sent_advice`).
+            Error::Uncertain(e) => (Some(("envoi incertain", "uncertain send")), text(e)),
+        };
+        match prefix {
+            None => write!(f, "{detail}"),
+            Some((_, en)) if crate::i18n::english() => write!(f, "{en}: {detail}"),
+            Some((fr, _)) => write!(f, "{fr} : {detail}"),
+        }
+    }
+}
+
+impl Error {
+    pub fn is_damaged_db(&self) -> bool {
+        use rusqlite::ErrorCode::{DatabaseCorrupt, NotADatabase};
+        matches!(self, Error::Db(rusqlite::Error::SqliteFailure(e, _)) if matches!(e.code, DatabaseCorrupt | NotADatabase))
+    }
+
+    pub fn is_connection_drop(&self) -> bool {
+        use async_imap::error::Error as Imap;
+        match self {
+            Error::Dropped(_) | Error::Imap(Imap::ConnectionLost) => true,
+            Error::Imap(Imap::Io(e)) => !(e.kind() == std::io::ErrorKind::Other && e.to_string().contains("during parsing")),
+            Error::Io(e) => !is_local(e),
+            _ => false,
+        }
+    }
+}
+
+fn is_local(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        NotFound | PermissionDenied | AlreadyExists | ReadOnlyFilesystem | IsADirectory | NotADirectory | DirectoryNotEmpty
+            | FileTooLarge | QuotaExceeded | InvalidFilename | CrossesDevices | ResourceBusy | ExecutableFileBusy
+    )
+}
+
+fn db_sentence(e: &rusqlite::Error) -> Option<String> {
+    use rusqlite::ErrorCode::*;
+    let rusqlite::Error::SqliteFailure(failure, _) = e else { return None };
+    Some(match failure.code {
+        DiskFull => crate::tr!(
+            "disque plein : facteur ne peut plus écrire dans sa base, libérez de la place",
+            "disk full: facteur can no longer write to its database, free some space"
+        ),
+        DatabaseBusy | DatabaseLocked => crate::tr!(
+            "base de données occupée : réessayez dans un instant",
+            "database busy: try again in a moment"
+        ),
+        DatabaseCorrupt | NotADatabase => crate::tr!(
+            "base de données endommagée : redémarrez facteur, et consultez les journaux si cela persiste",
+            "database damaged: restart facteur, and look at the logs if it persists"
+        ),
+        ReadOnly | PermissionDenied | CannotOpen => crate::tr!(
+            "base de données inaccessible en écriture : vérifiez les droits du dossier de facteur",
+            "database cannot be written: check the permissions of facteur's folder"
+        ),
+        SystemIoFailure => crate::tr!(
+            "erreur du disque en lisant ou écrivant la base de données",
+            "disk error while reading or writing the database"
+        ),
+        _ => return None,
+    })
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Db(e) => Some(e),
+            Error::Imap(e) => Some(e),
+            Error::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<rusqlite::Error> for Error {
+    fn from(e: rusqlite::Error) -> Self {
+        Error::Db(e)
+    }
+}
+
+impl From<async_imap::error::Error> for Error {
+    fn from(e: async_imap::error::Error) -> Self {
+        Error::Imap(e)
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Io(e)
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(e: serde_json::Error) -> Self {
+        Error::Other(e.to_string())
+    }
+}
+
+impl Serialize for Error {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_disk_errors_are_not_called_network_errors() {
+        let file = Error::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "accès refusé"));
+        assert_eq!(file.to_string(), "fichier : accès refusé");
+        let net = Error::Io(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "coupé"));
+        assert_eq!(net.to_string(), "réseau : coupé");
+        let full = Error::Io(std::io::Error::new(std::io::ErrorKind::StorageFull, "ENOSPC"));
+        assert!(full.to_string().starts_with("disque plein"));
+    }
+
+    #[test]
+    fn common_sqlite_failures_read_as_sentences() {
+        let failure = |code| Error::Db(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error { code, extended_code: 0 }, None));
+        assert!(failure(rusqlite::ErrorCode::DiskFull).to_string().starts_with("disque plein"));
+        assert!(failure(rusqlite::ErrorCode::DatabaseBusy).to_string().starts_with("base de données occupée"));
+        assert!(failure(rusqlite::ErrorCode::DatabaseCorrupt).is_damaged_db());
+        assert!(!failure(rusqlite::ErrorCode::DiskFull).is_damaged_db());
+    }
+}

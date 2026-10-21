@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fonctions · facteur</title>
+<meta name="title-fr" content="Fonctions · facteur">
+<meta name="title-en" content="Features · facteur">
+<meta name="description" content="Boîte unifiée, agenda, nouveaux expéditeurs, sauvegarde : tout ce que fait facteur.">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f7f8f8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0a0b0c" media="(prefers-color-scheme: dark)">
+<meta property="og:title" content="Fonctions · facteur">
+<meta property="og:description" content="Boîte unifiée, agenda, nouveaux expéditeurs, sauvegarde : tout ce que fait facteur.">
+<meta property="og:image" content="screens/inbox-light.webp">
+<link rel="icon" href="icon.png">
+<link rel="stylesheet" href="assets/site.css">
+
+</head>
+<body data-lang="fr" data-page="features">
+<a class="skip" href="#main"><span lang="fr">Aller au contenu</span><span lang="en">Skip to content</span></a>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="index.html">
+      <img src="icon.png" alt="" width="32" height="32">
+      facteur
+    </a>
+    <nav aria-label="Navigation">
+      <a href="features.html" aria-current="page"><span lang="fr">Fonctions</span><span lang="en">Features</span></a>
+      <a href="news.html"><span lang="fr">Nouveautés</span><span lang="en">What's new</span></a>
+      <a href="download.html"><span lang="fr">Télécharger</span><span lang="en">Download</span></a>
+    </nav>
+    <div class="top-actions">
+      <button class="lang" type="button" id="lang"><span class="long">English</span><span class="short">EN</span></button>
+      <a class="btn-small" href="download.html">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>
+        <span><span lang="fr">Télécharger</span><span lang="en">Download</span></span>
+      </a>
+    </div>
+  </div>
+</header>
+
+<main id="main">
+  <section class="page-head">
+    <div class="wrap">
+      <p class="eyebrow"><span lang="fr">Fonctions</span><span lang="en">Features</span></p>
+      <h1><span lang="fr">Tout ce que fait facteur.</span><span lang="en">Everything facteur does.</span></h1>
+      <p class="lead"><span lang="fr">Un client mail complet, qui garde tout sur votre ordinateur. Choisissez un sujet pour le voir en image.</span><span lang="en">A complete mail client that keeps everything on your computer. Pick a topic to see it.</span></p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap tour">
+      <div role="tablist" aria-label="Fonctions" aria-orientation="vertical">
+        <button type="button" role="tab" id="tab-unified" data-slug="unified" aria-controls="panel-unified" aria-selected="true" tabindex="0"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5h13L22 12v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-6z"/></svg><span><span lang="fr">Une seule boîte</span><span lang="en">One inbox</span></span></button>
+        <button type="button" role="tab" id="tab-fast" data-slug="fast" aria-controls="panel-fast" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2 3 14h9l-1 8 10-12h-9z"/></svg><span><span lang="fr">Rapide</span><span lang="en">Fast</span></span></button>
+        <button type="button" role="tab" id="tab-agenda" data-slug="agenda" aria-controls="panel-agenda" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18M8 2v4M16 2v4"/></svg><span><span lang="fr">Agenda</span><span lang="en">Calendar</span></span></button>
+        <button type="button" role="tab" id="tab-ai" data-slug="ai" aria-controls="panel-ai" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l1.8 4.6L18.5 9.5l-4.7 1.9L12 16l-1.8-4.6L5.5 9.5l4.7-1.9z"/><path d="M19 15l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8z"/></svg><span><span lang="fr">IA locale</span><span lang="en">Local AI</span></span><span class="new"><span lang="fr">Nouveau</span><span lang="en">New</span></span></button>
+        <button type="button" role="tab" id="tab-screener" data-slug="screener" aria-controls="panel-screener" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10" cy="8" r="4"/><path d="M2 21a8 8 0 0 1 12.5-6.6M16 18l2 2 4-4"/></svg><span><span lang="fr">Nouveaux expéditeurs</span><span lang="en">New senders</span></span></button>
+        <button type="button" role="tab" id="tab-write" data-slug="write" aria-controls="panel-write" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg><span><span lang="fr">Écrire</span><span lang="en">Write</span></span></button>
+        <button type="button" role="tab" id="tab-safety" data-slug="safety" aria-controls="panel-safety" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg><span><span lang="fr">Sécurité</span><span lang="en">Safety</span></span></button>
+        <button type="button" role="tab" id="tab-backup" data-slug="backup" aria-controls="panel-backup" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/></svg><span><span lang="fr">Sauvegarde</span><span lang="en">Backup</span></span></button>
+        <button type="button" role="tab" id="tab-stats" data-slug="stats" aria-controls="panel-stats" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v18h18"/><path d="M8 17V11M13 17V7M18 17v-4"/></svg><span><span lang="fr">Statistiques</span><span lang="en">Statistics</span></span></button>
+      </div>
+      <div>
+      <section class="panel" role="tabpanel" id="panel-unified" aria-labelledby="tab-unified">
+        <div class="text">
+          <div><h2><span lang="fr">Tous vos comptes, rangés tout seuls.</span><span lang="en">Every account, sorted for you.</span></h2><p><span lang="fr">Perso, travail, association : chaque compte a sa couleur, et la boîte unifiée les réunit. Le tri intelligent sépare les personnes des notifications et des lettres d'information.</span><span lang="en">Personal, work, club: each account has its colour, and the unified inbox brings them together. Smart sorting sets people apart from notifications and newsletters.</span></p></div>
+          <ul class="checks">
+            <li><span lang="fr">Onglets Personnes, Notifications, Newsletters</span><span lang="en">People, Notifications and Newsletters tabs</span></li>
+            <li><span lang="fr">Invitations d'agenda : répondre Oui, Peut-être ou Non sans quitter le message</span><span lang="en">Calendar invitations: answer Yes, Maybe or No right from the message</span></li>
+            <li><span lang="fr">Épingler ce qui compte, « Traité » pour vider la boîte</span><span lang="en">Pin what matters, “Done” to clear the inbox</span></li>
+          </ul>
+        </div>
+        <div class="frame"><img src="screens/smart-dark.webp" width="1800" height="1125" decoding="async"
+            data-alt-fr="L'onglet Personnes de la boîte unifiée, avec une invitation à une réunion ouverte."
+            data-alt-en="The People tab of the unified inbox, with a meeting invitation open."
+            alt="L'onglet Personnes de la boîte unifiée, avec une invitation à une réunion ouverte."></div>
+      </section>
+      <section class="panel" role="tabpanel" id="panel-fast" aria-labelledby="tab-fast" hidden>
+        <div class="text">
+          <div><h2><span lang="fr">Rien à attendre, même sans réseau.</span><span lang="en">Nothing to wait for, even offline.</span></h2><p><span lang="fr">Les messages sont gardés sur votre ordinateur : la boîte s'ouvre aussitôt, la recherche répond pendant que vous tapez, et ce que vous faites hors ligne part dès que le réseau revient.</span><span lang="en">Messages are kept on your computer: the inbox opens at once, search answers as you type, and whatever you do offline goes out as soon as the network is back.</span></p></div>
+          <ul class="checks">
+            <li><span lang="fr">Recherche plein texte dans tous les comptes, et sur le serveur si besoin</span><span lang="en">Full-text search across every account, and on the server when needed</span></li>
+            <li><span lang="fr">Recherches enregistrées dans la barre latérale</span><span lang="en">Saved searches in the sidebar</span></li>
+            <li><span lang="fr">Synchro au rythme choisi pour chaque compte, nouveaux messages en direct</span><span lang="en">Sync at the pace you choose per account, new mail live</span></li>
+          </ul>
+        </div>
+        <div class="frame"><img src="screens/search-dark.webp" width="1800" height="1125" loading="lazy" decoding="async"
+            data-alt-fr="Une recherche « Maison Brune » dans la boîte unifiée, avec ses résultats et la conversation ouverte."
+            data-alt-en="A search for “Maison Brune” in the unified inbox, with its results and the conversation open."
+            alt="Une recherche « Maison Brune » dans la boîte unifiée, avec ses résultats et la conversation ouverte."></div>
+      </section>
+      <section class="panel" role="tabpanel" id="panel-agenda" aria-labelledby="tab-agenda" hidden>
+        <div class="text">
+          <div><h2><span lang="fr">Vos agendas, à côté du courrier.</span><span lang="en">Your calendars, next to your mail.</span></h2><p><span lang="fr">Les agendas de vos comptes Google, Outlook et CalDAV réunis dans une vue jour, semaine ou mois, aux couleurs de chaque compte. Créez, déplacez, répétez vos événements et invitez du monde, sans quitter facteur.</span><span lang="en">The calendars of your Google, Outlook and CalDAV accounts together in a day, week or month view, in each account's colours. Create, move and repeat your events and invite people, without leaving facteur.</span></p></div>
+          <ul class="checks">
+            <li><span lang="fr">Événements répétés : chaque semaine, le 3e mardi du mois, jusqu'à une date…</span><span lang="en">Repeating events: every week, the 3rd Tuesday of the month, until a date…</span></li>
+            <li><span lang="fr">Invités et leurs réponses, invitations envoyées pour vous</span><span lang="en">Guests and their answers, invitations sent for you</span></li>
+            <li><span lang="fr">Rappels en notification, avec « Rejoindre » pour la visio</span><span lang="en">Reminders as notifications, with “Join” for the video call</span></li>
+          </ul>
+        </div>
+        <div class="frame"><img src="screens/event-dark.webp" width="1800" height="1125" loading="lazy" decoding="async"
+            data-alt-fr="La semaine dans l'agenda, une réunion ouverte : lien de visio, lieu, invités et leurs réponses, rappel."
+            data-alt-en="The week in the calendar, a meeting open: video link, place, guests and their answers, reminder."
+            alt="La semaine dans l'agenda, une réunion ouverte : lien de visio, lieu, invités et leurs réponses, rappel."></div>
+      </section>
+      <section class="panel" role="tabpanel" id="panel-ai" aria-labelledby="tab-ai" hidden>
+        <div class="text">
+          <div><h2><span lang="fr">Une IA qui ne sort pas de chez vous.</span><span lang="en">An AI that never leaves home.</span></h2><p><span lang="fr">Désactivée tant que vous ne l'activez pas. Le modèle tourne sur votre ordinateur : aucun message, aucun texte et aucun son n'est envoyé à un serveur. Seul le fichier du modèle se télécharge, une fois.</span><span lang="en">Off until you turn it on. The model runs on your computer: no message, no text and no sound is sent to a server. Only the model's file is downloaded, once.</span></p></div>
+          <ul class="checks">
+            <li><span lang="fr">Résumer un long fil en quelques points</span><span lang="en">Sum up a long thread in a few points</span></li>
+            <li><span lang="fr">Un rendez-vous dans un message devient un événement en un clic</span><span lang="en">An appointment in a message becomes an event in one click</span></li>
+            <li><span lang="fr">Dicter vos messages : un bouton micro, la ponctuation en prime</span><span lang="en">Dictate your messages: a microphone button, punctuation included</span></li>
+          </ul>
+        </div>
+        <div class="frame"><img src="screens/ai-dark.webp" width="1800" height="1125" loading="lazy" decoding="async"
+            data-alt-fr="Un fil de quatre messages résumé en quatre points par l'IA locale, au-dessus de la conversation."
+            data-alt-en="A four-message thread summed up in four points by the local AI, above the conversation."
+            alt="Un fil de quatre messages résumé en quatre points par l'IA locale, au-dessus de la conversation."></div>
+      </section>
+
+      <section class="panel" role="tabpanel" id="panel-screener" aria-labelledby="tab-screener" hidden>
+        <div class="text">
+          <div><h2><span lang="fr">Les inconnus attendent à la porte.</span><span lang="en">Strangers wait at the door.</span></h2><p><span lang="fr">Filtre activé, le premier message d'un nouvel expéditeur attend votre décision au lieu d'arriver dans la boîte. Accepté une fois, il passe toujours ; refusé, on ne le revoit plus.</span><span lang="en">With the filter on, a new sender's first message waits for your decision instead of landing in the inbox. Accept once and they always get through; refuse and you won't see them again.</span></p></div>
+          <ul class="checks">
+            <li><span lang="fr">Accepter comme personne, newsletter ou notification</span><span lang="en">Accept as a person, a newsletter or a notification</span></li>
+            <li><span lang="fr">Décider pour tout un domaine d'un coup</span><span lang="en">Decide for a whole domain at once</span></li>
+            <li><span lang="fr">Les messages suspects sont signalés avant que vous acceptiez</span><span lang="en">Suspicious messages are flagged before you accept them</span></li>
+          </ul>
+        </div>
+        <div class="frame"><img src="screens/screener-dark.webp" width="1800" height="1125" loading="lazy" decoding="async"
+            data-alt-fr="L'écran des nouveaux expéditeurs : une carte par expéditeur, avec les boutons Accepter et Refuser, et un message frauduleux signalé."
+            data-alt-en="The new senders screen: one card per sender, with Accept and Refuse buttons, and a fraudulent message flagged."
+            alt="L'écran des nouveaux expéditeurs : une carte par expéditeur, avec les boutons Accepter et Refuser, et un message frauduleux signalé."></div>
+      </section>
+      <section class="panel" role="tabpanel" id="panel-write" aria-labelledby="tab-write" hidden>
+        <div class="text">
+          <div><h2><span lang="fr">Envoyer au bon moment, et s'en souvenir.</span><span lang="en">Send at the right time, and remember.</span></h2><p><span lang="fr">Un éditeur simple, vos signatures, alias et modèles, et de quoi se rattraper : quelques secondes pour annuler un envoi, un envoi programmé, et un rappel si personne ne répond.</span><span lang="en">A simple editor, your signatures, aliases and templates, and room for second thoughts: a few seconds to undo a send, scheduled sending, and a reminder when nobody answers.</span></p></div>
+          <ul class="checks">
+            <li><span lang="fr">Annuler l'envoi, envoyer plus tard, modèles de messages</span><span lang="en">Undo send, send later, message templates</span></li>
+            <li><span lang="fr">« Plus tard » : un message revient quand vous voulez</span><span lang="en">“Later”: a message comes back when you choose</span></li>
+            <li><span lang="fr">Relances : « Sans réponse » vous rappelle ce qui attend</span><span lang="en">Follow-ups: “No reply” reminds you of what is waiting</span></li>
+          </ul>
+        </div>
+        <div class="frame"><img src="screens/compose-dark.webp" width="1800" height="1125" loading="lazy" decoding="async"
+            data-alt-fr="La fenêtre de rédaction : destinataire, objet, texte mis en forme, signature et pièce jointe."
+            data-alt-en="The compose window: recipient, subject, formatted text, signature and an attachment."
+            alt="La fenêtre de rédaction : destinataire, objet, texte mis en forme, signature et pièce jointe."></div>
+      </section>
+      <section class="panel" role="tabpanel" id="panel-safety" aria-labelledby="tab-safety" hidden>
+        <div class="text">
+          <div><h2><span lang="fr">Méfiant à votre place.</span><span lang="en">Suspicious on your behalf.</span></h2><p><span lang="fr">Les images distantes, qui disent à l'expéditeur que vous avez lu, sont bloquées. facteur examine les liens et les pièces jointes avant que vous cliquiez.</span><span lang="en">Remote images, which tell the sender you've read the message, are blocked. facteur examines links and attachments before you click.</span></p></div>
+          <ul class="checks">
+            <li><span lang="fr">Liens trompeurs et domaines sosies signalés, pisteurs repérés</span><span lang="en">Deceptive links and lookalike domains flagged, trackers spotted</span></li>
+            <li><span lang="fr">Pièces jointes inspectées : leur vrai type, pas celui annoncé</span><span lang="en">Attachments inspected: their real type, not the one claimed</span></li>
+            <li><span lang="fr">Désabonnement en un clic des envois groupés</span><span lang="en">One-click unsubscribe from bulk mail</span></li>
+          </ul>
+        </div>
+        <div class="frame"><img src="screens/safety-dark.webp" width="1800" height="1125" loading="lazy" decoding="async"
+            data-alt-fr="Une lettre d'information ouverte : images distantes bloquées et bouton Se désabonner."
+            data-alt-en="A newsletter open: remote images blocked and an Unsubscribe button."
+            alt="Une lettre d'information ouverte : images distantes bloquées et bouton Se désabonner."></div>
+      </section>
+      <section class="panel" role="tabpanel" id="panel-backup" aria-labelledby="tab-backup" hidden>
+        <div class="text">
+          <div><h2><span lang="fr">Une copie de tout, chez vous.</span><span lang="en">A copy of everything, at home.</span></h2><p><span lang="fr">Chaque jour, facteur sauvegarde tous vos messages dans un dossier de votre choix, un fichier .eml par message, lisible par n'importe quel logiciel. Rien n'en est effacé, même si le message disparaît du serveur.</span><span lang="en">Every day, facteur backs up all your messages to a folder of your choice, one .eml file per message, readable by any software. Nothing is ever deleted from it, even when the message leaves the server.</span></p></div>
+          <ul class="checks">
+            <li><span lang="fr">Restaurer un dossier, une période ou quelques messages</span><span lang="en">Restore a folder, a date range or a few messages</span></li>
+            <li><span lang="fr">Un message rangé dans plusieurs dossiers ne prend la place qu'une fois</span><span lang="en">A message filed in several folders takes room only once</span></li>
+            <li><span lang="fr">Mots de passe dans le coffre du système, aucun serveur intermédiaire</span><span lang="en">Passwords in the system vault, no middleman server</span></li>
+          </ul>
+        </div>
+        <div class="frame"><img src="screens/backup-dark.webp" width="1800" height="1125" loading="lazy" decoding="async"
+            data-alt-fr="Les réglages de sauvegarde : dossier de destination, sauvegarde automatique quotidienne et état de chaque compte."
+            data-alt-en="The backup settings: destination folder, daily automatic backup and the state of each account."
+            alt="Les réglages de sauvegarde : dossier de destination, sauvegarde automatique quotidienne et état de chaque compte."></div>
+      </section>
+      <section class="panel" role="tabpanel" id="panel-stats" aria-labelledby="tab-stats" hidden>
+        <div class="text">
+          <div><h2><span lang="fr">Savoir ce qui encombre.</span><span lang="en">Know what clutters.</span></h2><p><span lang="fr">Combien vous recevez, de qui, à quelle heure, et ce qui prend de la place : de quoi faire le ménage en connaissance de cause.</span><span lang="en">How much you receive, from whom, at what time, and what takes up room: enough to clean up knowing what you're doing.</span></p></div>
+          <ul class="checks">
+            <li><span lang="fr">Expéditeurs et destinataires les plus fréquents</span><span lang="en">Most frequent senders and recipients</span></li>
+            <li><span lang="fr">Heures et jours de la semaine</span><span lang="en">Hours and days of the week</span></li>
+            <li><span lang="fr">Messages semblables traités d'un coup</span><span lang="en">Similar messages handled at once</span></li>
+          </ul>
+        </div>
+        <div class="frame"><img src="screens/stats-dark.webp" width="1800" height="1125" loading="lazy" decoding="async"
+            data-alt-fr="L'écran des statistiques : nombre de messages, reçus et envoyés par mois."
+            data-alt-en="The statistics screen: message counts, received and sent per month."
+            alt="L'écran des statistiques : nombre de messages, reçus et envoyés par mois."></div>
+      </section>
+      </div>
+    </div>
+  </section>
+
+  <section class="section more" aria-labelledby="more-title">
+    <div class="wrap">
+      <h2 class="section-title" id="more-title"><span lang="fr">Et tous les petits plus</span><span lang="en">And all the little extras</span></h2>
+      <p><span lang="fr">Ce qu'on attend d'un bon client mail, sans rien à configurer pour commencer.</span><span lang="en">What you expect from a good mail client, with nothing to set up to get started.</span></p>
+      <div class="grid">
+        <div class="card">
+          <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 5h18M6 12h12M10 19h4"/></svg></div>
+          <h3><span lang="fr">Règles</span><span lang="en">Rules</span></h3>
+          <p><span lang="fr">Ranger, archiver ou épingler les nouveaux messages selon l'expéditeur, l'objet ou la liste.</span><span lang="en">File, archive or pin new messages by sender, subject or list.</span></p>
+        </div>
+        <div class="card">
+          <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></svg></div>
+          <h3><span lang="fr">Au clavier</span><span lang="en">Keyboard first</span></h3>
+          <p><span lang="fr">Raccourcis partout et une palette de commandes pour tout atteindre.</span><span lang="en">Shortcuts everywhere and a command palette to reach anything.</span></p>
+        </div>
+        <div class="card">
+          <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.9 1.9 0 0 0 3.4 0"/></svg></div>
+          <h3><span lang="fr">Notifications</span><span lang="en">Notifications</span></h3>
+          <p><span lang="fr">Seulement pour les personnes, pour tout, ou jamais : vous choisissez.</span><span lang="en">Only for people, for everything, or never: your call.</span></p>
+        </div>
+        <div class="card">
+          <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></div>
+          <h3><span lang="fr">Réglages faciles à trouver</span><span lang="en">Settings easy to find</span></h3>
+          <p><span lang="fr">Une recherche dans les réglages, et une page par compte.</span><span lang="en">A search in the settings, and a page per account.</span></p>
+        </div>
+        <div class="card">
+          <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor"/></svg></div>
+          <h3><span lang="fr">Clair ou sombre</span><span lang="en">Light or dark</span></h3>
+          <p><span lang="fr">Suit votre système, avec la couleur d'accent de votre choix.</span><span lang="en">Follows your system, with the accent colour of your choice.</span></p>
+        </div>
+        <div class="card">
+          <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></svg></div>
+          <h3><span lang="fr">Client par défaut</span><span lang="en">Default client</span></h3>
+          <p><span lang="fr">Les liens « mailto: » du système et du navigateur s'ouvrent dans facteur.</span><span lang="en">“mailto:” links from the system and the browser open in facteur.</span></p>
+        </div>
+        <div class="card">
+          <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8"/></svg></div>
+          <h3><span lang="fr">Vos contacts</span><span lang="en">Your contacts</span></h3>
+          <p><span lang="fr">Les carnets d'adresses Google, Outlook et CardDAV proposés quand vous écrivez.</span><span lang="en">Google, Outlook and CardDAV address books suggested as you write.</span></p>
+        </div>
+        <div class="card">
+          <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22v-5M9 8V2M15 8V2M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8z"/></svg></div>
+          <h3><span lang="fr">Serveurs capricieux</span><span lang="en">Fussy servers</span></h3>
+          <p><span lang="fr">Une boîte qui coupe les connexions ? facteur le repère et propose de n'en garder qu'une.</span><span lang="en">A mailbox that keeps dropping connections? facteur spots it and offers to keep just one.</span></p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="android section" aria-labelledby="android-title">
+    <div class="wrap">
+      <div class="box">
+        <div>
+          <p class="eyebrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="3"/><path d="M11 18h2"/></svg>Android<span class="badge-soon"><span lang="fr">bientôt</span><span lang="en">soon</span></span></p>
+          <h2 class="section-title" id="android-title"><span lang="fr">Bientôt dans votre poche.</span><span lang="en">Soon in your pocket.</span></h2>
+          <p><span lang="fr">facteur arrive sur Android : la même boîte unifiée, le même tri, les mêmes protections, pensés pour le doigt.</span><span lang="en">facteur is coming to Android: the same unified inbox, the same sorting, the same protections, designed for your thumb.</span></p>
+        </div>
+        <div class="phones">
+          <div class="phone"><img src="screens/mobile-inbox-dark.webp" width="780" height="1688" loading="lazy" decoding="async"
+            data-alt-fr="La boîte unifiée sur un téléphone."
+            data-alt-en="The unified inbox on a phone."
+            alt="La boîte unifiée sur un téléphone."></div>
+          <div class="phone"><img src="screens/mobile-message-dark.webp" width="780" height="1688" loading="lazy" decoding="async"
+            data-alt-fr="Une invitation à une réunion ouverte sur un téléphone."
+            data-alt-en="A meeting invitation open on a phone."
+            alt="Une invitation à une réunion ouverte sur un téléphone."></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="closing" aria-labelledby="closing-title">
+    <div class="wrap">
+      <h2 class="section-title" id="closing-title"><span lang="fr">Prêt à essayer ?</span><span lang="en">Ready to try it?</span></h2>
+      <p><span lang="fr">Gratuit, sans compte à créer, en une minute.</span><span lang="en">Free, no account to create, in a minute.</span></p>
+      <div class="cta"><a class="btn primary win" aria-disabled="true" href="download.html">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3 5.5 10 4.5v7H3zM11 4.4 21 3v8.5H11zM3 12.5h7v7L3 18.5zM11 12.5h10V21l-10-1.4z"/></svg>
+          <span class="lbl"><span><span lang="fr">Télécharger pour Windows</span><span lang="en">Download for Windows</span></span><small class="win-meta"><span lang="fr">Windows 10 et 11</span><span lang="en">Windows 10 and 11</span></small></span>
+        </a></div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span class="brand"><img src="icon.png" alt="" width="24" height="24" loading="lazy">facteur</span>
+    <span><span lang="fr">Client mail pour Windows et Linux, bientôt sur Android. Gratuit.</span><span lang="en">A mail client for Windows and Linux, coming to Android. Free.</span></span>
+    <span><a href="features.html"><span lang="fr">Fonctions</span><span lang="en">Features</span></a> · <a href="news.html"><span lang="fr">Nouveautés</span><span lang="en">What's new</span></a> · <a href="privacy.html"><span lang="fr">Confidentialité</span><span lang="en">Privacy</span></a> · <a href="terms.html"><span lang="fr">Conditions d'utilisation</span><span lang="en">Terms of use</span></a></span>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>

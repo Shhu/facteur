@@ -1,0 +1,5 @@
+<resources>
+    <string name="listener_channel">Écoute en arrière-plan</string>
+    <string name="listener_title">facteur écoute vos boîtes</string>
+    <string name="listener_text">Les nouveaux messages arrivent aussitôt. Désactivable dans les réglages.</string>
+</resources>

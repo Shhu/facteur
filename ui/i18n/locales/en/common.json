@@ -1,0 +1,148 @@
+{
+  "common": {
+    "confirm": {
+      "title": "Confirm",
+      "ok": "Confirm"
+    },
+    "unknown": "(unknown)",
+    "me": "me",
+    "noSubject": "(no subject)",
+    "neverSynced": "Never synced",
+    "syncing": "Syncing…",
+    "sentTo": "To {to} · sent {ago}",
+    "role": {
+      "inbox": "Inbox",
+      "sent": "Sent",
+      "drafts": "Drafts",
+      "trash": "Trash",
+      "junk": "Junk",
+      "archive": "Archive",
+      "all": "All mail",
+      "flagged": "Pinned",
+      "snoozed": "Later",
+      "screener": "New senders",
+      "refused": "Screened out"
+    },
+    "date": {
+      "today": "Today",
+      "yesterday": "Yesterday",
+      "thisWeek": "This week",
+      "earlierThisMonth": "Earlier this month"
+    },
+    "until": {
+      "today": "today {time}",
+      "tomorrow": "tomorrow {time}"
+    },
+    "since": {
+      "now": "just now"
+    },
+    "ago": {
+      "today": "today",
+      "yesterday": "yesterday",
+      "days": "{n} days ago",
+      "week": "a week ago",
+      "weeks": "{n} weeks ago"
+    },
+    "size": {
+      "b": "{n} B",
+      "kb": "{n} KB",
+      "mb": "{n} MB",
+      "gb": "{n} GB"
+    },
+    "when": {
+      "in3h": "In 3 hours",
+      "tonight": "This evening",
+      "tomorrowMorning": "Tomorrow morning",
+      "weekend": "This weekend",
+      "nextWeek": "Next week",
+      "tomorrowAfternoon": "Tomorrow afternoon",
+      "mondayMorning": "Monday morning"
+    },
+    "error": "Error",
+    "cancel": "Cancel",
+    "undo": "Undo",
+    "undone": "Action undone",
+    "undoFailed": "Could not undo",
+    "language": {
+      "label": "Language",
+      "fr": "Français",
+      "en": "English"
+    },
+    "toast": {
+      "stillRefused": "Still refused by the server",
+      "draftUnreadable": "Unreadable draft",
+      "cannotReopen": "Could not reopen the message",
+      "searchNotSaved": "Search not saved",
+      "syncFailed": "Sync failed",
+      "syncFailedFor": "Sync failed ({email})",
+      "sendFailed": "Could not send · {subject}",
+      "willRetry": "facteur will retry in a minute.",
+      "waitsInOutbox": "The message is waiting in the outbox.",
+      "edit": "Edit",
+      "outbox": "Outbox",
+      "messageNotFound": "Message not found"
+    },
+    "compose": {
+      "wrote": "On {date}, {who} wrote:",
+      "forwarded": "---------- Forwarded message ----------",
+      "from": "From: {v}",
+      "date": "Date: {v}",
+      "subject": "Subject: {v}",
+      "to": "To: {v}",
+      "unsavedLeave": "This draft could not be saved. Leave it anyway and lose the changes that were not saved?",
+      "leaveAnyway": "Leave without saving",
+      "keepEditing": "Keep editing"
+    },
+    "attachment": {
+      "saveAnyway": "Save it anyway? Don't open it if you weren't expecting it.",
+      "suspicious": "Suspicious attachment",
+      "saved": "Attachment saved",
+      "open": "Open",
+      "previewFailed": "Preview unavailable"
+    },
+    "backup": {
+      "incomplete": "Backup incomplete",
+      "done": "Backup complete",
+      "newMessages": "No new message backed up | {n} new message backed up | {n} new messages backed up",
+      "upToDate": "Everything was already backed up",
+      "restoreFailed": "Restore failed",
+      "autoFailedHint": "Further automatic attempts will fail silently: see Settings › Backup."
+    },
+    "purge": {
+      "titleTrash": "Empty trash",
+      "titleJunk": "Empty junk",
+      "loading": "Taking stock of the folder…",
+      "messages": "no messages | message | messages",
+      "period": "From {from} to {to}",
+      "periodToday": "From {from} to today, {time}",
+      "since": "Since {from}",
+      "missingTitle": "{n} message is not in facteur | {n} messages are not in facteur",
+      "missing": "The server holds {server}, facteur has {local} cached. Download them to see what will be deleted before emptying?",
+      "download": "Download the message | Download the {n} messages",
+      "downloading": "Downloading… {local} / {server}",
+      "stop": "Stop",
+      "downloadFailed": "Download interrupted",
+      "topSenders": "Top senders",
+      "sendersHint": "Click to see their messages",
+      "list": "Messages",
+      "more": "… and {n} more",
+      "unread": "unread",
+      "withAttachments": "with attachments | with attachment | with attachments",
+      "freed": "freed on the server",
+      "freedShort": "freed",
+      "clearFilter": "Remove the filter: {name}",
+      "countAll": "no messages | {n} message | {n} messages, newest first",
+      "countSender": "no messages from this sender | {n} message from this sender | {n} messages from this sender",
+      "grouped": "{n} message in a row | {n} message in a row | {n} messages in a row",
+      "recent": "most recent",
+      "seeAll": "No messages | See the message | See all {n} messages",
+      "empty": "This folder is already empty.",
+      "warningTitle": "Permanent deletion on the server",
+      "warningDetail": "No messages to delete. | This message cannot be recovered, neither in facteur nor at {provider}. | These {n} messages cannot be recovered, neither in facteur nor at {provider}.",
+      "warningShort": "These messages cannot be recovered.",
+      "confirm": "Empty · {n} message | Empty · {n} messages",
+      "done": "{n} message permanently deleted | {n} messages permanently deleted",
+      "failed": "Could not empty the folder"
+    }
+  }
+}

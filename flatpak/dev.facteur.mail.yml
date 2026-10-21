@@ -1,0 +1,57 @@
+# Flatpak of facteur, built locally by scripts/build-flatpak.sh (never on CI). The interface is
+# generated beforehand on the host (ui/.output/public); the engine and the window are compiled
+# here in the GNOME SDK, with the network open to fetch the crates (a local build, not Flathub).
+id: dev.facteur.mail
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: facteur
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # Passwords and tokens in the system keyring (Secret Service).
+  - --talk-name=org.freedesktop.secrets
+  - --talk-name=org.freedesktop.Notifications
+  # "Show backup folder" (tauri-plugin-opener's revealItemInDir asks the file manager over D-Bus).
+  - --talk-name=org.freedesktop.FileManager1
+  # Downloads, where saved attachments usually go.
+  - --filesystem=xdg-download
+  # Default backup folder (ui/app/composables/useBackup.ts: Documents/facteur-sauvegardes);
+  # without it the backups land on the sandbox's throwaway tmpfs.
+  - --filesystem=xdg-documents/facteur-sauvegardes:create
+modules:
+  - name: facteur
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      build-args:
+        - --share=network
+      env:
+        CARGO_HOME: /run/build/facteur/cargo-home
+    build-commands:
+      # `tauri/custom-protocol`: what `tauri build` turns on, the interface is served from the binary.
+      # Without the local AI for now: llama.cpp needs libclang (the SDK's LLVM extension).
+      - cargo build --release --locked -p facteur-app --bin facteur --no-default-features --features tauri/custom-protocol
+      - install -Dm755 target/release/facteur /app/bin/facteur
+      - install -Dm644 flatpak/dev.facteur.mail.desktop /app/share/applications/dev.facteur.mail.desktop
+      - install -Dm644 flatpak/dev.facteur.mail.metainfo.xml /app/share/metainfo/dev.facteur.mail.metainfo.xml
+      - install -Dm644 src-tauri/icons/32x32.png /app/share/icons/hicolor/32x32/apps/dev.facteur.mail.png
+      - install -Dm644 src-tauri/icons/64x64.png /app/share/icons/hicolor/64x64/apps/dev.facteur.mail.png
+      - install -Dm644 src-tauri/icons/128x128.png /app/share/icons/hicolor/128x128/apps/dev.facteur.mail.png
+      - install -Dm644 src-tauri/icons/128x128@2x.png /app/share/icons/hicolor/256x256/apps/dev.facteur.mail.png
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - .git
+          - target
+          - node_modules
+          - ui/node_modules
+          - ui/.nuxt
+          - site
+          - src-tauri/gen

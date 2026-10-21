@@ -1,0 +1,504 @@
+{
+  "mail": {
+    "page": {
+      "done": "Done",
+      "unified": "Unified inbox",
+      "toDo": "To do",
+      "filter": {
+        "all": "All",
+        "unread": "Unread",
+        "flagged": "Pinned"
+      },
+      "to": "To: {who}",
+      "historyUnavailable": "History unavailable",
+      "serverSearchFailed": "Server search failed",
+      "snoozeMany": "Snooze {n} conversations",
+      "snoozeUntil": "Snooze until…",
+      "backOn": "Back {when}",
+      "toInboxDone": "Moved to inbox | {n} conversations moved to inbox",
+      "doneDone": "Done | {n} conversations done",
+      "archived": "Archived | {n} conversations archived",
+      "deleted": "Deleted | {n} conversations deleted",
+      "movedTo": "Moved to {folder}",
+      "searchAll": "Search all accounts",
+      "search": "Search",
+      "searchIn": "Search {account}",
+      "searchAccount": "Search this account",
+      "selectAll": "Select all",
+      "selectedCount": "{n} selected",
+      "toInbox": "Move to inbox",
+      "markDone": "Done",
+      "archive": "Archive",
+      "trash": "Delete",
+      "readToggle": "Read / unread",
+      "readToggleAria": "Read or unread",
+      "later": "Later",
+      "pin": "Pin",
+      "move": "Move",
+      "clearSelection": "Clear selection",
+      "includeBins": "Include trash and junk",
+      "searchServer": "Search on server",
+      "searchServerToo": "Also search on server",
+      "serverSearched": "Also searched on the server ({n} found)",
+      "empty": {
+        "noResultsServer": "No results, even on the server",
+        "noResultsCache": "No results in cached messages",
+        "allRead": "All read",
+        "noPinned": "No pinned messages",
+        "noDone": "Nothing done yet",
+        "allDone": "All done",
+        "nothingSnoozed": "Nothing snoozed",
+        "inboxEmpty": "Inbox is empty",
+        "noMessages": "No messages",
+        "noNewSenders": "No messages from new senders"
+      },
+      "historyComplete": "This folder's full history is loaded",
+      "loadingOlder": "Loading older messages…",
+      "retryOlder": "Retry loading older messages",
+      "selectConversation": "Select a conversation",
+      "hint": {
+        "navigate": "to navigate",
+        "select": "to select",
+        "compose": "to compose"
+      },
+      "category": {
+        "people": "People",
+        "notification": "Notifications",
+        "newsletter": "Newsletters",
+        "all": "All"
+      }
+    },
+    "threadList": {
+      "pinned": "Pinned",
+      "conversations": "{n} conversations",
+      "toInbox": "Move to inbox",
+      "done": "Done",
+      "archive": "Archive",
+      "unsnooze": "Unsnooze now",
+      "later": "Later",
+      "trash": "Delete",
+      "markRead": "Mark as read",
+      "markUnread": "Mark as unread",
+      "unpin": "Unpin",
+      "pin": "Pin"
+    },
+    "threadRow": {
+      "select": "Select",
+      "unread": "Unread",
+      "woken": "Back from “Later”"
+    },
+    "threadView": {
+      "folded": "{n} more message | {n} more messages",
+      "openFailed": "Couldn't open the message",
+      "toInbox": "Move to inbox",
+      "markDone": "Done",
+      "archive": "Archive",
+      "movedToInbox": "Moved to inbox",
+      "doneDone": "Done",
+      "archived": "Archived",
+      "deleted": "Deleted",
+      "snoozeUntil": "Snooze until…",
+      "backOn": "Back {when}",
+      "notJunk": "Not junk",
+      "reportJunk": "Report as junk",
+      "reportedJunk": "Reported as junk",
+      "deleteSimilar": "Similar messages…",
+      "createRule": "Create a rule for this sender…",
+      "block": "Block {who}",
+      "blockConfirm": "Messages from {email}, past and future, will go straight to junk.",
+      "blockTitle": "Block sender",
+      "movedTo": "Moved to {folder}",
+      "back": "Back",
+      "unsnooze": "Unsnooze now",
+      "later": "Later",
+      "trash": "Delete",
+      "more": "More",
+      "move": "Move",
+      "markUnread": "Mark as unread",
+      "unread": "Unread",
+      "unpin": "Unpin",
+      "pin": "Pin",
+      "mute": "Mute conversation",
+      "unmute": "Unmute conversation",
+      "muted": "Conversation muted: its next messages will be archived",
+      "unmuted": "Conversation no longer muted",
+      "outgoing": {
+        "you": "You",
+        "pending": "sending in a few seconds",
+        "sending": "sending…",
+        "sent": "sent",
+        "failed": "not sent: see the outbox"
+      },
+      "mutedBadge": "Muted",
+      "ai": {
+        "summarize": "Sum up the thread",
+        "short": "AI",
+        "title": "Local AI",
+        "summaryTitle": "Summary (local AI)",
+        "summarizing": "Summing up on this computer…",
+        "event": "Make an event from this message",
+        "noEvent": "No appointment found in this message",
+        "checkDate": "Check the date: it was not understood"
+      }
+    },
+    "messageCard": {
+      "imagesAlways": "Images always shown",
+      "imagesAlwaysDesc": "For {key}. You can change this in Settings.",
+      "show": "Show",
+      "alwaysFor": "Always for {key}",
+      "remoteConfirm": "This message is untrustworthy. Showing its remote images tells the sender you opened it.",
+      "remoteConfirmTitle": "Show images",
+      "reportedJunk": "Reported as junk",
+      "unsubConfirm": "Stop receiving mail from {who}?",
+      "unsubscribe": "Unsubscribe",
+      "unsubMailConfirm": "facteur will send a message to {address}\nSubject: “{subject}”\n\nSend?",
+      "unsubMailTitle": "Unsubscribe by email",
+      "unsubPageOpened": "Unsubscribe page opened",
+      "unsubPageDesc": "Finish in your browser.",
+      "unsubscribed": "Unsubscribed",
+      "unsubSent": "Request sent to {address}",
+      "unsubDone": "{who} shouldn't email you anymore.",
+      "unsubFailed": "Couldn't unsubscribe",
+      "print": {
+        "message": "Message",
+        "from": "From",
+        "to": "To",
+        "cc": "Cc",
+        "date": "Date",
+        "attachments": "Attachments",
+        "action": "Print or save as PDF…"
+      },
+      "darken": "Darken message",
+      "originalColors": "Original colors",
+      "showSource": "Show source",
+      "verified": "Verified sender · {reasons}",
+      "untrusted": "Untrustworthy message",
+      "downloading": "Downloading message…",
+      "fraudTitle": "Caution: this message may be fraudulent",
+      "reportJunk": "Report as junk",
+      "fraudAdvice": "Don't reply, open attachments or unsubscribe: that would confirm your address.",
+      "bulk": "Bulk mail (newsletter, mailing list)",
+      "remoteBlocked": "Remote images blocked to protect your privacy.",
+      "reply": "Reply",
+      "replyAll": "Reply all",
+      "forward": "Forward",
+      "others": "and {n} other | and {n} others",
+      "repliesTo": "Replies go to {who}",
+      "addToCalendar": "Add to calendar",
+      "addToCalendarShort": "Calendar",
+      "to": "To",
+      "cc": "Cc",
+      "replyTo": "Reply to",
+      "less": "Less"
+    },
+    "mailFrame": {
+      "loading": "Loading the message…",
+      "deceptive": "This link shows “{shown}” but actually leads to “{host}”. This is a common phishing technique.\n\nOpen anyway?",
+      "cautious": "This message is untrustworthy. The link leads to “{host}”.\n\nOpen anyway?",
+      "deceptiveTitle": "Deceptive link",
+      "cautiousTitle": "Link from an untrustworthy message",
+      "openFailed": "Couldn't open the link",
+      "frameTitle": "Message content"
+    },
+    "linkPreview": {
+      "trusted": "Safe link",
+      "check": "Check this link",
+      "suspicious": "Suspicious link",
+      "created": "Domain created in {date}",
+      "seenIn": "Found in {n} other message | Found in {n} other messages",
+      "neverSeen": "Never seen in your messages",
+      "tracking": "Tracking: {list}",
+      "openFailed": "Couldn't open the link",
+      "copied": "Link copied",
+      "copyFailed": "Couldn't copy",
+      "label": "Link preview",
+      "analysisFailed": "Analysis failed",
+      "analyzing": "Analyzing link…",
+      "redirectsTo": "Redirects to",
+      "openAnyway": "Open anyway",
+      "open": "Open",
+      "noTracking": "Without tracking",
+      "copy": "Copy",
+      "sender": {
+        "title": "What {domain} lacks to authenticate its mail:",
+        "noDmarc": "no DMARC policy published",
+        "noSpf": "no SPF record published",
+        "noDkim": "this message is not signed (DKIM)",
+        "badDkim": "this message's DKIM signature is invalid",
+        "otherDkim": "this message is signed by {domain}, not by its own domain (DKIM)",
+        "advice": "So its address can be imitated. Worth telling the sender: it is fixed in their DNS or with their host."
+      },
+      "announced": {
+        "created": "Announced domain “{domain}”: created in {date}",
+        "seenIn": "Announced domain “{domain}”: found in {n} other message | Announced domain “{domain}”: found in {n} other messages",
+        "neverSeen": "Announced domain “{domain}”: never seen in your messages",
+        "sender": "Announced domain “{domain}”: the sender's own"
+      }
+    },
+    "attachment": {
+      "trusted": "Safe file",
+      "check": "Check this file",
+      "suspicious": "Suspicious file",
+      "analysisFailed": "Analysis failed",
+      "analyzing": "Analyzing attachment…",
+      "contains": "Contains {n} file: | Contains {n} files:",
+      "openInApp": "Open in facteur",
+      "saveAnyway": "Save anyway",
+      "download": "Download"
+    },
+    "pdf": {
+      "zoomOut": "Zoom out",
+      "percent": "{n}%",
+      "zoomIn": "Zoom in",
+      "fitWidth": "Fit width",
+      "pages": "{n} page | {n} pages",
+      "unreadable": "Unreadable PDF: {error}",
+      "opening": "Opening PDF…",
+      "page": "Page {n}"
+    },
+    "invite": {
+      "range": "from {from} to {to}",
+      "maybe": "Maybe",
+      "organizer": "the organizer",
+      "responseSent": "Response sent",
+      "responseTo": "To {to}",
+      "responseFailed": "Response not sent",
+      "eventSaved": "Event saved",
+      "eventSavedDesc": "Open it to add it to your calendar.",
+      "cancelled": "Event cancelled",
+      "reply": "Reply to an invitation",
+      "invitation": "Invitation",
+      "recurring": "Recurring",
+      "untitled": "(untitled)",
+      "organizedBy": "Organized by {who}",
+      "band": {
+        "accepted": "You're going",
+        "tentative": "You replied maybe",
+        "declined": "You declined",
+        "pending": "Invitation · awaiting your reply"
+      },
+      "updated": "Update",
+      "updatedWhat": "Update · {what}",
+      "changed": "Changed: {what}",
+      "header": {
+        "updated": "Updated invitation",
+        "cancelled": "Cancelled invitation"
+      },
+      "tag": {
+        "update": "Updated",
+        "cancelled": "Cancelled",
+        "accepted": "Accepted",
+        "tentative": "Maybe",
+        "declined": "Declined",
+        "delegated": "Delegated",
+        "none": "No reply"
+      },
+      "allDayOnly": "All day",
+      "durationH": "{h} h",
+      "durationHM": "{h} h {m}",
+      "durationM": "{m} min",
+      "days": "{n} day | {n} days",
+      "zone": "{city} time",
+      "otherZoneTime": "{time} in {city}",
+      "join": "Join",
+      "joinProvider": "Join {provider}",
+      "guests": "{n} guest | {n} guests",
+      "acceptCount": "{n} accepted | {n} accepted",
+      "maybeCount": "{n} maybe",
+      "declineCount": "{n} declined | {n} declined",
+      "noReplyCount": "{n} no reply",
+      "seeAll": "See all",
+      "seeAllCount": "See all {n} people",
+      "hideAll": "Hide",
+      "you": "you",
+      "organizes": "organizer",
+      "yes": "Yes",
+      "no": "No",
+      "yourResponse": "Your response",
+      "addToCalendar": "Add to calendar",
+      "provider": {
+        "google": "Google Calendar"
+      },
+      "showOriginal": "Show the original email from {from}",
+      "showOriginalElided": "Show the original email from {from}",
+      "hideOriginal": "Hide the original email",
+      "excerpt": "“{text}”",
+      "to": "to",
+      "free": "Free at that time",
+      "nextOccurrence": "Next occurrence: {date}",
+      "conflict": "Conflicts with: {what}",
+      "conflictMore": "Conflicts with: {what} and {n} other | Conflicts with: {what} and {n} others",
+      "yourDay": "Your calendar that day"
+    },
+    "source": {
+      "unavailable": "Source unavailable",
+      "copied": "Copied",
+      "copyFailed": "Couldn't copy",
+      "saved": "Message saved",
+      "title": "Message source",
+      "headers": "Headers",
+      "full": "Full source",
+      "copy": "Copy",
+      "saveEml": "Save (.eml)",
+      "loading": "Loading…"
+    },
+    "followUps": {
+      "title": "No reply",
+      "dismiss": "Don't remind me",
+      "less": "Less",
+      "more": "{n} more"
+    },
+    "searchSuggest": {
+      "label": "Search suggestions",
+      "from": "sender (address or name)",
+      "to": "recipient",
+      "with": "exchanges with someone",
+      "subject": "in the subject",
+      "in": "in a folder",
+      "after": "after a date (2026-03-01)",
+      "before": "before a date",
+      "attachment": "with an attachment",
+      "unread": "unread",
+      "read": "read",
+      "pinned": "pinned",
+      "labelled": "filed in one of your folders",
+      "unlabelled": "in none of your folders",
+      "dates": {
+        "today": "Today",
+        "yesterday": "Yesterday",
+        "week": "7 days ago",
+        "month": "1 month ago",
+        "quarter": "3 months ago",
+        "year": "1 year ago"
+      }
+    },
+    "searchField": {
+      "edit": "Edit {chip}",
+      "remove": "Remove {chip}"
+    },
+    "searchHelp": {
+      "ops": {
+        "from": {
+          "op": "from:mary",
+          "desc": "sender (address or name)"
+        },
+        "to": {
+          "op": "to:paul",
+          "desc": "recipient"
+        },
+        "with": {
+          "op": "with:anthony",
+          "desc": "conversations with someone: from or to them"
+        },
+        "subject": {
+          "op": "subject:\"quote 2026\"",
+          "desc": "in the subject"
+        },
+        "attachment": {
+          "op": "has:attachment",
+          "desc": "with an attachment"
+        },
+        "read": {
+          "op": "is:unread · is:read",
+          "desc": "read status"
+        },
+        "pinned": {
+          "op": "is:pinned",
+          "desc": "pinned messages"
+        },
+        "labels": {
+          "op": "has:userlabels · has:nouserlabels",
+          "desc": "filed in your folders, or not"
+        },
+        "after": {
+          "op": "after:2026-01-01",
+          "desc": "from this date on"
+        },
+        "before": {
+          "op": "before:2026-03-31",
+          "desc": "before this date"
+        },
+        "in": {
+          "op": "in:sent",
+          "desc": "a folder (role or name) or a Gmail label, also label:; in:trash searches it even with the switch off"
+        }
+      },
+      "savedToast": "Search saved",
+      "savedToastDesc": "It appears in the sidebar.",
+      "saveSearch": "Save search",
+      "help": "Search help",
+      "alreadySaved": "Search already saved",
+      "saveThis": "Save this search",
+      "name": "Search name",
+      "save": "Save",
+      "operators": "Operators",
+      "footer": "Combine them with each other and with free text. Also in French: de:, à:, avec:, objet:, pj, non-lu, avant:, après:, dans:."
+    },
+    "address": {
+      "copy": "Copy address",
+      "copied": "Address copied",
+      "copyFailed": "Could not copy",
+      "write": "Write",
+      "messages": "Your conversations",
+      "rule": "Create a rule",
+      "block": "Block",
+      "blocked": "Sender blocked",
+      "blockConfirm": "Messages from {email}, past and future, will go straight to junk.",
+      "classify": "File this sender under",
+      "classified": "{who} now goes to {category}"
+    },
+    "list": {
+      "unread": "{n} unread | {n} unread",
+      "accounts": "{n} account | {n} accounts"
+    },
+    "reader": {
+      "messageCount": "{n} message | {n} messages",
+      "verified": "Verified",
+      "showQuoted": "Show quoted message | Show {n} quoted messages",
+      "hideQuoted": "Hide quoted messages"
+    },
+    "screener": {
+      "title": "New senders",
+      "intro": "Their first message waits here for your decision. Accepted, a sender lands in the inbox; screened out, their messages go to “Screened out”.",
+      "swipeHint": "Swipe right to accept, left to screen out.",
+      "hint": {
+        "move": "move",
+        "accept": "accept",
+        "refuse": "screen out",
+        "open": "open"
+      },
+      "empty": "No new senders",
+      "emptyHint": "First messages from people who never wrote to you before will wait here.",
+      "offHint": "The new-senders filter is turned on in each account's settings.",
+      "openSettings": "Open settings",
+      "messages": "{n} message | {n} messages",
+      "accept": "Accept",
+      "acceptAs": "Accept as…",
+      "asNewsletter": "Accept as a newsletter",
+      "asNotification": "Accept as a notification",
+      "refuse": "Screen out",
+      "wholeDomain": "Whole domain ({domain})",
+      "lowTrust": "This message shows signs of fraud: check it before accepting this sender.",
+      "openLatest": "Open the latest message",
+      "accepted": "Accepted: {name}",
+      "acceptedNewsletter": "Accepted as a newsletter: {name}",
+      "acceptedNotification": "Accepted as a notification: {name}",
+      "refused": "Screened out: {name}",
+      "banner": "{n} new sender | {n} new senders",
+      "review": "Review",
+      "held": "New sender: {name}"
+    },
+    "quit": {
+      "sending": "Sending {n} message before quitting… | Sending {n} messages before quitting…",
+      "sendingHint": "Close again to quit without waiting."
+    },
+    "labels": {
+      "title": "Labels",
+      "add": "Label",
+      "none": "No labels on this account",
+      "added": "Label “{label}” added",
+      "removed": "Label “{label}” removed",
+      "remove": "Remove label {label}"
+    }
+  }
+}

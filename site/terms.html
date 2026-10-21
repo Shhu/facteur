@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>facteur · Conditions d'utilisation</title>
+<link rel="icon" href="icon.png">
+<style>
+  :root { --bg:#fafafa; --surface:#fff; --border:#e4e4e7; --text:#18181b; --muted:#52525b; --link:#0e7490; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0b0b0d; --surface:#161619; --border:#27272a; --text:#f4f4f5; --muted:#a1a1aa; --link:#67e8f9; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.65 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  a { color:var(--link); }
+  .wrap { max-width:760px; margin:0 auto; padding:0 16px 64px; }
+  header { display:flex; align-items:center; gap:12px; padding:20px 0 8px; }
+  header img { width:32px; height:32px; border-radius:8px; }
+  header a.home { color:var(--text); text-decoration:none; font-weight:700; font-size:18px; }
+  header button { margin-left:auto; border:1px solid var(--border); background:var(--surface); color:var(--muted); border-radius:999px; padding:6px 12px; font:inherit; font-size:13px; font-weight:600; cursor:pointer; }
+  h1 { font-size:32px; letter-spacing:-0.02em; margin:28px 0 4px; }
+  h2 { font-size:19px; margin:32px 0 8px; }
+  p, li { color:var(--muted); }
+  .updated { font-size:14px; }
+  [data-lang="en"] [lang="fr"], [data-lang="fr"] [lang="en"] { display:none; }
+</style>
+</head>
+<body data-lang="fr">
+<div class="wrap">
+  <header>
+    <img src="icon.png" alt="">
+    <a class="home" href="./">facteur</a>
+    <button type="button" id="lang">English</button>
+  </header>
+  <h1><span lang="fr">Conditions d'utilisation</span><span lang="en">Terms of use</span></h1>
+  <p class="updated"><span lang="fr">Dernière mise à jour : 20 octobre 2026</span><span lang="en">Last updated: October 20, 2026</span></p>
+  <p><span lang="fr">facteur est un client mail gratuit, fourni par un développeur indépendant. En l'utilisant, vous acceptez les conditions suivantes.</span><span lang="en">facteur is a free mail client, provided by an independent developer. By using it, you accept the following terms.</span></p>
+  <h2><span lang="fr">Utilisation</span><span lang="en">Use</span></h2>
+  <p><span lang="fr">Vous pouvez utiliser facteur librement pour gérer vos propres comptes de messagerie et agendas. Vous restez responsable du contenu que vous envoyez et du respect des conditions de vos fournisseurs (Google, Microsoft, votre hébergeur…).</span><span lang="en">You may use facteur freely to manage your own mail accounts and calendars. You remain responsible for the content you send and for following your providers' terms (Google, Microsoft, your host…).</span></p>
+  <h2><span lang="fr">Vos données</span><span lang="en">Your data</span></h2>
+  <p><span lang="fr">Vos données restent les vôtres et restent sur votre appareil : voir les <a href="privacy.html">règles de confidentialité</a>.</span><span lang="en">Your data remains yours and stays on your device: see the <a href="privacy.html">privacy policy</a>.</span></p>
+  <h2><span lang="fr">Sans garantie</span><span lang="en">No warranty</span></h2>
+  <p><span lang="fr">facteur est fourni « tel quel », sans garantie d'aucune sorte. Il est en cours de développement : gardez une sauvegarde de vos messages importants (facteur sait en faire une, et vos messages restent aussi sur vos serveurs). L'auteur ne peut être tenu responsable d'une perte de données ou d'un dommage lié à son utilisation, dans les limites permises par la loi.</span><span lang="en">facteur is provided “as is”, without warranty of any kind. It is under development: keep a backup of your important messages (facteur can make one, and your messages also stay on your servers). The author cannot be held liable for data loss or damage arising from its use, to the extent permitted by law.</span></p>
+  <h2><span lang="fr">Licence</span><span lang="en">License</span></h2>
+  <p><span lang="fr">Le code de facteur est distribué sous licence MIT ou Apache 2.0, au choix. Le nom « facteur » et son logo n'en font pas partie : une version modifiée doit porter un autre nom.</span><span lang="en">facteur's code is distributed under the MIT or the Apache 2.0 license, at your option. The name “facteur” and its logo are not part of it: a modified version must carry another name.</span></p>
+  <h2><span lang="fr">Mises à jour et fin du service</span><span lang="en">Updates and discontinuation</span></h2>
+  <p><span lang="fr">facteur se met à jour de lui-même. Ces conditions peuvent évoluer ; la date en haut de page indique la dernière version. L'auteur peut arrêter de développer facteur à tout moment ; l'application installée continue alors de fonctionner, sans mises à jour.</span><span lang="en">facteur updates itself. These terms may change; the date at the top shows the latest version. The author may stop developing facteur at any time; the installed app then keeps working, without updates.</span></p>
+  <h2><span lang="fr">Contact</span><span lang="en">Contact</span></h2>
+  <p><span lang="fr">Pour toute question, écrivez à l'adresse d'assistance indiquée sur l'écran de connexion Google de facteur.</span><span lang="en">For any question, write to the support address shown on facteur's Google sign-in screen.</span></p>
+
+</div>
+<script>
+  const button = document.getElementById('lang')
+  function setLang(lang) {
+    document.body.dataset.lang = lang
+    document.documentElement.lang = lang
+    button.textContent = lang === 'fr' ? 'English' : 'Français'
+    try { localStorage.setItem('facteur-lang', lang) } catch {}
+  }
+  let saved = null
+  try { saved = localStorage.getItem('facteur-lang') } catch {}
+  setLang(saved || ((navigator.language || 'fr').toLowerCase().startsWith('fr') ? 'fr' : 'en'))
+  button.addEventListener('click', () => setLang(document.body.dataset.lang === 'fr' ? 'en' : 'fr'))
+</script>
+</body>
+</html>

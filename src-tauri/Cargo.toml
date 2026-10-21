@@ -1,0 +1,48 @@
+[package]
+name = "facteur-app"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+default-run = "facteur"
+
+[lib]
+name = "facteur_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "facteur"
+path = "src/main.rs"
+
+[dependencies]
+facteur-core = { version = "0.1.0", path = "../crates/core" }
+chrono = "0.4.45"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tauri = { version = "2.12.4", features = [] }
+tauri-plugin-dialog = "2.8.3"
+tauri-plugin-fs = "2.7.1"
+tauri-plugin-notification = "2.7.0"
+tauri-plugin-opener = "2.7.2"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[features]
+default = ["local-ai"]
+# Performance tracing for local builds (scripts/build-windows.sh --perf); never in a release.
+perf = ["facteur-core/perf"]
+# The local AI (llama.cpp, built in): its build needs CMake and libclang.
+local-ai = ["facteur-core/local-ai"]
+
+[build-dependencies]
+tauri-build = { version = "2.7.3", features = [] }
+
+[target."cfg(windows)".dependencies]
+tauri-winrt-notification = "0.8"
+winreg = "0.56"
+
+# Desktop only: mobile systems already enforce a single instance.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-single-instance = "2.5.4"
+tauri-plugin-window-state = "2.5.0"

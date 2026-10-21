@@ -1,0 +1,33 @@
+{
+  "name": "facteur-ui",
+  "private": true,
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "nuxt dev",
+    "generate": "nuxt generate",
+    "typecheck": "nuxt typecheck",
+    "postinstall": "nuxt prepare"
+  },
+  "dependencies": {
+    "@iconify-json/lucide": "^1.2.144",
+    "@nuxt/ui": "^4.11.3",
+    "@nuxtjs/i18n": "^10.6.0",
+    "@tanstack/vue-virtual": "^3.13.45",
+    "@tauri-apps/api": "^2.12.4",
+    "@tauri-apps/plugin-dialog": "^2.8.3",
+    "@tauri-apps/plugin-notification": "^2.7.0",
+    "@tauri-apps/plugin-opener": "^2.7.2",
+    "@tiptap/extension-image": "3.32.0",
+    "@tiptap/extension-text-style": "3.32.0",
+    "@tiptap/vue-3": "^3.32.0",
+    "@vueuse/core": "^14.4.0",
+    "nuxt": "^4.6.1",
+    "pdfjs-dist": "4.10.38",
+    "tailwindcss": "^4.3.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vue-tsc": "^3.3.13"
+  }
+}

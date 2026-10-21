@@ -1,0 +1,148 @@
+{
+  "common": {
+    "confirm": {
+      "title": "Confirmer",
+      "ok": "Confirmer"
+    },
+    "unknown": "(inconnu)",
+    "me": "moi",
+    "noSubject": "(sans objet)",
+    "neverSynced": "Jamais synchronisé",
+    "syncing": "Synchronisation…",
+    "sentTo": "À {to} · envoyé {ago}",
+    "role": {
+      "inbox": "Boîte de réception",
+      "sent": "Envoyés",
+      "drafts": "Brouillons",
+      "trash": "Corbeille",
+      "junk": "Indésirables",
+      "archive": "Archives",
+      "all": "Tous les messages",
+      "flagged": "Épinglés",
+      "snoozed": "Plus tard",
+      "screener": "Nouveaux expéditeurs",
+      "refused": "Refusés"
+    },
+    "date": {
+      "today": "Aujourd'hui",
+      "yesterday": "Hier",
+      "thisWeek": "Cette semaine",
+      "earlierThisMonth": "Plus tôt ce mois-ci"
+    },
+    "until": {
+      "today": "aujourd'hui {time}",
+      "tomorrow": "demain {time}"
+    },
+    "since": {
+      "now": "à l'instant"
+    },
+    "ago": {
+      "today": "aujourd'hui",
+      "yesterday": "hier",
+      "days": "il y a {n} jours",
+      "week": "il y a une semaine",
+      "weeks": "il y a {n} semaines"
+    },
+    "size": {
+      "b": "{n} o",
+      "kb": "{n} Ko",
+      "mb": "{n} Mo",
+      "gb": "{n} Go"
+    },
+    "when": {
+      "in3h": "Dans 3 heures",
+      "tonight": "Ce soir",
+      "tomorrowMorning": "Demain matin",
+      "weekend": "Ce week-end",
+      "nextWeek": "Semaine prochaine",
+      "tomorrowAfternoon": "Demain après-midi",
+      "mondayMorning": "Lundi matin"
+    },
+    "error": "Erreur",
+    "cancel": "Annuler",
+    "undo": "Annuler",
+    "undone": "Action annulée",
+    "undoFailed": "Annulation impossible",
+    "language": {
+      "label": "Langue",
+      "fr": "Français",
+      "en": "English"
+    },
+    "toast": {
+      "stillRefused": "Toujours refusée par le serveur",
+      "draftUnreadable": "Brouillon illisible",
+      "cannotReopen": "Impossible de reprendre le message",
+      "searchNotSaved": "Recherche non enregistrée",
+      "syncFailed": "Synchronisation impossible",
+      "syncFailedFor": "Synchronisation impossible ({email})",
+      "sendFailed": "Envoi impossible · {subject}",
+      "willRetry": "facteur réessaiera dans une minute.",
+      "waitsInOutbox": "Le message attend dans la boîte d'envoi.",
+      "edit": "Modifier",
+      "outbox": "Boîte d'envoi",
+      "messageNotFound": "Message introuvable"
+    },
+    "compose": {
+      "wrote": "Le {date}, {who} a écrit :",
+      "forwarded": "---------- Message transféré ----------",
+      "from": "De : {v}",
+      "date": "Date : {v}",
+      "subject": "Objet : {v}",
+      "to": "À : {v}",
+      "unsavedLeave": "Ce brouillon n'a pas pu être enregistré. Le quitter quand même et perdre les modifications non enregistrées ?",
+      "leaveAnyway": "Quitter sans enregistrer",
+      "keepEditing": "Continuer la rédaction"
+    },
+    "attachment": {
+      "saveAnyway": "L'enregistrer quand même ? Ne l'ouvrez pas si vous ne l'attendiez pas.",
+      "suspicious": "Pièce jointe suspecte",
+      "saved": "Pièce jointe enregistrée",
+      "open": "Ouvrir",
+      "previewFailed": "Aperçu impossible"
+    },
+    "backup": {
+      "incomplete": "Sauvegarde incomplète",
+      "done": "Sauvegarde terminée",
+      "newMessages": "Aucun nouveau message sauvegardé | {n} nouveau message sauvegardé | {n} nouveaux messages sauvegardés",
+      "upToDate": "Tout était déjà sauvegardé",
+      "restoreFailed": "Restauration impossible",
+      "autoFailedHint": "Les prochaines tentatives automatiques échoueront sans prévenir : voyez Réglages › Sauvegarde."
+    },
+    "purge": {
+      "titleTrash": "Vider la corbeille",
+      "titleJunk": "Vider les indésirables",
+      "loading": "Inventaire du dossier…",
+      "messages": "aucun message | message | messages",
+      "period": "Du {from} au {to}",
+      "periodToday": "Du {from} à aujourd'hui, {time}",
+      "since": "Depuis le {from}",
+      "missingTitle": "{n} message n'est pas dans facteur | {n} messages ne sont pas dans facteur",
+      "missing": "Le serveur en compte {server}, facteur en a {local} en cache. Les télécharger pour voir ce qui sera supprimé avant de vider ?",
+      "download": "Télécharger le message | Télécharger les {n} messages",
+      "downloading": "Téléchargement… {local} / {server}",
+      "stop": "Arrêter",
+      "downloadFailed": "Téléchargement interrompu",
+      "topSenders": "Principaux expéditeurs",
+      "sendersHint": "Cliquer pour voir leurs messages",
+      "list": "Messages",
+      "more": "… et {n} autre | … et {n} autres",
+      "unread": "non lu | non lu | non lus",
+      "withAttachments": "avec pièce jointe | avec pièce jointe | avec pièces jointes",
+      "freed": "libérés sur le serveur",
+      "freedShort": "libérés",
+      "clearFilter": "Retirer le filtre : {name}",
+      "countAll": "aucun message | {n} message | {n} messages, du plus récent au plus ancien",
+      "countSender": "aucun message de cet expéditeur | {n} message de cet expéditeur | {n} messages de cet expéditeur",
+      "grouped": "{n} message à la suite | {n} message à la suite | {n} messages à la suite",
+      "recent": "les plus récents",
+      "seeAll": "Aucun message | Voir le message | Voir les {n} messages",
+      "empty": "Ce dossier est déjà vide.",
+      "warningTitle": "Suppression définitive sur le serveur",
+      "warningDetail": "Aucun message à supprimer. | Ce message ne pourra pas être récupéré, ni dans facteur ni chez {provider}. | Ces {n} messages ne pourront pas être récupérés, ni dans facteur ni chez {provider}.",
+      "warningShort": "Ces messages ne pourront pas être récupérés.",
+      "confirm": "Vider · {n} message | Vider · {n} messages",
+      "done": "{n} message supprimé définitivement | {n} messages supprimés définitivement",
+      "failed": "Vidage impossible"
+    }
+  }
+}
