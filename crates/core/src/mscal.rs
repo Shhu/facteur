@@ -107,7 +107,7 @@ fn url(segments: &[&str]) -> Result<reqwest::Url> {
     Ok(url)
 }
 
-/// Times in UTC; a whole day as its dates at midnight.
+/// Times in the zone asked for, else in UTC; a whole day as its dates at midnight.
 fn body(changes: &EventChanges) -> Result<serde_json::Value> {
     let mut body = serde_json::Map::new();
     if let Some(s) = &changes.summary {
@@ -124,12 +124,29 @@ fn body(changes: &EventChanges) -> Result<serde_json::Value> {
             let (first, after) = crate::calendar::days_of(start, end).ok_or_else(|| Error::Other("date".into()))?;
             (first.format("%Y-%m-%dT00:00:00").to_string(), after.format("%Y-%m-%dT00:00:00").to_string())
         } else {
-            let at = |t: i64| chrono::DateTime::from_timestamp(t, 0).map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string()).unwrap_or_default();
+            let tz = changes.zone().map(|(_, tz)| tz);
+            let at = |t: i64| {
+                chrono::DateTime::from_timestamp(t, 0)
+                    .map(|d| match tz {
+                        Some(tz) => d.with_timezone(&tz).naive_local(),
+                        None => d.naive_utc(),
+                    })
+                    .map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string())
+                    .unwrap_or_default()
+            };
             (at(start), at(end.max(start)))
         };
+        let zone = changes.zone().filter(|_| !all_day).map_or_else(|| "UTC".to_string(), |(name, _)| name);
         body.insert("isAllDay".into(), all_day.into());
-        body.insert("start".into(), serde_json::json!({ "dateTime": from, "timeZone": "UTC" }));
-        body.insert("end".into(), serde_json::json!({ "dateTime": to, "timeZone": "UTC" }));
+        body.insert("start".into(), serde_json::json!({ "dateTime": from, "timeZone": zone }));
+        body.insert("end".into(), serde_json::json!({ "dateTime": to, "timeZone": zone }));
+    }
+    // Outlook has one reminder per event: the earliest asked for.
+    if let Some(minutes) = &changes.reminders {
+        body.insert("isReminderOn".into(), (!minutes.is_empty()).into());
+        if let Some(m) = minutes.iter().max() {
+            body.insert("reminderMinutesBeforeStart".into(), (*m).into());
+        }
     }
     // The guests: Outlook names the organizer and sends the invitations itself.
     if changes.attendees.is_some() {
@@ -153,8 +170,8 @@ fn written(json: &serde_json::Value) -> Result<Instance> {
 pub async fn create(token: &str, calendar_id: &str, key: &str, changes: &EventChanges, repeat: Option<&crate::repeat::Repeat>) -> Result<Instance> {
     let mut body = body(changes)?;
     if let (Some(repeat), Some((start, end, all_day))) = (repeat, changes.times) {
-        let day = if all_day { crate::calendar::days_of(start, end).map(|d| d.0) } else { crate::calendar::local_date(start) };
-        series_body(&mut body, (start, end, all_day, day.ok_or_else(|| Error::Other("date".into()))?), Some(repeat))?;
+        let day = crate::calendar::first_day(start, end, all_day, changes.zone.as_deref());
+        series_body(&mut body, (start, end, all_day, day.ok_or_else(|| Error::Other("date".into()))?), Some(repeat), changes.zone.as_deref())?;
     }
     body["transactionId"] = key.into();
     let req = client()?.post(url(&["me", "calendars", calendar_id, "events"])?).header("Content-Type", "application/json").body(serde_json::to_vec(&body)?);
@@ -256,15 +273,15 @@ pub async fn rebuild_series(
     repeat: Option<&crate::repeat::Repeat>,
 ) -> Result<()> {
     let mut body = body(&EventChanges { times: None, ..changes.clone() })?;
-    series_body(&mut body, first, repeat)?;
+    series_body(&mut body, first, repeat, changes.zone.as_deref())?;
     write(client()?.patch(url(&["me", "events", series_id])?).header("Content-Type", "application/json").body(serde_json::to_vec(&body)?), token).await?;
     Ok(())
 }
 
 /// A series' times and rule into `body` (see [`rebuild_series`]).
-fn series_body(body: &mut serde_json::Value, first: (i64, i64, bool, chrono::NaiveDate), repeat: Option<&crate::repeat::Repeat>) -> Result<()> {
+fn series_body(body: &mut serde_json::Value, first: (i64, i64, bool, chrono::NaiveDate), repeat: Option<&crate::repeat::Repeat>, zone: Option<&str>) -> Result<()> {
     let (start, end, all_day, day) = first;
-    let (zone, tz) = match crate::repeat::local_zone() {
+    let (zone, tz) = match crate::calendar::series_zone(zone) {
         Some((name, tz)) => (name, Some(tz)),
         None => ("UTC".to_string(), None),
     };
@@ -335,7 +352,7 @@ pub async fn events(token: &str, calendar_id: &str, from: i64, to: i64) -> Resul
         .append_pair("$top", "500")
         .append_pair(
             "$select",
-            "id,iCalUId,subject,location,bodyPreview,start,end,isAllDay,showAs,isCancelled,organizer,webLink,responseStatus,type,isOrganizer,seriesMasterId,attendees,onlineMeeting,isReminderOn,reminderMinutesBeforeStart",
+            "id,iCalUId,subject,location,bodyPreview,start,end,isAllDay,showAs,isCancelled,organizer,webLink,responseStatus,type,isOrganizer,seriesMasterId,attendees,onlineMeeting,isReminderOn,reminderMinutesBeforeStart,originalStartTimeZone",
         );
     Ok(list(&http, token, url).await?.iter().filter_map(map_event).collect())
 }
@@ -424,6 +441,7 @@ fn map_event(item: &serde_json::Value) -> Option<Instance> {
             (Some(true), Some(m)) if m >= 0 => vec![m],
             _ => Vec::new(),
         },
+        zone: if all_day { None } else { item["originalStartTimeZone"].as_str().and_then(crate::calendar::event_zone) },
     })
 }
 
@@ -539,6 +557,15 @@ mod tests {
 
         let changes = EventChanges { attendees: Some(e.attendees.clone()), ..Default::default() };
         assert_eq!(body(&changes).unwrap()["attendees"], serde_json::json!([{ "emailAddress": { "address": "paul@example.org", "name": "paul@example.org" }, "type": "required" }]));
+
+        let zoned = EventChanges { times: Some((1_792_497_600, 1_792_501_200, false)), zone: Some("Asia/Tokyo".into()), reminders: Some(vec![10, 60]), ..Default::default() };
+        let written = body(&zoned).unwrap();
+        assert_eq!(written["start"], serde_json::json!({ "dateTime": "2026-10-20T21:00:00", "timeZone": "Asia/Tokyo" }));
+        assert_eq!((written["isReminderOn"].as_bool(), written["reminderMinutesBeforeStart"].as_i64()), (Some(true), Some(60)));
+        let none = body(&EventChanges { reminders: Some(Vec::new()), ..Default::default() }).unwrap();
+        assert_eq!(none["isReminderOn"].as_bool(), Some(false));
+        let item = serde_json::json!({ "id": "Z", "start": { "dateTime": "2026-10-20T12:00:00" }, "originalStartTimeZone": "Tokyo Standard Time" });
+        assert_eq!(map_event(&item).unwrap().zone.as_deref(), Some("Asia/Tokyo"));
     }
 
     #[test]

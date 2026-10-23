@@ -15,12 +15,12 @@ dest="$win_home/dev/facteur-build"
 pnpm='npx -y pnpm@11.1.1'
 
 bundle='--no-bundle'
-features=''
+features='vulkan'
 for arg in "$@"; do
   case "$arg" in
     --setup) bundle='--bundles nsis' ;;
     # Local builds only: scripts/release.sh never passes it.
-    --perf) features='--features perf' ;;
+    --perf) features='vulkan,perf' ;;
   esac
 done
 
@@ -55,6 +55,12 @@ llvm='/mnt/c/Program Files/LLVM/bin'
 [[ -f "$llvm/libclang.dll" ]] || { echo "LLVM missing (libclang.dll): winget install LLVM.LLVM" >&2; exit 1; }
 export LIBCLANG_PATH="$(wslpath -w "$llvm")"
 export WSLENV="${WSLENV:+$WSLENV:}LIBCLANG_PATH"
+# The local AI on the graphics card: llama.cpp's Vulkan backend is built with the Vulkan SDK
+# (winget install KhronosGroup.VulkanSDK); the exe itself needs only the graphics driver.
+vulkan="$(ls -d /mnt/c/VulkanSDK/*/ 2>/dev/null | sort -V | tail -1)"
+[[ -n "$vulkan" && -f "$vulkan/Lib/vulkan-1.lib" ]] || { echo "Vulkan SDK missing: winget install KhronosGroup.VulkanSDK" >&2; exit 1; }
+export VULKAN_SDK="$(wslpath -w "${vulkan%/}")"
+export WSLENV="$WSLENV:VULKAN_SDK"
 vs_cmake="$(ls -d /mnt/c/Program\ Files*/Microsoft\ Visual\ Studio/*/*/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe 2>/dev/null | head -1)"
 if [[ -n "$vs_cmake" ]]; then
   export CMAKE="$(wslpath -w "$vs_cmake")"
@@ -74,7 +80,7 @@ fi
 grep -E '✔|ERROR' "$log" || true
 rm -f "$log"
 [[ -f "$dest/ui/.output/public/index.html" ]] || { echo "nuxt generate wrote no ui/.output/public/index.html" >&2; exit 1; }
-win "$pnpm tauri build $bundle $features --config src-tauri\\tauri.exe.conf.json" | grep -vE '^\s+Compiling '
+win "$pnpm tauri build $bundle --features $features --config src-tauri\\tauri.exe.conf.json" | grep -vE '^\s+Compiling '
 
 echo
 echo "Executable: $(wslpath -w "$dest/target/release/facteur.exe")"

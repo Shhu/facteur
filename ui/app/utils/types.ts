@@ -751,6 +751,8 @@ export interface CalendarEvent {
   meeting: string | null
   /** Minutes before the start when the provider reminds of it. */
   reminders: number[]
+  /** The IANA zone a timed event was set in, when the provider names one. */
+  zone: string | null
 }
 
 export interface EventAttendee {
@@ -784,6 +786,10 @@ export interface EventDraft {
   repeat?: Repeat | null
   /** The guests to invite (the organizer left out); `undefined`: unchanged. */
   attendees?: EventAttendee[]
+  /** The IANA zone of a timed event's times; `null`: as before (a new event: the computer's). */
+  zone?: string | null
+  /** Minutes before the start; `null`: the calendar's own (a new event) or unchanged. */
+  reminders?: number[] | null
 }
 
 export type RepeatFreq = 'daily' | 'weekly' | 'monthly' | 'yearly'
@@ -859,6 +865,9 @@ export interface AiStatus {
   dictation: boolean
   dictation_ready: boolean
   dictation_model: AiModel
+  /** The graphics card may be used, and the one the model last ran on. */
+  graphics: boolean
+  card: string | null
 }
 
 /** An appointment the local AI found in a message. Times null when its day was not understood. */

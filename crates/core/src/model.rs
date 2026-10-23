@@ -797,7 +797,7 @@ pub struct CalendarInfo {
 }
 
 /// One occurrence of an event (recurring events are expanded).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct CalendarEvent {
     pub id: i64,
     pub calendar_id: i64,
@@ -834,6 +834,8 @@ pub struct CalendarEvent {
     pub meeting: Option<String>,
     /// Minutes before the start when the provider reminds of it.
     pub reminders: Vec<i64>,
+    /// The IANA zone a timed event was set in, when the provider names one.
+    pub zone: Option<String>,
 }
 
 /// A guest of an event. `response`: `needs_action`, `accepted`, `tentative` or `declined`.
@@ -874,6 +876,13 @@ pub struct EventDraft {
     /// The guests to invite (the organizer left out); `None`: unchanged.
     #[serde(default)]
     pub attendees: Option<Vec<EventAttendee>>,
+    /// The IANA zone of a timed event's times (`None`: as before; a new event in UTC, or in the
+    /// computer's zone for a series).
+    #[serde(default)]
+    pub zone: Option<String>,
+    /// Minutes before the start to be reminded at (`None`: the calendar's own, or unchanged).
+    #[serde(default)]
+    pub reminders: Option<Vec<i64>>,
 }
 
 /// How a series repeats now, for its form. `custom`: a rule facteur cannot put in the form's terms

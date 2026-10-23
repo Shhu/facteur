@@ -186,11 +186,13 @@ impl Index {
     }
 
     /// A file of another folder holding this message (same Message-ID, same size): (folder, file).
-    pub fn elsewhere(&self, folder: &str, message_id: &str, size: i64) -> Result<Option<(String, String)>> {
+    /// Same Message-ID, size and arrival date (kept by a server's COPY and MOVE): two different
+    /// messages are not taken for one on a reused Message-ID.
+    pub fn elsewhere(&self, folder: &str, message_id: &str, size: i64, received: i64) -> Result<Option<(String, String)>> {
         let mut st = self.conn.prepare_cached(
-            "SELECT folder, file FROM entries WHERE message_id = ?2 AND size = ?3 AND folder <> ?1 ORDER BY id LIMIT 1",
+            "SELECT folder, file FROM entries WHERE message_id = ?2 AND size = ?3 AND received = ?4 AND folder <> ?1 ORDER BY id LIMIT 1",
         )?;
-        Ok(st.query_row(params![folder, message_id, size], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)
+        Ok(st.query_row(params![folder, message_id, size, received], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)
     }
 
     /// `file` of `folder` is a copy of `source`: its headers are not read again.

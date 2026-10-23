@@ -419,6 +419,11 @@ async fn ai_summarize(engine: Eng<'_>, account_id: i64, thread_id: i64) -> Res<S
 }
 
 #[tauri::command]
+async fn ai_graphics(engine: Eng<'_>, on: bool) -> Res<()> {
+    blocking(&engine, move |e| e.set_ai_graphics(on)).await
+}
+
+#[tauri::command]
 async fn dictation_off(engine: Eng<'_>) -> Res<()> {
     blocking(&engine, |e| e.dictation_off()).await
 }
@@ -1371,6 +1376,7 @@ pub fn run() {
             ai_summarize,
             ai_find_event,
             dictation_off,
+            ai_graphics,
             ai_transcribe,
             mail_client_status,
             register_mail_client,

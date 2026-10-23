@@ -63,11 +63,17 @@ const people = computed<InvitePerson[]>(() => e.value.attendees.map(a => ({
 
 /** "10 min before", "1 h before", "1 day before". */
 const reminders = computed(() => e.value.reminders.map((m) => {
-  if (m === 0) return t('tools.calendar.reminder.atStart')
-  if (m % 1440 === 0) return t('tools.calendar.reminder.days', { n: m / 1440 }, m / 1440)
-  if (m % 60 === 0) return t('tools.calendar.reminder.hours', { n: m / 60 }, m / 60)
-  return t('tools.calendar.reminder.minutes', { n: m }, m)
+  const [key, n] = reminderKey(m)
+  return t(key, { n }, n)
 }).join(', '))
+
+/** The event's own time, when set in another zone than the computer's. */
+const ownTime = computed(() => {
+  const zone = validZone(e.value.zone)
+  if (e.value.all_day || !zone || zone === localZone()) return null
+  const time = new Date(e.value.start * 1000).toLocaleString(undefined, { timeZone: zone, weekday: 'short', hour: '2-digit', minute: '2-digit' })
+  return t('tools.calendar.event.inZone', { time, zone: zoneCity(zone) })
+})
 
 /** Google and Outlook give their own event page; a CalDAV event's URL is whatever its author
  *  wrote, so it opens like the other links they wrote. */
@@ -123,6 +129,10 @@ async function respond(p: Partstat) {
           {{ title }}
         </h2>
         <span class="text-[13px] text-toned first-letter:uppercase">{{ eventWhen(e) }}</span>
+        <span v-if="ownTime" class="flex items-center gap-1.5 text-[13px] text-muted">
+          <UIcon name="i-lucide-globe" class="size-3.5 shrink-0" />
+          {{ ownTime }}
+        </span>
       </div>
       <UBadge v-if="e.status === 'tentative'" :label="t('tools.calendar.tentative')" color="warning" variant="subtle" class="shrink-0" />
       <UBadge v-else-if="e.status === 'cancelled'" :label="t('tools.calendar.cancelled')" color="error" variant="subtle" class="shrink-0" />

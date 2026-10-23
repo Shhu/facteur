@@ -602,6 +602,44 @@ ALTER TABLE calendar_events ADD COLUMN meeting TEXT;
 ALTER TABLE calendar_events ADD COLUMN reminders TEXT;
 UPDATE calendars SET ctag = NULL, synced_at = NULL;
 "#,
+r#"
+-- A queued operation's server refusals, counted apart from its network cuts: each has its limit.
+ALTER TABLE pending_ops ADD COLUMN refusals INTEGER NOT NULL DEFAULT 0;
+"#,
+r#"
+-- When a thread last left the inbox, however it left (archived here or elsewhere, a label
+-- removed): the "Done" view sorts by it. Not written for an account being removed.
+CREATE TABLE handled (
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    thread_id  INTEGER NOT NULL,
+    at         INTEGER NOT NULL,
+    PRIMARY KEY (account_id, thread_id)
+) WITHOUT ROWID;
+CREATE TRIGGER handled_on_delete AFTER DELETE ON messages
+WHEN EXISTS (SELECT 1 FROM mailboxes WHERE id = old.mailbox_id AND role = 'inbox')
+ AND EXISTS (SELECT 1 FROM accounts WHERE id = old.account_id)
+BEGIN
+    INSERT OR REPLACE INTO handled VALUES (old.account_id, old.thread_id, CAST(strftime('%s', 'now') AS INTEGER));
+END;
+CREATE TRIGGER handled_on_move AFTER UPDATE OF mailbox_id ON messages
+WHEN old.mailbox_id <> new.mailbox_id
+ AND EXISTS (SELECT 1 FROM mailboxes WHERE id = old.mailbox_id AND role = 'inbox')
+BEGIN
+    INSERT OR REPLACE INTO handled VALUES (old.account_id, old.thread_id, CAST(strftime('%s', 'now') AS INTEGER));
+END;
+CREATE TRIGGER handled_on_unlabel AFTER DELETE ON labels
+WHEN EXISTS (SELECT 1 FROM mailboxes WHERE id = old.mailbox_id AND role = 'inbox')
+BEGIN
+    INSERT OR REPLACE INTO handled
+    SELECT m.account_id, m.thread_id, CAST(strftime('%s', 'now') AS INTEGER)
+    FROM messages m JOIN accounts a ON a.id = m.account_id WHERE m.id = old.message_id;
+END;
+"#,
+r#"
+-- Events: the IANA zone a timed event was set in. Every calendar is fetched again to fill it.
+ALTER TABLE calendar_events ADD COLUMN zone TEXT;
+UPDATE calendars SET ctag = NULL, synced_at = NULL;
+"#,
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -961,12 +999,9 @@ impl Store {
             check_integrity(path)?;
             let _ = std::fs::remove_file(&marker);
         }
+        // Compacting (VACUUM) is left to the engine, after the start (`Engine::compact_later`): it
+        // can take a while on a large base, and the window would wait for it.
         let mut store = Self::init(Connection::open(path)?)?;
-        match store.compact_if_wasteful() {
-            Ok(Some(freed)) => tracing::info!("database compacted: {} MiB given back", freed / (1024 * 1024)),
-            Ok(None) => {}
-            Err(e) => tracing::warn!("database compaction: {e}"),
-        }
         // After the migrations, so the readers see the up-to-date schema.
         for _ in 0..READERS {
             let conn = Connection::open_with_flags(
@@ -2563,6 +2598,14 @@ impl Store {
         }
         let condition = if conds.is_empty() { String::new() } else { format!("WHERE {}", conds.join(" AND ")) };
         let pinned = if pinned_first { "any_flagged DESC," } else { "" };
+        // The "Done" view sorts a thread by when it left the inbox, if that came after its
+        // last message.
+        let handled = if except_in.is_empty() {
+            ""
+        } else {
+            "LEFT JOIN handled h ON h.account_id = gb.account_id AND h.thread_id = g.thread_id"
+        };
+        let handled_at = if except_in.is_empty() { "0" } else { "COALESCE(h.at, 0)" };
         let mut except = if except_in.is_empty() {
             String::new()
         } else {
@@ -2589,10 +2632,11 @@ impl Store {
                 FROM ({pool}) WHERE 1 {except} GROUP BY thread_id
              )
              SELECT g.thread_id, cnt, unread, any_flagged, any_attachment,
-                    MAX(last, COALESCE(s.woke_at, 0)) AS activity,
+                    MAX(last, COALESCE(s.woke_at, 0), {handled_at}) AS activity,
                     CASE WHEN s.woke_at IS NULL THEN s.until END, s.woke_at IS NOT NULL, cat
              FROM g JOIN mailboxes gb ON gb.id = g.box
              LEFT JOIN snoozes s ON s.account_id = gb.account_id AND s.thread_id = g.thread_id
+             {handled}
              {condition}
              ORDER BY {pinned} activity DESC, last_id DESC LIMIT ?1 OFFSET ?2"
         ))?;
@@ -5036,6 +5080,21 @@ impl Store {
         Ok(failed.unwrap_or(false))
     }
 
+    /// [`fail_op`](Self::fail_op) for a refusal by the server: counted apart from the network
+    /// cuts, so that a few cuts before do not make one refusal final.
+    pub fn refuse_op(&self, id: i64, error: &str, max: i64) -> Result<bool> {
+        let failed: Option<bool> = self
+            .db()
+            .query_row(
+                "UPDATE pending_ops SET refusals = refusals + 1, last_error = ?2, failed = (refusals + 1 >= ?3) WHERE id = ?1
+                 RETURNING failed",
+                params![id, error, max],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(failed.unwrap_or(false))
+    }
+
     /// (account, pending, failed) for each account.
     pub fn ops_counts(&self) -> Result<Vec<(i64, i64, i64)>> {
         let db = self.read();
@@ -5180,7 +5239,7 @@ impl Store {
 
     pub fn retry_op(&self, id: i64) -> Result<i64> {
         let db = self.db();
-        db.execute("UPDATE pending_ops SET failed = 0, attempts = 0 WHERE id = ?1", [id])?;
+        db.execute("UPDATE pending_ops SET failed = 0, attempts = 0, refusals = 0 WHERE id = ?1", [id])?;
         Ok(db.query_row("SELECT account_id FROM pending_ops WHERE id = ?1", [id], |r| r.get(0))?)
     }
 }
@@ -5427,28 +5486,30 @@ const EVENT_COLUMNS: &str = "SELECT e.id, e.calendar_id, c.account_id, e.uid, e.
         e.recurring, e.own AND NOT c.read_only AND NOT (c.source = 'caldav' AND e.href IS NULL),
         c.remote_id, c.source, e.href, e.series, e.response,
         e.response IS NOT NULL AND NOT c.read_only AND NOT (c.source = 'caldav' AND e.href IS NULL),
-        e.attendees, e.meeting, e.reminders
+        e.attendees, e.meeting, e.reminders, e.zone
     FROM calendar_events e JOIN calendars c ON c.id = e.calendar_id";
 
 /// Only what changed is written: an unchanged sync leaves the rows alone.
 const UPSERT_EVENT: &str = "INSERT INTO calendar_events
         (calendar_id, uid, instance, start_at, end_at, all_day, summary, location, description, status, organizer, url, busy,
-         href, recurring, own, series, response, attendees, meeting, reminders)
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+         href, recurring, own, series, response, attendees, meeting, reminders, zone)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
     ON CONFLICT (calendar_id, uid, instance) DO UPDATE SET
         start_at = excluded.start_at, end_at = excluded.end_at, all_day = excluded.all_day,
         summary = excluded.summary, location = excluded.location, description = excluded.description,
         status = excluded.status, organizer = excluded.organizer, url = excluded.url, busy = excluded.busy,
         href = excluded.href, recurring = excluded.recurring, own = excluded.own,
         series = excluded.series, response = excluded.response,
-        attendees = excluded.attendees, meeting = excluded.meeting, reminders = excluded.reminders
+        attendees = excluded.attendees, meeting = excluded.meeting, reminders = excluded.reminders,
+        zone = excluded.zone
     WHERE start_at IS NOT excluded.start_at OR end_at IS NOT excluded.end_at OR all_day IS NOT excluded.all_day
         OR summary IS NOT excluded.summary OR location IS NOT excluded.location
         OR description IS NOT excluded.description OR status IS NOT excluded.status
         OR organizer IS NOT excluded.organizer OR url IS NOT excluded.url OR busy IS NOT excluded.busy
         OR href IS NOT excluded.href OR recurring IS NOT excluded.recurring OR own IS NOT excluded.own
         OR series IS NOT excluded.series OR response IS NOT excluded.response
-        OR attendees IS NOT excluded.attendees OR meeting IS NOT excluded.meeting OR reminders IS NOT excluded.reminders";
+        OR attendees IS NOT excluded.attendees OR meeting IS NOT excluded.meeting OR reminders IS NOT excluded.reminders
+        OR zone IS NOT excluded.zone";
 
 /// An event's guests or reminders as stored: JSON, `NULL` when there are none.
 fn json_list<T: serde::Serialize>(list: &[T]) -> Option<String> {
@@ -5486,6 +5547,7 @@ fn event_row(r: &rusqlite::Row) -> rusqlite::Result<CalendarEvent> {
         attendees: json_of(r.get(23)?),
         meeting: r.get(24)?,
         reminders: json_of(r.get(25)?),
+        zone: r.get(26)?,
     })
 }
 
@@ -5598,7 +5660,7 @@ impl Store {
         db.execute(UPSERT_EVENT, params![
             calendar_id, e.uid, e.instance, e.start, e.end, e.all_day, e.summary,
             e.location, e.description, e.status, e.organizer, e.url, e.busy,
-            e.href, e.recurring, e.own, e.series, e.response, json_list(&e.attendees), e.meeting, json_list(&e.reminders),
+            e.href, e.recurring, e.own, e.series, e.response, json_list(&e.attendees), e.meeting, json_list(&e.reminders), e.zone,
         ])?;
         Ok(db.query_row(
             "SELECT id FROM calendar_events WHERE calendar_id = ?1 AND uid = ?2 AND instance = ?3",
@@ -5628,7 +5690,7 @@ impl Store {
         tx.execute(UPSERT_EVENT, params![
             calendar_id, e.uid, e.instance, e.start, e.end, e.all_day, e.summary,
             e.location, e.description, e.status, e.organizer, e.url, e.busy,
-            e.href, e.recurring, e.own, e.series, e.response, json_list(&e.attendees), e.meeting, json_list(&e.reminders),
+            e.href, e.recurring, e.own, e.series, e.response, json_list(&e.attendees), e.meeting, json_list(&e.reminders), e.zone,
         ])?;
         let id = tx.query_row(
             "SELECT id FROM calendar_events WHERE calendar_id = ?1 AND uid = ?2 AND instance = ?3",
@@ -5763,7 +5825,7 @@ impl Store {
                 changed |= upsert.execute(params![
                     calendar_id, e.uid, e.instance, e.start, e.end, e.all_day, e.summary,
                     e.location, e.description, e.status, e.organizer, e.url, e.busy,
-                    e.href, e.recurring, e.own, e.series, e.response, json_list(&e.attendees), e.meeting, json_list(&e.reminders),
+                    e.href, e.recurring, e.own, e.series, e.response, json_list(&e.attendees), e.meeting, json_list(&e.reminders), e.zone,
                 ])? > 0;
             }
             let mut st = tx.prepare("SELECT id, uid, instance FROM calendar_events WHERE calendar_id = ?1")?;
@@ -6040,6 +6102,20 @@ mod tests {
     }
 
     const FLAGS: ServerFlags = ServerFlags { seen: false, flagged: false, answered: false, draft: false };
+
+    #[test]
+    fn refusals_and_network_cuts_have_their_own_limits() {
+        let (s, acc, _, _) = setup();
+        let op = s.push_op(acc, r#"{"kind":"move_set","mailbox":"INBOX","uids":[1],"dest":"Archive"}"#, "", None).unwrap();
+        for _ in 0..4 {
+            assert!(!s.fail_op(op, "cut", 10).unwrap());
+        }
+        assert!(!s.refuse_op(op, "NO busy", 5).unwrap(), "four cuts before do not make one refusal final");
+        for _ in 0..3 {
+            assert!(!s.refuse_op(op, "NO busy", 5).unwrap());
+        }
+        assert!(s.refuse_op(op, "NO busy", 5).unwrap(), "the fifth refusal is");
+    }
 
     #[test]
     fn damage_found_while_running_is_checked_at_the_next_start() {
@@ -7022,6 +7098,41 @@ mod tests {
         s.insert_header(acc, inbox, 1, &header("open@x", None, "En cours", 200), FLAGS, 10).unwrap();
         let done = s.list_threads(&[all], &[inbox], ThreadFilter::All, false, None, 50, 0).unwrap();
         assert_eq!(done.iter().map(|t| t.subject.as_str()).collect::<Vec<_>>(), ["Traité"]);
+    }
+
+    #[test]
+    fn done_view_sorts_by_when_threads_left_the_inbox() {
+        let (s, acc, inbox, _) = setup();
+        let archive = s.upsert_mailbox(acc, "Archives", Some("/"), Some(Role::Archive), true).unwrap();
+        let old = s.insert_header(acc, inbox, 1, &header("old@x", None, "Ancien", 100), FLAGS, 10).unwrap();
+        s.insert_header(acc, archive, 1, &header("new@x", None, "Récent", 200), FLAGS, 10).unwrap();
+        let done = || s.list_threads(&[archive], &[inbox], ThreadFilter::All, false, None, 50, 0).unwrap();
+        assert_eq!(done().iter().map(|t| t.subject.as_str()).collect::<Vec<_>>(), ["Récent"]);
+        // Archived now: before the thread whose last message is newer.
+        s.move_local(old, archive).unwrap();
+        let listed = done();
+        assert_eq!(listed.iter().map(|t| t.subject.as_str()).collect::<Vec<_>>(), ["Ancien", "Récent"]);
+        assert!(listed[0].activity >= now() - 5 && listed[0].date == 100);
+
+        // A label taken off (Gmail): the same.
+        let all = s.upsert_mailbox(acc, "[Gmail]/All Mail", Some("/"), Some(Role::All), true).unwrap();
+        let labels = s.upsert_mailbox(acc, "Labels", Some("/"), None, true).unwrap();
+        s.set_label_folder(labels, true).unwrap();
+        let x = s.insert_header(acc, all, 1, &header("x@x", None, "Libellé", 50), FLAGS, 10).unwrap();
+        s.set_labels(x, &[inbox]).unwrap();
+        let handled = |id: i64| -> Option<i64> {
+            s.read()
+                .query_row("SELECT h.at FROM handled h JOIN messages m ON m.thread_id = h.thread_id WHERE m.id = ?1", [id], |r| r.get(0))
+                .optional()
+                .unwrap()
+        };
+        s.db().execute("DELETE FROM handled", []).unwrap();
+        s.set_labels(x, &[labels]).unwrap();
+        assert!(handled(x).is_some());
+
+        // Nothing written for an account being removed.
+        s.delete_account(acc).unwrap();
+        assert_eq!(s.read().query_row("SELECT COUNT(*) FROM handled", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
     }
 
     #[test]

@@ -57,9 +57,10 @@ scripts/build-windows.sh          # standalone facteur.exe (~45 MB, embedded int
 scripts/build-windows.sh --setup  # + NSIS installer
 ```
 
-The local AI (llama.cpp, built in) also needs LLVM for libclang (`winget install LLVM.LLVM`) and
-CMake (the one in Visual Studio's Build Tools is found). The exe only needs WebView2, which ships
-with Windows 10/11. Data lives in
+The local AI (llama.cpp, built in) also needs LLVM for libclang (`winget install LLVM.LLVM`),
+CMake (the one in Visual Studio's Build Tools is found) and, for the graphics card, the Vulkan SDK
+(`winget install KhronosGroup.VulkanSDK`). The exe only needs WebView2, which ships with Windows
+10/11; the AI uses the graphics card when its driver has Vulkan, the processor otherwise. Data lives in
 `%APPDATA%\dev.facteur.mail`, passwords in Windows Credential Manager.
 
 ## Google and Microsoft sign-in (OAuth2)

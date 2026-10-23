@@ -314,7 +314,9 @@ async fn send_with(account: &Account, credential: &Credential, message: &Message
             Credential::Password(_) => None,
         };
         if let Some((mechanisms, credentials)) = auth {
-            conn.auth(&mechanisms, &credentials).await.map_err(|e| connection_error(&e))?;
+            // Refused sign-in: told apart, so that a cached OAuth token is replaced and the send tried
+            // again (see `deliver_as`).
+            conn.auth(&mechanisms, &credentials).await.map_err(|e| if e.is_permanent() { Error::Auth(e.to_string()) } else { connection_error(&e) })?;
         }
         Ok::<_, Error>((conn, limit))
     };

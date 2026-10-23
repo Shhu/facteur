@@ -207,8 +207,21 @@ fn body(changes: &EventChanges) -> Result<serde_json::Value> {
         } else {
             (None, None)
         };
-        body.insert("start".into(), bound(start, first));
-        body.insert("end".into(), bound(end.max(start), after));
+        match changes.zone().filter(|_| !all_day) {
+            Some((name, tz)) => {
+                let wall = |t: i64| chrono::DateTime::from_timestamp(t, 0).map(|d| d.with_timezone(&tz).naive_local().format("%Y-%m-%dT%H:%M:%S").to_string());
+                body.insert("start".into(), serde_json::json!({ "dateTime": wall(start), "timeZone": name, "date": null }));
+                body.insert("end".into(), serde_json::json!({ "dateTime": wall(end.max(start)), "timeZone": name, "date": null }));
+            }
+            None => {
+                body.insert("start".into(), bound(start, first));
+                body.insert("end".into(), bound(end.max(start), after));
+            }
+        }
+    }
+    if let Some(minutes) = &changes.reminders {
+        let overrides: Vec<serde_json::Value> = minutes.iter().map(|m| serde_json::json!({ "method": "popup", "minutes": m })).collect();
+        body.insert("reminders".into(), serde_json::json!({ "useDefault": false, "overrides": overrides }));
     }
     // The guests only: Google names the organizer itself. Their answers so far are kept.
     if changes.attendees.is_some() {
@@ -238,8 +251,8 @@ fn written(json: &serde_json::Value) -> Result<Instance> {
 pub async fn create(token: &str, calendar_id: &str, key: &str, changes: &EventChanges, repeat: Option<&crate::repeat::Repeat>) -> Result<Instance> {
     let mut body = body(changes)?;
     if let (Some(repeat), Some((start, end, all_day))) = (repeat, changes.times) {
-        let day = if all_day { crate::calendar::days_of(start, end).map(|d| d.0) } else { crate::calendar::local_date(start) };
-        series_body(&mut body, (start, end, all_day, day.ok_or_else(|| Error::Other("date".into()))?), Some(repeat))?;
+        let day = crate::calendar::first_day(start, end, all_day, changes.zone.as_deref());
+        series_body(&mut body, (start, end, all_day, day.ok_or_else(|| Error::Other("date".into()))?), Some(repeat), changes.zone.as_deref())?;
     }
     body["id"] = key.into();
     let req = client()?.post(write_url(calendar_id, None)?).header("Content-Type", "application/json").body(serde_json::to_vec(&body)?);
@@ -340,8 +353,8 @@ pub async fn series_rule(token: &str, calendar_id: &str, series_id: &str) -> Res
 }
 
 /// The series rebuilt from its new first occurrence (`first`: start, end, whole day, first day),
-/// repeating as `repeat` (`None`: a single event). Timed, in the computer's zone, so that its
-/// dates keep their hour across changes of time. Google drops the dates changed alone.
+/// repeating as `repeat` (`None`: a single event). Timed, in the zone asked for or the computer's,
+/// so that its dates keep their hour across changes of time. Google drops the dates changed alone.
 pub async fn rebuild_series(
     token: &str,
     calendar_id: &str,
@@ -351,16 +364,16 @@ pub async fn rebuild_series(
     repeat: Option<&crate::repeat::Repeat>,
 ) -> Result<()> {
     let mut body = body(&EventChanges { times: None, ..changes.clone() })?;
-    series_body(&mut body, first, repeat)?;
+    series_body(&mut body, first, repeat, changes.zone.as_deref())?;
     let http = client()?;
     send(http.patch(write_url(calendar_id, Some(series_id))?).header("Content-Type", "application/json").body(serde_json::to_vec(&body)?), token).await?;
     Ok(())
 }
 
 /// A series' times and rule into `body` (see [`rebuild_series`]).
-fn series_body(body: &mut serde_json::Value, first: (i64, i64, bool, chrono::NaiveDate), repeat: Option<&crate::repeat::Repeat>) -> Result<()> {
+fn series_body(body: &mut serde_json::Value, first: (i64, i64, bool, chrono::NaiveDate), repeat: Option<&crate::repeat::Repeat>, zone: Option<&str>) -> Result<()> {
     let (start, end, all_day, day) = first;
-    let zone = crate::repeat::local_zone();
+    let zone = crate::calendar::series_zone(zone);
     if all_day {
         let (first, after) = crate::calendar::days_of(start, end).ok_or_else(|| Error::Other("date".into()))?;
         body["start"] = bound(start, Some(first));
@@ -527,6 +540,7 @@ fn map_event(item: &serde_json::Value) -> Option<Instance> {
             crate::calendar::meeting_link(texts.into_iter().flatten())
         },
         reminders: minutes(&item["reminders"]["overrides"]),
+        zone: if all_day { None } else { item["start"]["timeZone"].as_str().and_then(crate::calendar::event_zone) },
     })
 }
 
@@ -649,6 +663,13 @@ mod tests {
         let written = body(&changes).unwrap();
         assert_eq!(written["attendees"], serde_json::json!([{ "email": "paul@example.org", "displayName": "Paul", "responseStatus": "declined" }]), "the guests, their answers kept");
         assert_eq!(write_url("c", Some("e")).unwrap().query(), Some("sendUpdates=all"));
+
+        let zoned = EventChanges { times: Some((1_792_497_600, 1_792_501_200, false)), zone: Some("Asia/Tokyo".into()), reminders: Some(vec![10]), ..Default::default() };
+        let written = body(&zoned).unwrap();
+        assert_eq!(written["start"], serde_json::json!({ "dateTime": "2026-10-20T21:00:00", "timeZone": "Asia/Tokyo", "date": null }));
+        assert_eq!(written["reminders"], serde_json::json!({ "useDefault": false, "overrides": [{ "method": "popup", "minutes": 10 }] }));
+        let item = serde_json::json!({ "id": "z", "start": { "dateTime": "2026-10-20T21:00:00+09:00", "timeZone": "Asia/Tokyo" } });
+        assert_eq!(map_event(&item).unwrap().zone.as_deref(), Some("Asia/Tokyo"));
     }
 
     #[test]

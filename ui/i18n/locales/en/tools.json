@@ -318,7 +318,14 @@
         "guests": "Guests",
         "guestsPlaceholder": "Add guests",
         "guestsInvited": "They will get an invitation by mail.",
-        "guestsUpdated": "Guests are told of the changes, and new ones get an invitation."
+        "guestsUpdated": "Guests are told of the changes, and new ones get an invitation.",
+        "zone": "Time zone",
+        "searchZone": "Search for a city or a zone",
+        "localTime": "That is {time}, this computer's time",
+        "reminders": "Reminders",
+        "remindersDefault": "The calendar's reminders",
+        "noReminder": "No reminder",
+        "inZone": "{time}, {zone} time"
       },
       "repeat": {
         "title": "Repeat",

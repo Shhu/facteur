@@ -9,12 +9,15 @@ sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
   - org.freedesktop.Sdk.Extension.node24
+  # libclang, for the local AI's llama.cpp bindings.
+  - org.freedesktop.Sdk.Extension.llvm22
 command: facteur
 finish-args:
   - --share=ipc
   - --share=network
   - --socket=wayland
   - --socket=fallback-x11
+  # The graphics card: the interface, and the local AI through Vulkan.
   - --device=dri
   # Passwords and tokens in the system keyring (Secret Service).
   - --talk-name=org.freedesktop.secrets
@@ -27,11 +30,25 @@ finish-args:
   # without it the backups land on the sandbox's throwaway tmpfs.
   - --filesystem=xdg-documents/facteur-sauvegardes:create
 modules:
+  # Needed by llama.cpp's Vulkan backend to build its shaders; the SDK has Vulkan and glslc.
+  - name: spirv-headers
+    buildsystem: cmake-ninja
+    cleanup:
+      - '*'
+    sources:
+      - type: archive
+        url: https://github.com/KhronosGroup/SPIRV-Headers/archive/refs/tags/vulkan-sdk-1.4.357.0.tar.gz
+        sha256: 4d703067a7e06331ccb37bdfed3f9b7879cc61969a2689ae95c95db34a47ff07
+
   - name: facteur
     buildsystem: simple
     build-options:
       append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/node24/bin
       env:
+        LIBCLANG_PATH: /usr/lib/sdk/llvm22/lib
+        # The extension's libclang does not find its own headers (stdbool.h) by itself.
+        BINDGEN_EXTRA_CLANG_ARGS: -I/usr/lib/sdk/llvm22/lib/clang/22/include
+        CMAKE_PREFIX_PATH: /app
         CARGO_HOME: /run/build/facteur/cargo
         CARGO_NET_OFFLINE: 'true'
         npm_config_offline: 'true'
@@ -41,8 +58,8 @@ modules:
       - node pnpm/bin/pnpm.cjs install --offline --frozen-lockfile
       - node pnpm/bin/pnpm.cjs --dir ui generate
       # `tauri/custom-protocol`: what `tauri build` turns on, the interface is served from the binary.
-      # Without the local AI for now: llama.cpp needs libclang (the SDK's LLVM extension).
-      - cargo build --offline --release --locked -p facteur-app --bin facteur --no-default-features --features tauri/custom-protocol
+      # The local AI on the graphics card (Vulkan), the processor without one.
+      - cargo build --offline --release --locked -p facteur-app --bin facteur --no-default-features --features tauri/custom-protocol,vulkan
       - install -Dm755 target/release/facteur ${FLATPAK_DEST}/bin/facteur
       - install -Dm644 flatpak/${FLATPAK_ID}.desktop ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
       - install -Dm644 flatpak/${FLATPAK_ID}.metainfo.xml ${FLATPAK_DEST}/share/metainfo/${FLATPAK_ID}.metainfo.xml

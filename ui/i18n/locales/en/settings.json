@@ -501,6 +501,12 @@
       "offTitle": "Turn the local AI off?",
       "offConfirm": "The model is deleted from the computer ({size} freed). You can download it again.",
       "offConfirmFile": "facteur will no longer use your file (it stays where it is).",
+      "graphics": {
+        "title": "Graphics card",
+        "help": "The work goes through the graphics card when the computer has one, faster than on the processor alone. Turn it off if the AI gets slower or unstable.",
+        "using": "In use: {card}. Turn it off if the AI gets slower or unstable.",
+        "off": "Off: the AI uses the processor only."
+      },
       "dictation": {
         "title": "Dictation",
         "help": "Dictate your messages: a microphone button in the composer. Your voice is transcribed on this computer ({size} model).",

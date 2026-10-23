@@ -131,6 +131,8 @@ fn refused(e: &Error) -> Option<String> {
         // `append` has already told it apart from a cut connection.
         Error::Imap(Imap::Append) => Some(e.to_string()),
         Error::Imap(Imap::Validate(v)) => Some(v.to_string()),
+        // Refused in substance (a Gmail label the server keeps leaving off): the next ones go on.
+        Error::Rejected(msg) => Some(msg.clone()),
         _ => None,
     }
 }
@@ -217,8 +219,7 @@ pub async fn flush(store: &Store, account_id: i64, session: &mut Session, caps: 
                         ),
                         _ => (msg, MAX_ATTEMPTS),
                     };
-                    store.fail_op(pending.id, &msg, max)?;
-                    if pending.attempts + 1 >= max {
+                    if store.refuse_op(pending.id, &msg, max)? {
                         recheck_folders(store, account_id, &op);
                     }
                 }
@@ -685,7 +686,7 @@ async fn add_labels(session: &mut Session, uids: &[u32], add: &[String]) -> Resu
         tracing::warn!("Gmail did not add {add:?} (attempt {attempt}): {}", found.join(", "));
     }
     let names: Vec<String> = add.iter().map(|l| crate::utf7::decode(&crate::provider::unquote_label(l))).collect();
-    Err(Error::Other(crate::i18n::both(|| {
+    Err(Error::Rejected(crate::i18n::both(|| {
         crate::tr!("Gmail n'a pas ajouté le libellé {} : les messages gardent leurs libellés", "Gmail did not add the label {}: the messages keep their labels", names.join(", "))
     })))
 }

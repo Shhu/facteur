@@ -317,7 +317,20 @@ async function reload() {
     reload()
   }
 }
-watch(tick, reload)
+// A sync ticks a few times a second: the open thread is read again at most once a second, and not
+// while another screen covers it.
+const tickReloader = useReloader(() => reload(), 1000)
+let staleWhileCovered = false
+watch(tick, () => {
+  if (covered.value) staleWhileCovered = true
+  else tickReloader.schedule()
+})
+watch(covered, (now) => {
+  if (!now && staleWhileCovered) {
+    staleWhileCovered = false
+    tickReloader.schedule()
+  }
+})
 
 const { done } = useUndo()
 

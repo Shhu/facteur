@@ -520,7 +520,7 @@ async fn copy_saved_elsewhere(session: &mut Session, place: &Place<'_>, validity
         let mut copied = HashSet::new();
         idx.begin()?;
         for (uid, id, size, received, letters) in seen {
-            let Some((folder, source)) = idx.elsewhere(&rel, &id, size)? else { continue };
+            let Some((folder, source)) = idx.elsewhere(&rel, &id, size, received)? else { continue };
             let Some(path) = index::find_file(&root.join(&folder), &source) else { continue };
             let file = format!("{received}.U{uid}V{validity}.facteur{sep}2,{letters}");
             let target = dir.join("cur").join(&file);

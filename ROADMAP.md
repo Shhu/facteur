@@ -33,8 +33,9 @@ What remains to be done, by theme. Decisions already made are noted under each i
 
 ## Sorting and reading
 
-- Done: templates and quick replies, muting a conversation.
-- "Done": sort by the date a thread was handled (not only by the date of its last message).
+- Done: templates and quick replies, muting a conversation; the "Done" view sorted by when each
+  thread left the inbox (archived in facteur or elsewhere, a label taken off), or by its last
+  message when that is later or the thread was archived before facteur kept track.
 
 ## Mobile and sync
 
@@ -61,7 +62,10 @@ What remains to be done, by theme. Decisions already made are noted under each i
   "Join" for its video meeting); guests and their answers shown, and invited from facteur
   (Google and Outlook send the invitations; CalDAV through the server's scheduling, or by mail
   when it has none).
-- Not yet: reminders set from facteur (the provider's are used), a time zone per event.
+- Done: reminders set from facteur (on screen; Outlook keeps one per event, the earliest), and a
+  time zone per event: chosen in the form (its times typed in that zone, the computer's time
+  shown beside), read from Google, Outlook and CalDAV, shown in the event's card when it differs
+  from the computer's. A series moved to another zone is written again in it.
 - Done: Outlook calendars only reread when a light listing (identifiers and change dates)
   differs from the last one. Graph's `calendarView/delta` would avoid that listing too, but it
   only exists for the main calendar.
@@ -79,9 +83,10 @@ What remains to be done, by theme. Decisions already made are noted under each i
 - Done: dictation (Whisper large-v3 turbo, 0.57 GB, turned on apart): a microphone button in
   the composer, the voice transcribed on the computer (whisper.cpp v1.9.5, built against
   llama.cpp's ggml so that the program holds one ggml).
-- The Flatpak is built without it for now: llama.cpp needs libclang there (the SDK's LLVM
-  extension).
-- Next: the graphics card (Vulkan), short reply suggestions, sorting help, search by meaning.
+- Done: the graphics card through Vulkan, on Windows and in the Flatpak (the model as far as the card's memory goes,
+  the rest on the processor; wholly on the processor without a Vulkan driver, or when the card
+  fails a request), dictation included.
+- Next: short reply suggestions, sorting help, search by meaning.
 
 ## Search
 
@@ -106,6 +111,16 @@ What remains to be done, by theme. Decisions already made are noted under each i
   correspondents of a removed account gone from the composer's suggestions.
 - Done: errors of queued operations kept in both languages too (the server's own words as they
   came).
+- Done (October 2026): an audit in ten domains (sync, queue, concurrency, SQLite, network,
+  interface, hostile mail, MIME, calendars, lifecycle), 44 findings, 41 fixed with their tests.
+  Left on purpose:
+  - Typing in a reply with a long quote serializes the whole editor on each key: the plain text
+    should be computed when sending instead (a debounce could send a message short of its last
+    characters).
+  - A CalDAV calendar is read again whole (expanded, 14 months) on any change, and fails above
+    32 MiB: per-object ETags or `sync-collection` instead, to be tested on a real CalDAV account.
+  - The one-time Gmail label conversion rewrites bodies in one transaction (off the async
+    workers now); chunking it only matters for accounts not converted yet.
 
 ## Distribution
 

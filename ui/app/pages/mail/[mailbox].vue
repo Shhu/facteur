@@ -135,9 +135,9 @@ async function read(full: boolean) {
     full = true
   }
   try {
-    // Another view's list: nothing to merge. A complete list (fewer than `limit` threads) may have
-    // grown at the end (history loaded): reread everything.
-    if (full || loadedFor !== key || complete.value) await readAll(request, key)
+    // Another view's list: nothing to merge. Older messages loaded at the end ask for a full read
+    // themselves (`fullNext`): a refresh only merges the first page, even into a long list.
+    if (full || loadedFor !== key) await readAll(request, key)
     else await merge(request, key)
   } catch (e) {
     if (request === loadRequest) showError(e)
@@ -223,7 +223,18 @@ watch([view, filter, limit, () => smart.category.value, smartView], load, { imme
 /** A sync ticks a few times a second, and each tick would aggregate the whole folder (tab
  *  counts) and reread the list: at most one round a second, one at a time. */
 const tickReloader = useReloader(() => Promise.all([loadCategoryUnread(), refresh(), refreshSearch()]), 1000)
-watch(tick, () => tickReloader.schedule())
+// Under another screen (stats, settings…) the list is read once, when it shows again.
+let staleWhileCovered = false
+watch(tick, () => {
+  if (covered.value) staleWhileCovered = true
+  else tickReloader.schedule()
+})
+watch(covered, (now) => {
+  if (!now && staleWhileCovered) {
+    staleWhileCovered = false
+    tickReloader.schedule()
+  }
+})
 // Saved search opened from the sidebar (`?q=`). Declared after the view reset so it runs last
 // when both change together.
 watch(() => route.query.q, (q, before) => {
@@ -341,7 +352,7 @@ const items = computed<ListItem[]>(() => {
       activity: m.date,
       snoozedUntil: null,
       woken: false,
-      labels: m.labels?.map(labelName).filter((l): l is string => !!l)
+      labels: m.labels?.map(id => labelNames.value.get(id)).filter((l): l is string => !!l)
     }))
   }
   return threads.value.map(t => ({
@@ -365,15 +376,12 @@ const items = computed<ListItem[]>(() => {
     activity: t.activity,
     snoozedUntil: t.snoozed_until,
     woken: t.woken,
-    labels: t.labels?.map(labelName).filter((l): l is string => !!l)
+    labels: t.labels?.map(id => labelNames.value.get(id)).filter((l): l is string => !!l)
   }))
 })
 
-function labelName(id: number): string | null {
-  const m = mailboxes.value.find(b => b.id === id)
-  if (!m) return null
-  return m.role ? roleLabels[m.role] : m.display_name
-}
+/** Label names by folder id, built once per folder list rather than looked up per thread. */
+const labelNames = computed(() => new Map(mailboxes.value.map(m => [m.id, m.role ? roleLabels[m.role] : m.display_name])))
 
 const selected = ref(new Set<string>())
 let anchor: string | null = null
@@ -488,6 +496,8 @@ async function loadOlder() {
   try {
     const added = await api.loadOlder(mailboxId.value)
     if (!added) historyComplete.value = true
+    // The list grew at its end, past what a merge rereads.
+    else fullNext = true
   } catch (e) {
     olderFailed.value = true
     showError(e, t('mail.page.historyUnavailable'))

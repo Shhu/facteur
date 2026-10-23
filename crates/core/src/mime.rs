@@ -197,7 +197,20 @@ fn joined_text<'a>(parts: impl Iterator<Item = &'a mail_parser::MessagePart<'a>>
             _ => None,
         })
         .collect();
-    (!texts.is_empty()).then(|| texts.join("\n"))
+    if texts.is_empty() {
+        return None;
+    }
+    // The same budget as text drawn from HTML: what goes to the search index, the preview and the
+    // reader stays bounded for a huge plain-text body too.
+    let mut text = texts.join("\n");
+    if text.len() > TEXT_BUDGET {
+        let mut cut = TEXT_BUDGET;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+    }
+    Some(text)
 }
 
 /// RFC 3676 `format=flowed` text as plain lines: a soft line break (a line ending with a space)
@@ -417,12 +430,12 @@ pub fn body_info(raw: &[u8]) -> BodyInfo {
     // The text parts, else ours from the HTML (mail-parser would make one up from the HTML,
     // with no line breaks between blocks).
     let text = joined_text(msg.text_bodies()).or_else(|| joined_text(msg.html_bodies())).unwrap_or_default();
+    // Its first words only: the rest of the body is never walked for 200 characters.
     let preview: String = text
         .lines()
         .filter(|l| !l.trim_start().starts_with('>') && !template_token(l))
-        .collect::<Vec<_>>()
-        .join(" ")
-        .split_whitespace()
+        .flat_map(str::split_whitespace)
+        .take(200)
         .collect::<Vec<_>>()
         .join(" ")
         .chars()
@@ -570,7 +583,10 @@ pub fn parse_body(raw: &[u8]) -> Result<ParsedBody> {
         _ => (text_to_html(text.as_deref().unwrap_or_default()), false, true, HashSet::new()),
     };
 
+    // A message made of thousands of tiny parts would become thousands of chips: the first ones
+    // are listed (a real message is far below), the message itself stays readable.
     let attachments = real_attachments(&msg, &shown)
+        .take(MAX_LISTED_ATTACHMENTS)
         .map(|(index, p)| Attachment {
             index,
             filename: p.attachment_name().unwrap_or("sans-nom").to_string(),
@@ -1090,6 +1106,8 @@ pub fn text_as_utf8<'a>(data: &'a [u8], charset: Option<&str>) -> std::borrow::C
 }
 
 const TEXT_BUDGET: usize = 4 << 20;
+/// Attachments listed for a message.
+const MAX_LISTED_ATTACHMENTS: usize = 300;
 /// Deepest quote or list level shown by [`html_to_text`]: HTML nesting has no limit, and a
 /// prefix per level on every line made the text grow with depth times lines.
 const MAX_DEPTH: usize = 8;

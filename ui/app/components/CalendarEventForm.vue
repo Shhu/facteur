@@ -100,6 +100,53 @@ function guestList(): EventAttendee[] {
     return { email: a.email, name: a.name ?? known?.name ?? null, response: known?.response ?? null }
   })
 }
+/** The zone the form's times are in. */
+const zone = ref(localZone())
+/** The zone the event had, the computer's for one without. */
+const zoneBefore = computed(() => validZone(props.event?.zone) ?? localZone())
+const zoneChosen = ref(false)
+const zoneShown = computed(() => !form.allDay && (zoneChosen.value || zone.value !== localZone()))
+const zoneItems = computed(() => {
+  const at = Math.floor(Date.now() / 1000)
+  return allZones().map(z => ({ label: `${z.replace(/_/g, ' ')} (${zoneOffsetLabel(z, at)})`, value: z }))
+})
+/** Where the times fall on the computer's clock, when the event is set in another zone. */
+const localHint = computed(() => {
+  if (form.allDay || zone.value === localZone()) return null
+  const start = parse(form.startDate, form.startTime)
+  if (!start) return null
+  const at = new Date(instantOf(start, zone.value) * 1000)
+  return t('tools.calendar.event.localTime', { time: at.toLocaleString(undefined, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) })
+})
+
+/** Minutes before the start; `null`: the calendar's own (a new event). */
+const reminders = ref<number[] | null>(null)
+const targetSource = computed(() => calendars.value.find(c => c.id === (props.event?.calendar_id ?? form.calendarId))?.source)
+/** Outlook keeps one reminder per event. */
+const oneReminder = computed(() => targetSource.value === 'microsoft')
+const reminderLabel = (m: number) => {
+  const [key, n] = reminderKey(m)
+  return t(key, { n }, n)
+}
+const reminderItems = computed(() => {
+  const list = [...new Set([...REMINDER_CHOICES, ...(reminders.value ?? [])])].sort((a, b) => a - b)
+  return list.map(m => ({ label: reminderLabel(m), value: m }))
+})
+const singleReminderItems = computed(() => [{ label: t('tools.calendar.event.noReminder'), value: -1 }, ...reminderItems.value])
+const singleReminder = computed({
+  get: () => (reminders.value === null ? undefined : (reminders.value.at(-1) ?? -1)),
+  set: (v: number | undefined) => {
+    reminders.value = v === undefined || v < 0 ? [] : [v]
+  }
+})
+const manyReminders = computed({
+  get: () => reminders.value ?? [],
+  set: (v: number[]) => {
+    reminders.value = [...v].sort((a, b) => a - b)
+  }
+})
+const remindersPlaceholder = computed(() => t(reminders.value === null ? 'tools.calendar.event.remindersDefault' : 'tools.calendar.event.noReminder'))
+
 /** The series' rule as read when the form opened on it (`null`: not read yet). */
 const seriesRepeat = ref<SeriesRepeat | null>(null)
 const loadingRepeat = ref(false)
@@ -130,6 +177,7 @@ const rebuilds = computed(() => {
   if (!e?.recurring || scope.value !== 'series' || !before) return false
   const start = new Date(e.start * 1000)
   if (form.startDate !== dateText(start) || form.allDay !== e.all_day) return true
+  if (!form.allDay && zone.value !== zoneBefore.value) return true
   return JSON.stringify(toRepeat(repeat.value)) !== JSON.stringify(toRepeat(fromRepeat(before, start)))
 })
 const saving = ref(false)
@@ -154,12 +202,15 @@ function fill() {
   repeat.value = blankRepeat()
   guests.value = (props.event?.attendees ?? []).filter(a => !a.organizer).map(a => addressFull({ name: a.name ?? null, email: a.email }))
   createKey = newKey()
+  zoneChosen.value = false
   const e = props.event
   if (e) {
-    const start = new Date(e.start * 1000)
+    zone.value = zoneBefore.value
+    reminders.value = [...e.reminders]
+    const start = e.all_day ? new Date(e.start * 1000) : wallDate(e.start, zone.value)
     // A whole day ends at the midnight after its last day: the form shows that last day, a
     // calendar day before (not 24 hours: the day clocks change has 23 or 25).
-    const after = new Date(e.end * 1000)
+    const after = e.all_day ? new Date(e.end * 1000) : wallDate(e.end, zone.value)
     const end = e.all_day ? new Date(Math.max(start.getTime(), addDays(dayStart(after), -1).getTime())) : after
     Object.assign(form, {
       summary: e.summary,
@@ -174,6 +225,8 @@ function fill() {
     })
     return
   }
+  zone.value = localZone()
+  reminders.value = null
   const found = props.suggestion
   const allDay = found?.start != null ? found.all_day : !!props.allDay
   const start = found?.start != null ? new Date(found.start * 1000) : props.start ?? nextHalfHour()
@@ -224,13 +277,29 @@ function draft(): EventDraft | null {
       end: unix(addDays(last, 1)),
       all_day: true,
       repeat: toRepeat(repeat.value),
-      attendees: guestList()
+      attendees: guestList(),
+      reminders: reminders.value
     }
   }
   const start = parse(form.startDate, form.startTime)
   const end = parse(form.endDate, form.endTime)
   if (!start || !end) return null
-  return { summary: form.summary, location: form.location || null, description: form.description || null, start: unix(start), end: unix(end), all_day: false, repeat: toRepeat(repeat.value), attendees: guestList() }
+  // The zone is sent once changed: an event left in its own keeps it, a new one in the computer's
+  // is written as before.
+  const before = props.event ? validZone(props.event.zone) : null
+  const sentZone = zone.value === zoneBefore.value ? before : zone.value
+  return {
+    summary: form.summary,
+    location: form.location || null,
+    description: form.description || null,
+    start: instantOf(start, zone.value),
+    end: instantOf(end, zone.value),
+    all_day: false,
+    repeat: toRepeat(repeat.value),
+    attendees: guestList(),
+    zone: sentZone,
+    reminders: reminders.value
+  }
 }
 
 async function save() {
@@ -344,7 +413,53 @@ async function remove() {
             </UFormField>
             <UInput v-if="!form.allDay" v-model="form.endTime" type="time" class="w-32" :aria-label="t('tools.calendar.event.endTime')" />
           </div>
+          <UButton
+            v-if="!form.allDay && !zoneShown"
+            :label="t('tools.calendar.event.zone')"
+            icon="i-lucide-globe"
+            color="neutral"
+            variant="link"
+            size="sm"
+            class="-ms-1.5 self-start px-1.5 text-muted"
+            @click="zoneChosen = true"
+          />
+          <template v-if="zoneShown">
+            <USelectMenu
+              v-model="zone"
+              :items="zoneItems"
+              value-key="value"
+              icon="i-lucide-globe"
+              :search-input="{ placeholder: t('tools.calendar.event.searchZone'), icon: 'i-lucide-search' }"
+              :aria-label="t('tools.calendar.event.zone')"
+              class="w-full"
+            />
+            <p v-if="localHint" class="text-[13px] text-muted">{{ localHint }}</p>
+          </template>
         </div>
+
+        <USelectMenu
+          v-if="oneReminder"
+          v-model="singleReminder"
+          :items="singleReminderItems"
+          value-key="value"
+          icon="i-lucide-bell"
+          :search-input="false"
+          :placeholder="remindersPlaceholder"
+          :aria-label="t('tools.calendar.event.reminders')"
+          class="w-full"
+        />
+        <USelectMenu
+          v-else
+          v-model="manyReminders"
+          :items="reminderItems"
+          value-key="value"
+          multiple
+          icon="i-lucide-bell"
+          :search-input="false"
+          :placeholder="remindersPlaceholder"
+          :aria-label="t('tools.calendar.event.reminders')"
+          class="w-full"
+        />
 
         <CalendarRepeat v-if="repeatShown" v-model="repeat" :start="parse(form.startDate)" :custom="!!seriesRepeat?.custom" />
         <div v-else-if="loadingRepeat" class="flex items-center gap-2 text-sm text-muted">

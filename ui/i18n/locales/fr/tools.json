@@ -318,7 +318,14 @@
         "guests": "Invités",
         "guestsPlaceholder": "Ajouter des invités",
         "guestsInvited": "Ils recevront une invitation par mail.",
-        "guestsUpdated": "Les invités sont prévenus des changements, et les nouveaux reçoivent une invitation."
+        "guestsUpdated": "Les invités sont prévenus des changements, et les nouveaux reçoivent une invitation.",
+        "zone": "Fuseau horaire",
+        "searchZone": "Chercher une ville ou un fuseau",
+        "localTime": "Soit {time}, heure de cet ordinateur",
+        "reminders": "Rappels",
+        "remindersDefault": "Rappels de l'agenda",
+        "noReminder": "Aucun rappel",
+        "inZone": "{time}, heure de {zone}"
       },
       "repeat": {
         "title": "Répétition",

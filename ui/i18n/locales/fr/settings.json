@@ -501,6 +501,12 @@
       "offTitle": "Désactiver l'IA locale ?",
       "offConfirm": "Le modèle est supprimé de l'ordinateur ({size} libérés). Vous pourrez le télécharger de nouveau.",
       "offConfirmFile": "facteur n'utilisera plus votre fichier (il reste où il est).",
+      "graphics": {
+        "title": "Carte graphique",
+        "help": "Les calculs passent par la carte graphique quand l'ordinateur en a une, plus vite qu'avec le processeur seul. Désactivez si l'IA devient plus lente ou instable.",
+        "using": "Utilisée : {card}. Désactivez si l'IA devient plus lente ou instable.",
+        "off": "Désactivée : l'IA n'utilise que le processeur."
+      },
       "dictation": {
         "title": "Dictée",
         "help": "Dicter vos messages : un bouton micro dans le rédacteur. La voix est transcrite sur cet ordinateur (modèle de {size}).",

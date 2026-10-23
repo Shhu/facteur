@@ -52,6 +52,7 @@ webpki-roots = "1.0.9"
 # `common` catches llama.cpp's C++ exceptions (a grammar dead end), which would abort the app.
 # Its build needs CMake and libclang.
 llama-cpp-2 = { version = "0.1.160", default-features = false, features = ["common"], optional = true }
+llama-cpp-sys-2 = { version = "=0.1.160", default-features = false, optional = true }
 # Dictation: whisper.cpp on the same ggml.
 facteur-whisper = { version = "0.1.0", path = "../whisper", optional = true }
 
@@ -64,7 +65,7 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 
 # Already there through tokio: the computer's memory, for the local AI's model.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation", "Win32_System_LibraryLoader"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 keyring-core = "1"
@@ -73,4 +74,7 @@ android-native-keyring-store = "1"
 [features]
 # Performance tracing for local builds (scripts/build-windows.sh --perf); never in a release.
 perf = ["rusqlite/trace"]
-local-ai = ["dep:llama-cpp-2", "dep:facteur-whisper"]
+local-ai = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2", "dep:facteur-whisper"]
+# The local AI on the graphics card (llama.cpp's Vulkan backend, Whisper's through the same ggml):
+# its build needs the Vulkan SDK; the processor stays the fallback.
+vulkan = ["local-ai", "llama-cpp-2/vulkan"]

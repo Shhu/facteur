@@ -63,6 +63,8 @@ async function fetchHistory() {
   fetching.value = true
   try {
     const added = await api.fetchAllHistory(a.value.id)
+    // Older messages joined the lists past what their refresh rereads.
+    useListStale().bump()
     toast.add({ title: t('settings.accounts.historyFetched'), description: t('settings.accounts.historyAdded', { n: num(added) }, added), icon: 'i-lucide-check' })
   } catch (e) {
     showError(e, t('settings.accounts.historyFailed'))

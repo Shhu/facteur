@@ -144,21 +144,47 @@ pub async fn download(model: &Model, dest: &Path, cancel: &std::sync::atomic::At
         .map_err(|e| Error::Other(e.to_string()))?;
     let part = dest.with_extension("part");
     let res = async {
-        let mut resp = http.get(model.url).send().await.map_err(|e| Error::Other(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(Error::Other(crate::tr!("téléchargement refusé ({})", "download refused ({})", resp.status())));
-        }
         let mut file = std::fs::File::create(&part)?;
         let mut hash = Sha256::new();
         let mut done = 0u64;
-        while let Some(chunk) = resp.chunk().await.map_err(|e| Error::Other(e.to_string()))? {
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(Error::Other(crate::tr!("téléchargement arrêté", "download stopped")));
+        // A cut connection (several GB on a home line) takes the download up where it stopped:
+        // the URL names a fixed revision, so the rest is the same file.
+        let mut retries = 0;
+        loop {
+            let mut req = http.get(model.url);
+            if done > 0 {
+                req = req.header(reqwest::header::RANGE, format!("bytes={done}-"));
             }
-            file.write_all(&chunk)?;
-            hash.update(&chunk);
-            done += chunk.len() as u64;
-            progress(done);
+            let cut = |e: reqwest::Error| Error::Unreachable(e.to_string());
+            let step = async {
+                let mut resp = req.send().await.map_err(cut)?;
+                if done > 0 && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+                    return Err(Error::Other(crate::tr!("le serveur ne reprend pas le téléchargement", "the server does not resume the download")));
+                }
+                if !resp.status().is_success() {
+                    return Err(Error::Other(crate::tr!("téléchargement refusé ({})", "download refused ({})", resp.status())));
+                }
+                while let Some(chunk) = resp.chunk().await.map_err(cut)? {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(Error::Other(crate::tr!("téléchargement arrêté", "download stopped")));
+                    }
+                    file.write_all(&chunk)?;
+                    hash.update(&chunk);
+                    done += chunk.len() as u64;
+                    progress(done);
+                }
+                Ok(())
+            }
+            .await;
+            match step {
+                Ok(()) => break,
+                Err(Error::Unreachable(e)) if retries < 8 && !cancel.load(std::sync::atomic::Ordering::Relaxed) => {
+                    retries += 1;
+                    tracing::info!("model download cut at {done} bytes ({e}): resuming");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                Err(e) => return Err(e),
+            }
         }
         file.sync_all()?;
         let digest: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
@@ -591,6 +617,66 @@ fn times(text: &str) -> Vec<chrono::NaiveTime> {
     out
 }
 
+/// The local AI may use the graphics card (a setting; on by default).
+static GRAPHICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// The graphics card the model was last loaded on (`None`: the processor, or not loaded yet).
+static CARD: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Turns the graphics card on or off for the local AI: the models in memory leave it, the next
+/// request loads them as asked.
+pub fn set_graphics(on: bool) {
+    if GRAPHICS.swap(on, std::sync::atomic::Ordering::SeqCst) != on {
+        unload();
+        *CARD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// The graphics card the model last ran on.
+pub fn graphics_card() -> Option<String> {
+    CARD.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The graphics card for the models (Vulkan), when allowed: one only, as a model split across a
+/// card and the processor's own graphics runs at the slower one's pace. A dedicated card first,
+/// the one with the most free memory. With its rank among the cards (Whisper names it so).
+#[cfg(feature = "local-ai")]
+fn chosen_card() -> Option<(llama_cpp_2::LlamaBackendDevice, usize)> {
+    use llama_cpp_2::LlamaBackendDeviceType as Kind;
+    if !GRAPHICS.load(std::sync::atomic::Ordering::SeqCst) {
+        return None;
+    }
+    llama_cpp_2::list_llama_ggml_backend_devices()
+        .into_iter()
+        .filter(|d| matches!(d.device_type, Kind::Gpu | Kind::IntegratedGpu))
+        .enumerate()
+        .max_by_key(|(_, d)| (matches!(d.device_type, Kind::Gpu), d.memory_free))
+        .map(|(rank, d)| (d, rank))
+}
+
+/// Before ggml's first call: without Vulkan's loader (a computer with no graphics driver, a
+/// virtual machine), its Vulkan backend is left out, the processor does the work. The loader is
+/// delay-loaded, so calling into it when missing would end the program. ggml reads the C
+/// runtime's environment, which `std::env::set_var` does not reach.
+#[cfg(feature = "local-ai")]
+fn check_graphics() {
+    #[cfg(all(windows, feature = "vulkan"))]
+    {
+        static CHECKED: std::sync::Once = std::sync::Once::new();
+        CHECKED.call_once(|| {
+            let name: Vec<u16> = "vulkan-1.dll\0".encode_utf16().collect();
+            // SAFETY: a NUL-terminated name; the library stays loaded for ggml.
+            let loader = unsafe { windows_sys::Win32::System::LibraryLoader::LoadLibraryW(name.as_ptr()) };
+            if loader.is_null() {
+                unsafe extern "C" {
+                    fn _putenv_s(name: *const std::ffi::c_char, value: *const std::ffi::c_char) -> i32;
+                }
+                // SAFETY: two NUL-terminated strings, copied by the C runtime.
+                unsafe { _putenv_s(c"GGML_DISABLE_VULKAN".as_ptr(), c"1".as_ptr()) };
+            }
+        });
+    }
+}
+
 #[cfg(feature = "local-ai")]
 mod run {
     use super::*;
@@ -610,6 +696,7 @@ mod run {
         static BACKEND: OnceLock<std::result::Result<LlamaBackend, String>> = OnceLock::new();
         BACKEND
             .get_or_init(|| {
+                check_graphics();
                 LlamaBackend::init().map(|mut b| {
                     b.void_logs();
                     b
@@ -620,8 +707,9 @@ mod run {
             .map_err(|e| Error::Other(format!("llama.cpp: {e}")))
     }
 
-    /// The model in memory, its file, and when it was last used.
-    static LOADED: Mutex<Option<(PathBuf, LlamaModel, Instant)>> = Mutex::new(None);
+    /// The model in memory, its file, when it was last used, and whether the graphics card holds
+    /// part of it.
+    static LOADED: Mutex<Option<(PathBuf, LlamaModel, Instant, bool)>> = Mutex::new(None);
 
     /// Frees the model's memory when unused for `idle` (the next request loads it again).
     pub fn unload_if_idle(idle: std::time::Duration) -> bool {
@@ -632,7 +720,7 @@ mod run {
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return false,
         };
-        if loaded.as_ref().is_some_and(|(_, _, used)| used.elapsed() >= idle) {
+        if loaded.as_ref().is_some_and(|(_, _, used, _)| used.elapsed() >= idle) {
             *loaded = None;
             return true;
         }
@@ -648,6 +736,39 @@ mod run {
         let n = std::thread::available_parallelism().map_or(4, |n| n.get());
         (n / 2).clamp(1, 8) as i32
     }
+
+    /// The model, on the graphics card as far as its memory goes (`graphics`), the rest on the
+    /// processor; wholly on the processor when nothing fits or loading there fails. Whether the
+    /// graphics card took part of it.
+    fn load(backend: &LlamaBackend, path: &Path, graphics: bool) -> Result<(LlamaModel, bool)> {
+        if let Some((card, _)) = graphics.then(chosen_card).flatten()
+            && let Ok(params) = LlamaModelParams::default().with_devices(&[card.index])
+        {
+            let mut params = std::pin::pin!(params);
+            let file = std::ffi::CString::new(path.to_string_lossy().into_owned()).map_err(|e| Error::Other(e.to_string()))?;
+            // Room for what facteur asks (a long thread summed up), a margin for the rest of
+            // the screen's work.
+            let mut context = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(CONTEXT));
+            let mut margins = vec![MARGIN; llama_cpp_2::max_devices()];
+            let fitted = params.as_mut().fit_params(&file, &mut context, &mut margins, CONTEXT, llama_cpp_sys_2::GGML_LOG_LEVEL_ERROR);
+            if fitted.is_ok() && params.n_gpu_layers() != 0 {
+                if let Ok(model) = LlamaModel::load_from_file(backend, path, &params) {
+                    tracing::info!(layers = params.n_gpu_layers(), card = %card.description, free_mib = card.memory_free >> 20, "local AI model on the graphics card");
+                    *CARD.lock().unwrap_or_else(|e| e.into_inner()) = Some(card.description);
+                    return Ok((model, true));
+                }
+            }
+        }
+        *CARD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        LlamaModel::load_from_file(backend, path, &LlamaModelParams::default().with_n_gpu_layers(0))
+            .map(|model| (model, false))
+            .map_err(|e| Error::Other(crate::tr!("modèle illisible : {e}", "unreadable model: {e}")))
+    }
+
+    /// The context the model is fitted to the graphics card for, in tokens.
+    const CONTEXT: u32 = 8192;
+    /// Graphics memory left free, in bytes.
+    const MARGIN: usize = 512 << 20;
 
     /// The conversation in the model's own format (its template), ready for its answer. A
     /// template llama.cpp does not know falls back to ChatML, the most common one.
@@ -679,26 +800,53 @@ mod run {
     pub fn generate(path: &Path, turns: &[Turn], max_tokens: usize, grammar: Option<&str>) -> Result<String> {
         let backend = backend()?;
         let mut loaded = LOADED.lock().unwrap_or_else(|e| e.into_inner());
-        if loaded.as_ref().is_none_or(|(p, _, _)| p != path) {
+        if loaded.as_ref().is_none_or(|(p, _, _, _)| p != path) {
             *loaded = None;
-            let model = LlamaModel::load_from_file(backend, path, &LlamaModelParams::default())
-                .map_err(|e| Error::Other(crate::tr!("modèle illisible : {e}", "unreadable model: {e}")))?;
-            *loaded = Some((path.to_path_buf(), model, Instant::now()));
+            let (model, graphics) = load(backend, path, true)?;
+            *loaded = Some((path.to_path_buf(), model, Instant::now(), graphics));
         }
-        let (_, model, used) = loaded.as_mut().expect("model loaded");
+        let (_, model, used, graphics) = loaded.as_mut().expect("model loaded");
         *used = Instant::now();
-        let text = prompt(model, turns)?;
+        match answer(backend, model, turns, max_tokens, grammar) {
+            // The graphics card failed it (its memory short for this text): the processor takes
+            // the model.
+            Err(Failed::Run(_)) if *graphics => {
+                (*model, *graphics) = load(backend, path, false)?;
+                answer(backend, model, turns, max_tokens, grammar).map_err(Failed::into_error)
+            }
+            other => other.map_err(Failed::into_error),
+        }
+    }
+
+    enum Failed {
+        /// llama.cpp could not run the model.
+        Run(String),
+        Other(Error),
+    }
+
+    impl Failed {
+        fn into_error(self) -> Error {
+            match self {
+                Failed::Run(e) => Error::Other(format!("llama.cpp: {e}")),
+                Failed::Other(e) => e,
+            }
+        }
+    }
+
+    fn answer(backend: &LlamaBackend, model: &LlamaModel, turns: &[Turn], max_tokens: usize, grammar: Option<&str>) -> std::result::Result<String, Failed> {
+        let run = |e: &dyn std::fmt::Display| Failed::Run(e.to_string());
+        let text = prompt(model, turns).map_err(Failed::Other)?;
         let tokens = model.vocab().tokenize(text.as_bytes(), true, true);
         let room = (tokens.len() + max_tokens + 16).min(model.n_ctx_train() as usize).max(512);
         if tokens.len() + 16 >= room {
-            return Err(Error::Other(crate::tr!("texte trop long pour le modèle", "text too long for the model")));
+            return Err(Failed::Other(Error::Other(crate::tr!("texte trop long pour le modèle", "text too long for the model"))));
         }
         let params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(room as u32))
             .with_n_batch(512)
             .with_n_threads(threads())
             .with_n_threads_batch(threads());
-        let mut ctx = model.new_context(backend, params).map_err(|e| Error::Other(format!("llama.cpp: {e}")))?;
+        let mut ctx = model.new_context(backend, params).map_err(|e| run(&e))?;
         // The prompt in chunks of the batch size; the last token's logits give the first word.
         let mut batch = LlamaBatch::new(512, 1);
         for (chunk_index, chunk) in tokens.chunks(512).enumerate() {
@@ -706,13 +854,13 @@ mod run {
             for (i, token) in chunk.iter().enumerate() {
                 let pos = (chunk_index * 512 + i) as i32;
                 let last = chunk_index * 512 + i == tokens.len() - 1;
-                batch.add(*token, pos, &[0], last).map_err(|e| Error::Other(format!("llama.cpp: {e}")))?;
+                batch.add(*token, pos, &[0], last).map_err(|e| run(&e))?;
             }
-            ctx.decode(&mut batch).map_err(|e| Error::Other(format!("llama.cpp: {e}")))?;
+            ctx.decode(&mut batch).map_err(|e| run(&e))?;
         }
         let mut samplers = Vec::new();
         if let Some(g) = grammar {
-            samplers.push(LlamaSampler::grammar(model, g, "root").map_err(|e| Error::Other(format!("grammar: {e}")))?);
+            samplers.push(LlamaSampler::grammar(model, g, "root").map_err(|e| Failed::Other(Error::Other(format!("grammar: {e}"))))?);
         }
         // Little randomness: the same message gives the same answer, much the same.
         samplers.extend([LlamaSampler::top_k(40), LlamaSampler::top_p(0.9, 1), LlamaSampler::temp(0.2), LlamaSampler::dist(1)]);
@@ -726,8 +874,8 @@ mod run {
             }
             out.extend(model.vocab().token_to_piece(token, false, None));
             batch.clear();
-            batch.add(token, pos, &[0], true).map_err(|e| Error::Other(format!("llama.cpp: {e}")))?;
-            ctx.decode(&mut batch).map_err(|e| Error::Other(format!("llama.cpp: {e}")))?;
+            batch.add(token, pos, &[0], true).map_err(|e| run(&e))?;
+            ctx.decode(&mut batch).map_err(|e| run(&e))?;
         }
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
@@ -783,11 +931,17 @@ mod hear {
         if loaded.as_ref().is_none_or(|(p, _, _)| p != path) {
             *loaded = None;
             let file = CString::new(path.to_string_lossy().into_owned()).map_err(|e| Error::Other(e.to_string()))?;
+            check_graphics();
             // SAFETY: plain C calls; the file name lives through the call.
-            let ctx = unsafe {
-                w::whisper_log_set(Some(quiet), std::ptr::null_mut());
-                w::whisper_init_from_file_with_params(file.as_ptr(), w::whisper_context_default_params())
-            };
+            unsafe { w::whisper_log_set(Some(quiet), std::ptr::null_mut()) };
+            // SAFETY: default parameters, then plain fields.
+            let mut params = unsafe { w::whisper_context_default_params() };
+            match chosen_card() {
+                Some((_, rank)) => params.gpu_device = rank as i32,
+                None => params.use_gpu = false,
+            }
+            // SAFETY: the file name lives through the call.
+            let ctx = unsafe { w::whisper_init_from_file_with_params(file.as_ptr(), params) };
             if ctx.is_null() {
                 return Err(Error::Other(crate::tr!("modèle de dictée illisible", "unreadable dictation model")));
             }

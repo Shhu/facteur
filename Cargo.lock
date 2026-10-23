@@ -1464,6 +1464,7 @@ dependencies = [
  "keyring-core",
  "lettre",
  "llama-cpp-2",
+ "llama-cpp-sys-2",
  "mail-auth",
  "mail-parser",
  "minisign-verify",

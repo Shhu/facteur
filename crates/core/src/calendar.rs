@@ -590,6 +590,8 @@ pub struct Instance {
     pub meeting: Option<String>,
     /// Minutes before the start.
     pub reminders: Vec<i64>,
+    /// The IANA zone a timed event was set in, when it names one.
+    pub zone: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -775,6 +777,7 @@ impl<'a> Shape<'a> {
             attendees: self.attendees(),
             meeting: self.meeting(),
             reminders: self.reminders(start),
+            zone: if matches!(at, Stamp::Date(_)) { None } else { self.get("DTSTART").and_then(|l| l.param("TZID")).and_then(event_zone) },
         })
     }
 
@@ -1270,6 +1273,11 @@ pub struct EventChanges {
     pub times: Option<(i64, i64, bool)>,
     /// Who is invited (see [`EventChanges::organized_by`]); empty: nobody any more.
     pub attendees: Option<Vec<crate::model::EventAttendee>>,
+    /// The IANA zone timed bounds are written in, given with `times` (`None`: UTC for a single
+    /// event, the computer's zone for a series).
+    pub zone: Option<String>,
+    /// Minutes before the start, on screen; empty: none.
+    pub reminders: Option<Vec<i64>>,
 }
 
 /// Guests as given: valid addresses, each once, the organizer left out.
@@ -1280,6 +1288,11 @@ fn guests(list: &[crate::model::EventAttendee]) -> Vec<crate::model::EventAttend
         .map(|a| crate::model::EventAttendee { email: a.email.trim().to_string(), name: clean(a.name.as_deref()), ..a.clone() })
         .filter(|a| a.email.contains('@') && !a.email.contains(char::is_whitespace) && seen.insert(a.email.to_lowercase()))
         .collect()
+}
+
+/// The draft's zone, known and for a timed event only.
+fn draft_zone(draft: &crate::model::EventDraft) -> Option<String> {
+    draft.zone.as_deref().filter(|_| !draft.all_day).and_then(zone_named).map(|(name, _)| name)
 }
 
 fn clean(v: Option<&str>) -> Option<String> {
@@ -1295,6 +1308,8 @@ impl EventChanges {
             description: Some(clean(draft.description.as_deref())),
             times: Some((draft.start, draft.end, draft.all_day)),
             attendees: draft.attendees.as_ref().map(|list| guests(list)).filter(|list| !list.is_empty()),
+            zone: draft_zone(draft),
+            reminders: draft.reminders.as_deref().map(reminder_list),
         }
     }
 
@@ -1305,11 +1320,18 @@ impl EventChanges {
         let location = clean(draft.location.as_deref());
         let description = clean(draft.description.as_deref());
         let times = (draft.start, draft.end, draft.all_day);
+        let zone = draft_zone(draft);
+        // Another zone rewrites the times in it, even at the same instants.
+        let rezoned = zone.is_some() && zone != old.zone;
+        let reminders = draft.reminders.as_deref().map(reminder_list).filter(|r| *r != reminder_list(&old.reminders));
+        let times = (times != (old.start, old.end, old.all_day) || rezoned).then_some(times);
         EventChanges {
             summary: (summary != old.summary.trim()).then(|| summary.to_string()),
             location: (location != clean(old.location.as_deref())).then_some(location),
             description: (description != clean(old.description.as_deref())).then_some(description),
-            times: (times != (old.start, old.end, old.all_day)).then_some(times),
+            times,
+            zone: zone.filter(|_| times.is_some()),
+            reminders,
             // Guests invited already keep their answer.
             attendees: draft.attendees.as_ref().map(|list| {
                 guests(list)
@@ -1330,6 +1352,16 @@ impl EventChanges {
                 emails(new) != emails(&old.attendees)
             }),
         }
+    }
+
+    /// Whether the times are written in another zone than `old`'s.
+    pub fn rezoned(&self, old: &crate::model::CalendarEvent) -> bool {
+        self.times.is_some_and(|(_, _, all_day)| !all_day) && self.zone.is_some() && self.zone != old.zone
+    }
+
+    /// The zone the timed bounds are written in, when one was asked for.
+    pub fn zone(&self) -> Option<(String, chrono_tz::Tz)> {
+        self.zone.as_deref().and_then(zone_named)
     }
 
     /// Guests given, their organizer named first (the account), as written to the provider.
@@ -1367,12 +1399,39 @@ fn utc_stamp(t: i64) -> Option<String> {
     chrono::DateTime::from_timestamp(t, 0).map(|d| d.format("%Y%m%dT%H%M%SZ").to_string())
 }
 
-fn time_lines(start: i64, end: i64, all_day: bool) -> Option<[String; 2]> {
+/// Timed bounds in `zone` (with its VTIMEZONE, to put in the object), else in UTC.
+fn time_lines(start: i64, end: i64, all_day: bool, zone: Option<&(String, chrono_tz::Tz)>) -> Option<(Vec<String>, [String; 2])> {
     if all_day {
         let (first, after) = days_of(start, end)?;
-        return Some([format!("DTSTART;VALUE=DATE:{}", first.format("%Y%m%d")), format!("DTEND;VALUE=DATE:{}", after.format("%Y%m%d"))]);
+        return Some((Vec::new(), [format!("DTSTART;VALUE=DATE:{}", first.format("%Y%m%d")), format!("DTEND;VALUE=DATE:{}", after.format("%Y%m%d"))]));
     }
-    Some([format!("DTSTART:{}", utc_stamp(start)?), format!("DTEND:{}", utc_stamp(end.max(start))?)])
+    let Some((name, tz)) = zone else {
+        return Some((Vec::new(), [format!("DTSTART:{}", utc_stamp(start)?), format!("DTEND:{}", utc_stamp(end.max(start))?)]));
+    };
+    let wall = |t: i64| Zone::Named(*tz).wall(t).map(|w| w.format("%Y%m%dT%H%M%S").to_string());
+    let tzid = quote_param(name);
+    Some((vtimezone(name, *tz), [format!("DTSTART;TZID={tzid}:{}", wall(start)?), format!("DTEND;TZID={tzid}:{}", wall(end.max(start))?)]))
+}
+
+/// The on-screen alarms of a list of reminders.
+fn alarm_lines(minutes: &[i64]) -> Vec<String> {
+    minutes
+        .iter()
+        .flat_map(|m| {
+            ["BEGIN:VALARM".to_string(), "ACTION:DISPLAY".into(), "DESCRIPTION:Reminder".into(), format!("TRIGGER:-PT{m}M"), "END:VALARM".into()]
+        })
+        .collect()
+}
+
+/// `zone` (a VTIMEZONE) put before the event at `index`, unless the object has it already.
+fn add_zone(parts: &mut Vec<Part>, index: usize, zone: Vec<String>) {
+    let Some(tzid) = zone.get(1).and_then(|l| l.strip_prefix("TZID:")).map(str::to_string) else { return };
+    let known = parts.iter().any(|p| matches!(p, Part::Line(l) if l.trim().eq_ignore_ascii_case(&format!("TZID:{tzid}"))));
+    if !known {
+        for (i, line) in zone.into_iter().enumerate() {
+            parts.insert(index + i, Part::Line(line));
+        }
+    }
 }
 
 fn text_line(name: &str, v: &str) -> String {
@@ -1383,18 +1442,19 @@ fn serialize(lines: &[String]) -> String {
     lines.iter().map(|l| fold(l)).collect::<Vec<_>>().join("\r\n") + "\r\n"
 }
 
-/// A repeating timed series is written in the computer's zone (with its VTIMEZONE), so that its
-/// dates keep their hour across changes of time; anything else in UTC or as days.
-fn series_lines(start: i64, end: i64, all_day: bool, repeat: &crate::repeat::Repeat) -> Option<(Vec<String>, Vec<String>)> {
+/// A repeating timed series is written in a zone (`zone`, else the computer's; with its
+/// VTIMEZONE), so that its dates keep their hour across changes of time; anything else in UTC or
+/// as days.
+fn series_lines(start: i64, end: i64, all_day: bool, repeat: &crate::repeat::Repeat, zone: Option<&str>) -> Option<(Vec<String>, Vec<String>)> {
     if all_day {
         let (first, _) = days_of(start, end)?;
-        let mut lines = time_lines(start, end, all_day)?.to_vec();
+        let mut lines = time_lines(start, end, all_day, None)?.1.to_vec();
         lines.push(format!("RRULE:{}", repeat.rrule(first, None)));
         return Some((Vec::new(), lines));
     }
-    let Some((name, tz)) = crate::repeat::local_zone() else {
+    let Some((name, tz)) = series_zone(zone) else {
         let first = local_date(start)?;
-        let mut lines = time_lines(start, end, all_day)?.to_vec();
+        let mut lines = time_lines(start, end, all_day, None)?.1.to_vec();
         let utc_end = |d: NaiveDate| resolve(&chrono::Local, d.and_hms_opt(23, 59, 59)?);
         lines.push(format!("RRULE:{}", repeat.rrule(first, Some(&utc_end))));
         return Some((Vec::new(), lines));
@@ -1461,8 +1521,8 @@ pub fn new_event(uid: &str, draft: &crate::model::EventDraft, organizer: Option<
     };
     let (start, end, all_day) = changes.times?;
     let (zone, times) = match &draft.repeat {
-        Some(repeat) => series_lines(start, end, all_day, repeat)?,
-        None => (Vec::new(), time_lines(start, end, all_day)?.to_vec()),
+        Some(repeat) => series_lines(start, end, all_day, repeat, changes.zone.as_deref())?,
+        None => time_lines(start, end, all_day, changes.zone().as_ref()).map(|(zone, times)| (zone, times.to_vec()))?,
     };
     let mut out = vec!["BEGIN:VCALENDAR".to_string(), "VERSION:2.0".into(), "PRODID:-//facteur//EN".into()];
     out.extend(zone);
@@ -1477,6 +1537,7 @@ pub fn new_event(uid: &str, draft: &crate::model::EventDraft, organizer: Option<
     out.extend(changes.location.flatten().map(|l| text_line("LOCATION", &l)));
     out.extend(changes.description.flatten().map(|d| text_line("DESCRIPTION", &d)));
     out.extend(attendee_lines(changes.attendees.as_deref().unwrap_or_default()));
+    out.extend(alarm_lines(changes.reminders.as_deref().unwrap_or_default()));
     out.push("END:VEVENT".into());
     out.push("END:VCALENDAR".into());
     Some(serialize(&out))
@@ -1563,13 +1624,29 @@ fn quote_param(v: &str) -> String {
     if v.contains([':', ';', ',']) { format!("\"{}\"", v.replace('"', "")) } else { v.to_string() }
 }
 
-/// `block` without its own properties named in `drop`, with `add` at its end and the change
-/// marks renewed (DTSTAMP, LAST-MODIFIED, SEQUENCE one higher).
+/// `block` without its own properties named in `drop` (its alarms too, for `VALARM`), with `add`
+/// at its end and the change marks renewed (DTSTAMP, LAST-MODIFIED, SEQUENCE one higher).
 fn rework(block: &[String], drop: &[&str], add: Vec<String>, now: i64) -> Option<Vec<String>> {
     let props = own_props(block);
     let sequence: i64 = props.iter().find(|(_, l)| l.name == "SEQUENCE").and_then(|(_, l)| l.value.trim().parse().ok()).unwrap_or(0);
     let marks = ["DTSTAMP", "LAST-MODIFIED", "SEQUENCE"];
-    let gone: HashSet<usize> = props.iter().filter(|(_, l)| drop.contains(&l.name.as_str()) || marks.contains(&l.name.as_str())).map(|(i, _)| *i).collect();
+    let mut gone: HashSet<usize> = props.iter().filter(|(_, l)| drop.contains(&l.name.as_str()) || marks.contains(&l.name.as_str())).map(|(i, _)| *i).collect();
+    if drop.contains(&"VALARM") {
+        let mut inside = false;
+        for (i, raw) in block.iter().enumerate() {
+            let Some(l) = parse_line(raw) else { continue };
+            let alarm = l.value.trim().eq_ignore_ascii_case("VALARM");
+            if l.name == "BEGIN" && alarm {
+                inside = true;
+            }
+            if inside {
+                gone.insert(i);
+            }
+            if l.name == "END" && alarm {
+                inside = false;
+            }
+        }
+    }
     let mut out: Vec<String> = block.iter().enumerate().filter(|(i, _)| !gone.contains(i)).map(|(_, l)| l.clone()).collect();
     if out.last().is_some_and(|l| l.eq_ignore_ascii_case("END:VEVENT")) {
         out.pop();
@@ -1601,6 +1678,10 @@ fn text_changes(changes: &EventChanges, block: &[String]) -> (Vec<&'static str>,
     if let Some(list) = &changes.attendees {
         drop.extend(["ORGANIZER", "ATTENDEE"]);
         add.extend(merged_attendees(block, list));
+    }
+    if let Some(minutes) = &changes.reminders {
+        drop.push("VALARM");
+        add.extend(alarm_lines(minutes));
     }
     (drop, add)
 }
@@ -1703,12 +1784,54 @@ pub fn edit_event(ics: &str, changes: &EventChanges, now: i64) -> Option<String>
         return None;
     }
     let (mut drop, mut add) = text_changes(changes, block);
+    let mut zone = Vec::new();
     if let Some((start, end, all_day)) = changes.times {
         drop.extend(TIMES);
-        add.extend(time_lines(start, end, all_day)?);
+        let (vtimezone, times) = time_lines(start, end, all_day, changes.zone().as_ref())?;
+        zone = vtimezone;
+        add.extend(times);
     }
     *block = rework(block, &drop, add, now)?;
+    let index = parts.iter().position(|p| matches!(p, Part::Event(_)))?;
+    add_zone(&mut parts, index, zone);
     Some(join(&parts))
+}
+
+/// The IANA name of the zone an event was set in, named by IANA, a vendor's prefix or Windows
+/// (Outlook). UTC is no zone of the event's own (how facteur wrote single events).
+pub(crate) fn event_zone(tzid: &str) -> Option<String> {
+    named_zone(tzid).map(|tz| tz.name().to_string()).filter(|z| !matches!(z.as_str(), "UTC" | "Etc/UTC" | "Etc/GMT" | "GMT"))
+}
+
+/// An IANA zone asked for by name; `None`: unknown.
+pub fn zone_named(name: &str) -> Option<(String, chrono_tz::Tz)> {
+    let tz: chrono_tz::Tz = name.trim().parse().ok()?;
+    Some((tz.name().to_string(), tz))
+}
+
+/// The zone a timed series is written in: the one asked for, else the computer's.
+pub fn series_zone(asked: Option<&str>) -> Option<(String, chrono_tz::Tz)> {
+    asked.and_then(zone_named).or_else(crate::repeat::local_zone)
+}
+
+/// The first day of an event: its date in `zone` (or the computer's) when timed.
+pub fn first_day(start: i64, end: i64, all_day: bool, zone: Option<&str>) -> Option<NaiveDate> {
+    if all_day {
+        return days_of(start, end).map(|d| d.0);
+    }
+    match zone.and_then(zone_named) {
+        Some((_, tz)) => Zone::Named(tz).wall(start).map(|w| w.date()),
+        None => local_date(start),
+    }
+}
+
+/// Reminders as written: minutes before the start, up to four weeks, each once, in order.
+fn reminder_list(list: &[i64]) -> Vec<i64> {
+    let mut out: Vec<i64> = list.iter().copied().filter(|m| (0..=28 * 24 * 60).contains(m)).collect();
+    out.sort_unstable();
+    out.dedup();
+    out.truncate(5);
+    out
 }
 
 /// The wall time of an instant in a zone named by IANA or Windows (Outlook); `None`: unknown.
@@ -1897,16 +2020,26 @@ pub fn edit_series(ics: &str, changes: &EventChanges, current: (i64, i64, bool),
 /// length (the computer's zone); for whole days, as many days long. Returns start, end (as
 /// [`EventChanges`] times) and the first day.
 pub fn series_first(master_first: NaiveDate, occurrence_start: i64, draft: &crate::model::EventDraft) -> Option<(i64, i64, NaiveDate)> {
-    let shift = (local_date(draft.start)? - local_date(occurrence_start)?).num_days();
-    let first = master_first.checked_add_signed(chrono::Duration::try_days(shift)?)?;
+    let zone = draft_zone(draft).and_then(|z| zone_named(&z)).map(|(_, tz)| tz);
+    let wall = |t: i64| match zone {
+        Some(tz) => Zone::Named(tz).wall(t),
+        None => chrono::DateTime::from_timestamp(t, 0).map(|d| d.with_timezone(&chrono::Local).naive_local()),
+    };
     if draft.all_day {
+        let shift = (local_date(draft.start)? - local_date(occurrence_start)?).num_days();
+        let first = master_first.checked_add_signed(chrono::Duration::try_days(shift)?)?;
         let days = (((draft.end - draft.start) as f64 / 86400.0).round() as i64).max(1);
         let start = local_midnight(first)?;
         let end = local_midnight(first.checked_add_signed(chrono::Duration::try_days(days)?)?)?;
         return Some((start, end, first));
     }
-    let time = chrono::DateTime::from_timestamp(draft.start, 0)?.with_timezone(&chrono::Local).time();
-    let start = resolve(&chrono::Local, first.and_time(time))?;
+    let shift = (wall(draft.start)?.date() - wall(occurrence_start)?.date()).num_days();
+    let first = master_first.checked_add_signed(chrono::Duration::try_days(shift)?)?;
+    let at = first.and_time(wall(draft.start)?.time());
+    let start = match zone {
+        Some(tz) => resolve(&tz, at)?,
+        None => resolve(&chrono::Local, at)?,
+    };
     Some((start, start + (draft.end - draft.start).max(0), first))
 }
 
@@ -1934,8 +2067,8 @@ pub fn rebuild_series(ics: &str, changes: &EventChanges, first: (i64, i64, bool)
     parts.retain(|p| !matches!(p, Part::Event(b) if is_override(b)));
     let (start, end, all_day) = first;
     let (zone, times) = match repeat {
-        Some(repeat) => series_lines(start, end, all_day, repeat)?,
-        None => (Vec::new(), time_lines(start, end, all_day)?.to_vec()),
+        Some(repeat) => series_lines(start, end, all_day, repeat, changes.zone.as_deref())?,
+        None => time_lines(start, end, all_day, changes.zone().as_ref()).map(|(zone, times)| (zone, times.to_vec()))?,
     };
     let index = parts.iter().position(|p| matches!(p, Part::Event(_)))?;
     let Part::Event(master) = &parts[index] else { return None };
@@ -1944,15 +2077,7 @@ pub fn rebuild_series(ics: &str, changes: &EventChanges, first: (i64, i64, bool)
     add.extend(times);
     let master = rework(master, &drop, add, now)?;
     parts[index] = Part::Event(master);
-    // The zone written, unless the object has it already.
-    if let Some(tzid) = zone.get(1).and_then(|l| l.strip_prefix("TZID:")) {
-        let known = parts.iter().any(|p| matches!(p, Part::Line(l) if l.trim().eq_ignore_ascii_case(&format!("TZID:{tzid}"))));
-        if !known {
-            for (i, line) in zone.into_iter().enumerate() {
-                parts.insert(index + i, Part::Line(line));
-            }
-        }
-    }
+    add_zone(&mut parts, index, zone);
     Some(join(&parts))
 }
 
@@ -1991,9 +2116,12 @@ pub fn edit_occurrence(ics: &str, original: i64, current: (i64, i64, bool), chan
     let (mut drop, mut add) = text_changes(changes, block);
     let (start, end, all_day) = changes.times.unwrap_or(current);
     drop.extend(TIMES);
-    add.extend(time_lines(start, end, all_day)?);
+    let (zone, times) = time_lines(start, end, all_day, changes.zone().as_ref())?;
+    add.extend(times);
     let reworked = rework(block, &drop, add, now)?;
     parts[index] = Part::Event(reworked);
+    let first = parts.iter().position(|p| matches!(p, Part::Event(_)))?;
+    add_zone(&mut parts, first, zone);
     Some(join(&parts))
 }
 
@@ -2038,7 +2166,7 @@ pub fn respond_event(ics: &str, me: &[String], partstat: &str, original: Option<
             let series = Series::read(&parts);
             let (index, new) = occurrence_block(&mut parts, &series, original)?;
             if new && let Part::Event(b) = &parts[index] {
-                let block = rework(b, &[], time_lines(current.0, current.1, current.2)?.to_vec(), now)?;
+                let block = rework(b, &[], time_lines(current.0, current.1, current.2, None)?.1.to_vec(), now)?;
                 parts[index] = Part::Event(block);
             }
             Some(index)
@@ -2146,7 +2274,7 @@ BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-P0DT0H10M0S\r\nEND:VALARM\r\nEND:VEVE
             end: 1_792_501_200,
             all_day: false,
             repeat: None,
-            attendees: None,
+            attendees: None, zone: None, reminders: None,
         };
         let ics = new_event("u1@facteur", &draft, None, 1_792_400_000).unwrap();
         assert!(ics.contains("UID:u1@facteur\r\n") && ics.contains("DTSTART:20261020T120000Z\r\n") && ics.contains("DTEND:20261020T130000Z\r\n"));
@@ -2163,6 +2291,44 @@ BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-P0DT0H10M0S\r\nEND:VALARM\r\nEND:VEVE
         // A whole day ending where it starts still lasts a day.
         let one = crate::model::EventDraft { end: local(24), ..day };
         assert!(new_event("u3@facteur", &one, None, 0).unwrap().contains("DTEND;VALUE=DATE:20261225\r\n"));
+    }
+
+    #[test]
+    fn writes_an_event_in_its_zone_with_its_reminders() {
+        // 2026-10-20 12:00 UTC: 21:00 in Tokyo.
+        let draft = crate::model::EventDraft {
+            summary: "Appel".into(), start: 1_792_497_600, end: 1_792_501_200,
+            zone: Some("Asia/Tokyo".into()), reminders: Some(vec![60, 10, 10, -5]),
+            ..Default::default()
+        };
+        let ics = new_event("z1@facteur", &draft, None, 1_792_400_000).unwrap();
+        assert!(ics.contains("DTSTART;TZID=Asia/Tokyo:20261020T210000\r\n") && ics.contains("DTEND;TZID=Asia/Tokyo:20261020T220000\r\n"), "{ics}");
+        assert!(ics.find("BEGIN:VTIMEZONE\r\nTZID:Asia/Tokyo").unwrap() < ics.find("BEGIN:VEVENT").unwrap());
+        assert_eq!(ics.matches("BEGIN:VALARM").count(), 2);
+        let back = &instances(&ics, 1_792_000_000, 1_793_000_000, &[])[0];
+        assert_eq!((back.start, back.end, back.zone.as_deref(), back.reminders.clone()), (1_792_497_600, 1_792_501_200, Some("Asia/Tokyo"), vec![10, 60]));
+
+        // The reminders changed: the old alarms go, the zone stays as written.
+        let old = crate::model::CalendarEvent { start: back.start, end: back.end, zone: back.zone.clone(), reminders: back.reminders.clone(), summary: "Appel".into(), ..Default::default() };
+        let same = crate::model::EventDraft { reminders: Some(vec![60, 10]), ..draft.clone() };
+        assert!(EventChanges::between(&old, &same).is_empty(), "nothing changed");
+        let changes = EventChanges::between(&old, &crate::model::EventDraft { reminders: Some(vec![30]), ..draft.clone() });
+        assert_eq!((changes.times, changes.reminders.clone()), (None, Some(vec![30])));
+        let out = edit_event(&ics, &changes, 1_792_400_100).unwrap();
+        assert_eq!(out.matches("BEGIN:VALARM").count(), 1);
+        assert!(out.contains("TRIGGER:-PT30M\r\n") && out.contains("DTSTART;TZID=Asia/Tokyo:20261020T210000\r\n"));
+
+        // Another zone at the same instants: the times are written again, in it.
+        let moved = EventChanges::between(&old, &crate::model::EventDraft { zone: Some("Europe/Paris".into()), ..draft.clone() });
+        assert!(moved.rezoned(&old) && moved.times.is_some());
+        let out = edit_event(&ics, &moved, 1_792_400_200).unwrap();
+        assert!(out.contains("DTSTART;TZID=Europe/Paris:20261020T140000\r\n") && out.contains("TZID:Europe/Paris\r\n"));
+        // No zone asked for: as before, in UTC; a whole day has none.
+        let utc = new_event("z2@facteur", &crate::model::EventDraft { zone: None, ..draft.clone() }, None, 0).unwrap();
+        assert!(utc.contains("DTSTART:20261020T120000Z\r\n") && !utc.contains("VTIMEZONE"));
+        assert_eq!(EventChanges::all(&crate::model::EventDraft { all_day: true, ..draft.clone() }).zone, None);
+        assert_eq!(event_zone("Romance Standard Time").as_deref(), Some("Europe/Paris"));
+        assert_eq!(event_zone("UTC"), None);
     }
 
     #[test]
@@ -2317,10 +2483,10 @@ DTEND;TZID=Europe/Paris:20261019T170000\r\nSUMMARY:Point (décalé)\r\nLOCATION:
             id: 1, calendar_id: 1, account_id: 1, uid: "u".into(), instance: String::new(), summary: "Point".into(),
             location: Some("Salle".into()), description: Some("Long text cut by the provider".into()), start: 100, end: 200,
             all_day: false, status: None, organizer: None, url: None, busy: true, recurring: false, editable: true, response: None, respondable: false,
-            attendees: Vec::new(), meeting: None, reminders: Vec::new(),
+            attendees: Vec::new(), meeting: None, reminders: Vec::new(), zone: None,
         };
         let same = crate::model::EventDraft {
-            summary: "Point ".into(), location: Some("Salle".into()), description: Some("Long text cut by the provider".into()), start: 100, end: 200, all_day: false, repeat: None, attendees: None,
+            summary: "Point ".into(), location: Some("Salle".into()), description: Some("Long text cut by the provider".into()), start: 100, end: 200, all_day: false, repeat: None, attendees: None, zone: None, reminders: None,
         };
         assert!(EventChanges::between(&old, &same).is_empty());
         let draft = crate::model::EventDraft { location: Some("  ".into()), end: 300, ..same };
@@ -2378,7 +2544,7 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
         let old = crate::model::CalendarEvent {
             id: 1, calendar_id: 1, account_id: 1, uid: old.uid.clone(), instance: String::new(), summary: old.summary.clone(), location: None, description: None,
             start: old.start, end: old.end, all_day: false, status: None, organizer: None, url: None, busy: true, recurring: false, editable: true,
-            response: None, respondable: false, attendees: old.attendees.clone(), meeting: None, reminders: Vec::new(),
+            response: None, respondable: false, attendees: old.attendees.clone(), meeting: None, reminders: Vec::new(), zone: None,
         };
         let more = crate::model::EventDraft { attendees: Some(vec![guest("marie@example.org"), guest("paul@example.org")]), ..draft.clone() };
         let changes = EventChanges::between(&old, &more).organized_by(me.clone());

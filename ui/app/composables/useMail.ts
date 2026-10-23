@@ -107,6 +107,7 @@ export const api = {
   aiSummarize: (accountId: number, threadId: number) => invoke<string>('ai_summarize', { accountId, threadId }),
   aiFindEvent: (id: number) => invoke<FoundEvent | null>('ai_find_event', { id }),
   dictationOff: () => invoke<void>('dictation_off'),
+  aiGraphics: (on: boolean) => invoke<void>('ai_graphics', { on }),
   /** `pcm`: 16 kHz mono, 16-bit little-endian. */
   aiTranscribe: (pcm: Uint8Array, language: string) => invoke<string>('ai_transcribe', pcm, { headers: { language } }),
   /** `true` turns the mode on, `false` never offers it again, `null`: later. */

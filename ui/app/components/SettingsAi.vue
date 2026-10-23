@@ -96,6 +96,19 @@ async function dictationOff() {
   }
 }
 
+/** The graphics card, or the processor only (a slow integrated card, an unstable driver). */
+const graphicsOn = computed({
+  get: () => status.value?.graphics ?? true,
+  set: async (v: boolean) => {
+    try {
+      await api.aiGraphics(v)
+      await refresh()
+    } catch (e) {
+      showError(e)
+    }
+  }
+})
+
 async function turnOff() {
   if (!on.value) {
     choosing.value = false
@@ -205,6 +218,19 @@ async function turnOff() {
         </div>
         <UProgress :model-value="percent" size="sm" />
       </div>
+    </div>
+
+    <div v-if="status?.available && (on || status.dictation)" class="flex items-center gap-4 border-t border-default pt-4">
+      <div class="flex min-w-0 flex-1 flex-col gap-0.5">
+        <span class="flex items-center gap-2 text-sm font-semibold text-highlighted">
+          <UIcon name="i-lucide-cpu" class="size-4 text-muted" />
+          {{ t('settings.ai.graphics.title') }}
+        </span>
+        <span class="text-[13px] text-muted">
+          {{ graphicsOn && status.card ? t('settings.ai.graphics.using', { card: status.card }) : t(graphicsOn ? 'settings.ai.graphics.help' : 'settings.ai.graphics.off') }}
+        </span>
+      </div>
+      <USwitch v-model="graphicsOn" size="lg" :aria-label="t('settings.ai.graphics.title')" />
     </div>
   </div>
 </template>

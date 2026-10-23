@@ -2,7 +2,8 @@
 # Builds target/flatpak/facteur-X.Y.Z.flatpak locally (no CI), offline as Flathub does. Install it
 # with `flatpak install --user facteur-X.Y.Z.flatpak`.
 # Needs once: flatpak install --user flathub org.gnome.Sdk//51 \
-#   org.freedesktop.Sdk.Extension.rust-stable//26.08 org.freedesktop.Sdk.Extension.node24//26.08
+#   org.freedesktop.Sdk.Extension.rust-stable//26.08 org.freedesktop.Sdk.Extension.node24//26.08 \
+#   org.freedesktop.Sdk.Extension.llvm22//26.08
 set -euo pipefail
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"

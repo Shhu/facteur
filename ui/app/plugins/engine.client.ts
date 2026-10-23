@@ -33,12 +33,25 @@ export default defineNuxtPlugin(async () => {
   const touched = new Set<number>()
   let flushTimer: ReturnType<typeof setTimeout> | undefined
   let lastFlush = 0
+  // Folder counts aggregate whole folders: during a sync they are read at most every 1.5 s, the
+  // open list and thread keep the faster pace.
+  const COUNTS_GAP = 1500
+  let lastCounts = 0
+  let countsTimer: ReturnType<typeof setTimeout> | undefined
+  const countsFor = new Set<number>()
+  function loadCounts() {
+    countsTimer = undefined
+    lastCounts = Date.now()
+    const ids = [...countsFor]
+    countsFor.clear()
+    if (ids.length) loadMailboxes(ids)
+  }
   function flush() {
     flushTimer = undefined
     lastFlush = Date.now()
-    const ids = [...touched]
+    for (const id of touched) countsFor.add(id)
     touched.clear()
-    if (ids.length) loadMailboxes(ids)
+    if (countsFor.size && !countsTimer) countsTimer = setTimeout(loadCounts, Math.max(0, lastCounts + COUNTS_GAP - Date.now()))
     tick.value++
   }
   function changed(accountId: number) {

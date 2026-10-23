@@ -124,6 +124,9 @@ pub struct AiStatus {
     pub dictation: bool,
     pub dictation_ready: bool,
     pub dictation_model: crate::ai::Model,
+    /// The graphics card may be used, and the one the model last ran on.
+    pub graphics: bool,
+    pub card: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -212,6 +215,41 @@ impl Pooled {
 type Slot = Arc<AsyncMutex<Option<Pooled>>>;
 type Conn = OwnedMutexGuard<Option<Pooled>>;
 
+/// A session for a long job: its own, or the account's one connection, given back afterwards.
+enum Dedicated {
+    Own(Session),
+    Shared(Conn),
+}
+
+impl Dedicated {
+    /// Its own is closed; the shared one goes back to the pool.
+    async fn finish(self) {
+        if let Dedicated::Own(mut session) = self {
+            logout(&mut session).await;
+        }
+    }
+}
+
+impl std::ops::Deref for Dedicated {
+    type Target = Session;
+
+    fn deref(&self) -> &Session {
+        match self {
+            Dedicated::Own(session) => session,
+            Dedicated::Shared(conn) => &conn.as_ref().expect("session open").session,
+        }
+    }
+}
+
+impl std::ops::DerefMut for Dedicated {
+    fn deref_mut(&mut self) -> &mut Session {
+        match self {
+            Dedicated::Own(session) => session,
+            Dedicated::Shared(conn) => &mut conn.as_mut().expect("session open").session,
+        }
+    }
+}
+
 /// Counted among those waiting for the account's one connection while it lives.
 struct Waiting(Arc<std::sync::atomic::AtomicUsize>);
 
@@ -249,6 +287,8 @@ const BURST_MAX: Duration = Duration::from_secs(10);
 /// Settings: the local AI's model (an offered one's id, or `file`), and the user's own file.
 const AI_MODEL: &str = "ai_model";
 const AI_FILE: &str = "ai_file";
+/// `off`: the local AI on the processor only.
+const AI_GRAPHICS: &str = "ai_graphics";
 /// Dictation, apart from the rest: its model downloaded (`whisper-turbo`), or none.
 const DICTATION_MODEL: &str = "dictation_model";
 
@@ -289,6 +329,11 @@ pub struct Engine {
     unsaved_secrets: Mutex<HashSet<i64>>,
     /// Wakes the periodic sync and the listening connections' pauses (see [`Engine::resume`]).
     resume: tokio::sync::Notify,
+    /// The attachment decoded last (message, index), for a minute (see `attachment`).
+    #[allow(clippy::type_complexity)]
+    last_attachment: Mutex<Option<((i64, usize), Instant, Arc<(String, String, Vec<u8>)>)>>,
+    /// Sends running per account (see `deliver_outgoing`).
+    sending: Mutex<HashMap<i64, Arc<tokio::sync::Semaphore>>>,
     last_resume: Mutex<Option<Instant>>,
     /// Connections the servers dropped lately (see [`chronic_cuts`]).
     cuts: Mutex<VecDeque<Cut>>,
@@ -536,7 +581,7 @@ fn organizer_of(account: &Account) -> EventAttendee {
 
 /// A draft's start, end, whole day and first day, for the series it starts.
 fn draft_first(d: &EventDraft) -> Result<(i64, i64, bool, chrono::NaiveDate)> {
-    let day = if d.all_day { crate::calendar::days_of(d.start, d.end).map(|days| days.0) } else { crate::calendar::local_date(d.start) };
+    let day = crate::calendar::first_day(d.start, d.end, d.all_day, d.zone.as_deref());
     day.map(|day| (d.start, d.end, d.all_day, day)).ok_or_else(|| Error::Other(crate::tr!("date de l'événement hors calendrier", "the event's date is out of range")))
 }
 
@@ -550,9 +595,11 @@ fn series_repeat(rule: Option<crate::repeat::Repeat>) -> SeriesRepeat {
 /// its rule; `Some(repeat)` rebuilds it from a new first date, repeating as `repeat`. A rule
 /// facteur cannot write back keeps the series' days.
 fn series_plan(e: &CalendarEvent, draft: &EventDraft, changes: &crate::calendar::EventChanges, now: &SeriesRepeat, first: chrono::NaiveDate) -> Result<Option<Option<crate::repeat::Repeat>>> {
-    let moved = changes.times.is_some_and(|(start, _, all_day)| {
-        all_day != e.all_day || crate::calendar::local_date(start) != crate::calendar::local_date(e.start)
-    });
+    // Another zone: the series is written again in it.
+    let moved = changes.rezoned(e)
+        || changes.times.is_some_and(|(start, _, all_day)| {
+            all_day != e.all_day || crate::calendar::local_date(start) != crate::calendar::local_date(e.start)
+        });
     // Compared as written: weekly on no day named is weekly on the first day's.
     let written = |r: &Option<crate::repeat::Repeat>| r.as_ref().map(|r| r.rrule(first, None));
     let ruled = if now.custom { draft.repeat.is_some() } else { written(&draft.repeat) != written(&now.repeat) };
@@ -716,6 +763,7 @@ impl Engine {
         if let Ok(Some(language)) = store.setting("language") {
             crate::i18n::set(&language);
         }
+        crate::ai::set_graphics(store.setting(AI_GRAPHICS).ok().flatten().as_deref() != Some("off"));
         Ok(Arc::new(Engine {
             store,
             secrets: Secrets::new(),
@@ -730,6 +778,8 @@ impl Engine {
             auth_refused: Mutex::default(),
             unsaved_secrets: Mutex::default(),
             resume: tokio::sync::Notify::new(),
+            sending: Mutex::default(),
+            last_attachment: Mutex::default(),
             last_resume: Mutex::default(),
             cuts: Mutex::default(),
             advised: Mutex::default(),
@@ -827,7 +877,13 @@ impl Engine {
                 if let Some(new_refresh) = fresh.refresh_token.as_deref().filter(|t| *t != refresh_token) {
                     // The old one may already be void: the new one is kept in memory whatever happens, and
                     // written again later if the keychain refuses it now.
-                    if let Err(e) = self.store_secret(account.id, new_refresh).await {
+                    // Bounded: this lock holds every connection of the account, and a keychain can
+                    // block for long. Too slow, it is written later like a refused write.
+                    let saved = match tokio::time::timeout(Duration::from_secs(5), self.store_secret(account.id, new_refresh)).await {
+                        Ok(res) => res,
+                        Err(_) => Err(Error::Secret(crate::tr!("trousseau trop lent", "keychain too slow"))),
+                    };
+                    if let Err(e) = saved {
                         tracing::error!("account {}: new refresh token not saved to the keychain (retried later): {e}", account.id);
                         self.secret_cache.lock().unwrap().insert(account.id, new_refresh.to_string());
                         self.unsaved_secrets.lock().unwrap().insert(account.id);
@@ -972,6 +1028,18 @@ impl Engine {
             *last = Some(Instant::now());
         }
         tracing::info!("resumed (wake from sleep or back online): syncing now");
+        // Kept connections may belong to the network before (and on Linux, Instant does not
+        // count the sleep): each is checked with a NOOP before its next use. One in use is left
+        // alone, and none is closed here (one connection for everything must stay one).
+        let slots: Vec<Slot> = self.slots.lock().unwrap().values().cloned().collect();
+        for slot in slots {
+            if let Ok(mut guard) = slot.try_lock_owned()
+                && let Some(conn) = guard.as_mut()
+                && let Some(old) = Instant::now().checked_sub(POOL_CHECK_AFTER * 2)
+            {
+                conn.used = old;
+            }
+        }
         self.resume.notify_waiters();
         self.scheduler.notify_one();
     }
@@ -1634,7 +1702,7 @@ impl Engine {
                     self.emit(Event::Changed { account_id });
                 }
             }
-            logout(&mut session).await;
+            session.finish().await;
             self.after_inbox_arrivals(account_id, &fresh_inbox);
             Ok(added)
         }
@@ -2067,8 +2135,20 @@ impl Engine {
 
     /// (file name, MIME type, content)
     pub async fn attachment(&self, id: i64, index: usize) -> Result<(String, String, Vec<u8>)> {
+        // Checked, then shown or saved: the same attachment asked again at once is not decoded
+        // from the whole message a second time.
+        if let Some((key, at, kept)) = self.last_attachment.lock().unwrap().as_ref()
+            && *key == (id, index)
+            && at.elapsed() < Duration::from_secs(60)
+        {
+            return Ok((kept.0.clone(), kept.1.clone(), kept.2.clone()));
+        }
         let raw = self.raw(id).await?;
-        blocking(move || mime::attachment(&raw, index)).await
+        let found = blocking(move || mime::attachment(&raw, index)).await?;
+        if found.2.len() <= 32 << 20 {
+            *self.last_attachment.lock().unwrap() = Some(((id, index), Instant::now(), Arc::new(found.clone())));
+        }
+        Ok(found)
     }
 
     pub async fn inspect_attachment(&self, id: i64, index: usize) -> Result<crate::attachments::AttachmentReport> {
@@ -2691,14 +2771,19 @@ impl Engine {
                 None => None,
             }
         };
+        let parts = self.trust_parts(message_id, None).ok();
+        // Asking the sender's domain tells it the mailbox is read: not for an untrusted message, in
+        // junk or from a blocked sender (as for logos).
+        let may_ask = parts.as_ref().is_some_and(|(signals, context)| {
+            !crate::trust::evaluate(signals, context).is_low() && !context.blocked && !context.in_junk
+        });
         let records = async {
             match &sender_host {
-                Some(host) => Some(self.sender_records(host).await),
-                None => None,
+                Some(host) if may_ask => Some(self.sender_records(host).await),
+                _ => None,
             }
         };
         let (registered, announced_registered, records) = tokio::join!(link_age, announced_age, records);
-        let parts = self.trust_parts(message_id, None).ok();
         let sender_auth = match (&sender_host, records, &parts) {
             (Some(host), Some((dmarc, spf)), Some((signals, _))) => Some(crate::links::SenderAuth {
                 domain: idna::domain_to_unicode(host).0,
@@ -3836,7 +3921,14 @@ impl Engine {
             e => e,
         })?;
         let credential = self.credential(&account).await?;
-        match smtp::send(&account, &credential, &message).await {
+        let mut sent = smtp::send(&account, &credential, &message).await;
+        // An access token refused although not expired (as for IMAP, `login`): a fresh one, once.
+        if let (Err(Error::Auth(_)), Credential::Token(used)) = (&sent, &credential) {
+            self.forget_token(account.id, Some(used.as_str()));
+            let credential = self.credential(&account).await?;
+            sent = smtp::send(&account, &credential, &message).await;
+        }
+        match sent {
             Ok(()) => {}
             // Maybe gone: the copy goes to Sent all the same, as the record of a message that may have
             // left (proving nothing, see `smtp::maybe_sent_advice`). Sending again reuses this Message-ID,
@@ -4324,7 +4416,31 @@ impl Engine {
 
     /// Sends what is due, wakes snoozed threads, reports unanswered messages; sleeps until the next
     /// due time (a minute at most).
+    /// A database with much free space is compacted a while after the start, off the window's
+    /// way. A failure (a full disk: VACUUM needs about twice the base's size) is not tried again
+    /// for a week.
+    fn compact_later(self: &Arc<Self>) {
+        const FAILED_AT: &str = "compaction_failed_at";
+        let this = self.clone();
+        self.spawn(async move {
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            let failed_at: Option<i64> = this.store.setting(FAILED_AT).ok().flatten().and_then(|t| t.parse().ok());
+            if failed_at.is_some_and(|t| crate::store::now() - t < 7 * 86400) {
+                return;
+            }
+            match crate::rt::offload(|| this.store.compact_if_wasteful()) {
+                Ok(Some(freed)) => tracing::info!("database compacted: {} MiB given back", freed / (1024 * 1024)),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!("database compaction: {e}");
+                    let _ = this.store.set_setting(FAILED_AT, &crate::store::now().to_string());
+                }
+            }
+        });
+    }
+
     fn start_scheduler(self: &Arc<Self>) {
+        self.compact_later();
         match self.store.interrupted_outgoing() {
             Ok(0) => {}
             Ok(n) => {
@@ -4419,6 +4535,10 @@ impl Engine {
     async fn deliver_outgoing(self: Arc<Self>, id: i64, draft: Draft, remind: Option<i64>) {
         self.emit(Event::OutboxChanged);
         let (account_id, subject) = (draft.account_id, draft.subject.clone());
+        // Two at a time per account: a batch of scheduled messages falling due together must not
+        // open as many connections (servers limit them, and a 4xx would spend an attempt).
+        let lane = self.sending.lock().unwrap().entry(account_id).or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(2))).clone();
+        let _lane = lane.acquire_owned().await;
         let res = std::panic::AssertUnwindSafe(self.deliver(draft, remind)).catch_unwind().await.unwrap_or_else(|_| {
             // Not known how far it went: treated like a cut in the middle of the transfer.
             Err(Error::Uncertain(crate::tr!("erreur interne pendant l'envoi", "internal error while sending")))
@@ -4732,9 +4852,14 @@ impl Engine {
         res.map(|()| report)
     }
 
-    /// So that a long backup blocks neither the sync nor reading.
-    async fn dedicated_session(&self, account: &Account) -> Result<Session> {
-        self.login(account).await
+    /// So that a long backup blocks neither the sync nor reading. With one connection for
+    /// everything, the account's own is taken instead (queued behind the sync): a second one
+    /// would bring back the cut sessions that mode is there to avoid.
+    async fn dedicated_session(&self, account: &Account) -> Result<Dedicated> {
+        if self.single_connection(account.id) {
+            return Ok(Dedicated::Shared(self.session(account.id, Purpose::Background).await?));
+        }
+        Ok(Dedicated::Own(self.login(account).await?))
     }
 
     /// The interface may have been reloaded during the operation: the engine is the reference.
@@ -4760,7 +4885,7 @@ impl Engine {
                     self.emit(Event::BackupProgress { account_id, mailbox: p.mailbox, done: p.done, total: p.total });
                 })
                 .await;
-                logout(&mut session).await;
+                session.finish().await;
                 stats
             })
             .await;
@@ -4861,7 +4986,7 @@ impl Engine {
                     self.emit(Event::RestoreProgress { account_id, mailbox: p.mailbox, done: p.done, total: p.total });
                 })
                 .await;
-                logout(&mut session).await;
+                session.finish().await;
                 stats
             })
             .await?;
@@ -5901,6 +6026,10 @@ impl Engine {
         self.spawn(async move {
             tokio::time::sleep(CALENDAR_FIRST).await;
             loop {
+                // Listening before the work: a wake-up during a long sync is not lost.
+                let woken = calendars.resume.notified();
+                tokio::pin!(woken);
+                woken.as_mut().enable();
                 let _ = calendars.sync_calendars_with(None, true).await;
                 // On its own task: a slow address book must not hold the calendars back, nor miss a
                 // wake-up signal.
@@ -5914,7 +6043,7 @@ impl Engine {
                 // round later (a few seconds first, for the network to come up).
                 tokio::select! {
                     _ = tokio::time::sleep(CALENDAR_EVERY) => {}
-                    _ = calendars.resume.notified() => tokio::time::sleep(CALENDAR_AFTER_RESUME).await,
+                    _ = woken => tokio::time::sleep(CALENDAR_AFTER_RESUME).await,
                 }
             }
         });
@@ -5924,6 +6053,10 @@ impl Engine {
             let mut last: HashMap<i64, [Option<Instant>; 3]> = HashMap::new();
             let mut housekeeping: Option<Instant> = None;
             loop {
+                // Listening before the syncs: a wake-up while they run is not lost.
+                let woken = this.resume.notified();
+                tokio::pin!(woken);
+                woken.as_mut().enable();
                 let chores = housekeeping.is_none_or(|t| t.elapsed() >= interval);
                 if chores {
                     // In the background: the network must not delay the sync.
@@ -5984,7 +6117,7 @@ impl Engine {
                 // Back from sleep or online again (see `resume`): everything is synced now.
                 tokio::select! {
                     _ = tokio::time::sleep(SYNC_TICK) => {}
-                    _ = this.resume.notified() => last.clear(),
+                    _ = woken => last.clear(),
                 }
             }
         });
@@ -6131,7 +6264,21 @@ impl Engine {
             dictation: self.setting(DICTATION_MODEL).ok().flatten().is_some(),
             dictation_ready: self.dictation_path().is_ok(),
             dictation_model: crate::ai::DICTATION,
+            graphics: self.setting(AI_GRAPHICS).ok().flatten().as_deref() != Some("off"),
+            card: crate::ai::graphics_card(),
         }
+    }
+
+    /// The graphics card for the local AI, or the processor only (`false`).
+    pub fn set_ai_graphics(&self, on: bool) -> Result<()> {
+        if on {
+            self.store.delete_setting(AI_GRAPHICS)?;
+        } else {
+            self.store.set_setting(AI_GRAPHICS, "off")?;
+        }
+        crate::ai::set_graphics(on);
+        self.emit(Event::AiChanged);
+        Ok(())
     }
 
     fn dictation_path(&self) -> Result<PathBuf> {
@@ -6760,7 +6907,7 @@ mod tests {
         let e = CalendarEvent {
             id: 1, calendar_id: 1, account_id: 1, uid: "s".into(), instance: "1".into(), summary: String::new(), location: None, description: None,
             start: at(19, 18), end: at(19, 19), all_day: false, status: None, organizer: None, url: None, busy: true, recurring: true,
-            editable: true, response: None, respondable: false, attendees: Vec::new(), meeting: None, reminders: Vec::new(),
+            editable: true, response: None, respondable: false, attendees: Vec::new(), meeting: None, reminders: Vec::new(), zone: None,
         };
         let first = chrono::NaiveDate::from_ymd_opt(2026, 10, 5).unwrap();
         let monday = Repeat { freq: Freq::Weekly, interval: 1, weekdays: vec![0], by_weekday: false, until: None, count: None };

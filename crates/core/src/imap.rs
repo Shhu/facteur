@@ -363,7 +363,9 @@ pub async fn uid_search_checked(session: &mut Session, query: &str, exists: u32)
 /// async-imap does not expose `X-GM-THRID`, so the FETCH is sent raw and read here up to its
 /// tagged end. Other untagged answers (EXISTS) are dropped: the sync reads the folder state
 /// itself.
-pub async fn gmail_threads(session: &mut Session, set: &str) -> Result<Vec<(u32, u64)>> {
+/// `false` with the list: Gmail refused some of the messages ("Some messages could not be
+/// FETCHed"), the others are given.
+pub async fn gmail_threads(session: &mut Session, set: &str) -> Result<(Vec<(u32, u64)>, bool)> {
     use async_imap::imap_proto::{AttributeValue, Response, Status};
     let tag = session.run_command(format!("UID FETCH {set} (UID X-GM-THRID)")).await?;
     let mut out = Vec::new();
@@ -380,10 +382,11 @@ pub async fn gmail_threads(session: &mut Session, set: &str) -> Result<Vec<(u32,
                 }
             }
             Response::Done { tag: done, status, outcome } if *done == tag => {
-                if *status != Status::Ok {
-                    return Err(Error::Imap(async_imap::error::Error::No(outcome.information.as_deref().unwrap_or("X-GM-THRID").to_string())));
-                }
-                return Ok(out);
+                return match status {
+                    Status::Ok => Ok((out, true)),
+                    Status::No => Ok((out, false)),
+                    _ => Err(Error::Imap(async_imap::error::Error::Bad(outcome.information.as_deref().unwrap_or("X-GM-THRID").to_string()))),
+                };
             }
             _ => {}
         }
@@ -686,10 +689,14 @@ pub(crate) mod tests {
     async fn gmail_threads_are_read_from_the_raw_answers() {
         let answers = "* 1 FETCH (X-GM-THRID 1278455344230334865 UID 10)\r\n* 4 EXISTS\r\n* 2 FETCH (UID 11 X-GM-THRID 7)\r\n{tag} OK done";
         let (mut session, log) = scripted_with_log(vec![(answers, false)]).await;
-        assert_eq!(gmail_threads(&mut session, "10:11").await.unwrap(), vec![(10, 1278455344230334865), (11, 7)]);
+        assert_eq!(gmail_threads(&mut session, "10:11").await.unwrap(), (vec![(10, 1278455344230334865), (11, 7)], true));
         assert_eq!(log.lock().unwrap().last().map(String::as_str), Some("UID FETCH 10:11 (UID X-GM-THRID)"));
         let mut refused = scripted(vec![("{tag} BAD unknown item", false)]).await;
         assert!(gmail_threads(&mut refused, "1").await.is_err());
+        // Gmail refusing some messages: the others are given, the answer marked partial.
+        let partial = "* 1 FETCH (X-GM-THRID 7 UID 10)\r\n{tag} NO Some messages could not be FETCHed (Failure)";
+        let mut session = scripted(vec![(partial, false)]).await;
+        assert_eq!(gmail_threads(&mut session, "10:11").await.unwrap(), (vec![(10, 7)], false));
     }
 
     #[tokio::test]
