@@ -1407,7 +1407,7 @@ dependencies = [
 
 [[package]]
 name = "facteur-app"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "chrono",
  "facteur-core",
