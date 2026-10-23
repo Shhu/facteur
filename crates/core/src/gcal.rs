@@ -250,8 +250,37 @@ pub async fn create(token: &str, calendar_id: &str, key: &str, changes: &EventCh
 }
 
 pub async fn update(token: &str, calendar_id: &str, event_id: &str, changes: &EventChanges) -> Result<Instance> {
-    let req = client()?.patch(write_url(calendar_id, Some(event_id))?).header("Content-Type", "application/json").body(serde_json::to_vec(&body(changes)?)?);
+    let mut body = body(changes)?;
+    merge_guests(token, calendar_id, event_id, changes, &mut body).await?;
+    let req = client()?.patch(write_url(calendar_id, Some(event_id))?).header("Content-Type", "application/json").body(serde_json::to_vec(&body)?);
     written(&send(req, token).await?)
+}
+
+/// A PATCH replaces the whole guest list: the list asked for is merged into the one Google holds
+/// now, so rooms, optional guests and answers given since the last sync are kept.
+async fn merge_guests(token: &str, calendar_id: &str, event_id: &str, changes: &EventChanges, body: &mut serde_json::Value) -> Result<()> {
+    if changes.attendees.is_none() {
+        return Ok(());
+    }
+    let current = get(&client()?, token, events_url(calendar_id, Some(event_id))?).await?;
+    let wanted: Vec<serde_json::Value> = body["attendees"].as_array().cloned().unwrap_or_default();
+    body["attendees"] = merged_guests(current["attendees"].as_array().map(Vec::as_slice).unwrap_or_default(), &wanted).into();
+    Ok(())
+}
+
+/// `current` entries that stay as they are (the organizer, rooms and resources, guests still
+/// wanted), then the wanted guests not there yet.
+fn merged_guests(current: &[serde_json::Value], wanted: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let email = |g: &serde_json::Value| g["email"].as_str().unwrap_or_default().to_lowercase();
+    let wanted_emails: std::collections::HashSet<String> = wanted.iter().map(email).collect();
+    let mut out: Vec<serde_json::Value> = current
+        .iter()
+        .filter(|g| g["organizer"].as_bool() == Some(true) || g["resource"].as_bool() == Some(true) || wanted_emails.contains(&email(g)))
+        .cloned()
+        .collect();
+    let present: std::collections::HashSet<String> = out.iter().map(email).collect();
+    out.extend(wanted.iter().filter(|g| !present.contains(&email(g))).cloned());
+    out
 }
 
 /// The whole series changed: its texts as `changes` says; with `times` (the new start of an
@@ -261,6 +290,7 @@ pub async fn update_series(token: &str, calendar_id: &str, series_id: &str, chan
     let http = client()?;
     let url = events_url(calendar_id, Some(series_id))?;
     let mut body = body(&EventChanges { times: None, ..changes.clone() })?;
+    merge_guests(token, calendar_id, series_id, changes, &mut body).await?;
     if let Some((at, length)) = times {
         let master = get(&http, token, url.clone()).await?;
         let (start, end) = moved(&master["start"], at, length).ok_or_else(|| Error::Other(crate::tr!("Google Agenda : série illisible", "Google Calendar: unreadable series")))?;
@@ -503,6 +533,25 @@ fn map_event(item: &serde_json::Value) -> Option<Instance> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guests_merge_into_the_list_google_holds() {
+        let current = vec![
+            serde_json::json!({ "email": "me@example.org", "organizer": true, "responseStatus": "accepted" }),
+            serde_json::json!({ "email": "Ann@example.org", "optional": true, "responseStatus": "accepted" }),
+            serde_json::json!({ "email": "room@resource.calendar.google.com", "resource": true, "responseStatus": "accepted" }),
+            serde_json::json!({ "email": "bob@example.org", "responseStatus": "declined" }),
+        ];
+        let wanted = vec![
+            serde_json::json!({ "email": "ann@example.org", "responseStatus": "needsAction" }),
+            serde_json::json!({ "email": "carl@example.org", "responseStatus": "needsAction" }),
+        ];
+        let merged = merged_guests(&current, &wanted);
+        let emails: Vec<&str> = merged.iter().map(|g| g["email"].as_str().unwrap()).collect();
+        assert_eq!(emails, ["me@example.org", "Ann@example.org", "room@resource.calendar.google.com", "carl@example.org"]);
+        assert_eq!(merged[1]["responseStatus"], "accepted", "Ann's answer from Google, not the cache's");
+        assert_eq!(merged[1]["optional"], true);
+    }
 
     #[test]
     fn maps_the_calendar_list() {

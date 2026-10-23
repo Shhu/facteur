@@ -212,11 +212,29 @@ impl Pooled {
 type Slot = Arc<AsyncMutex<Option<Pooled>>>;
 type Conn = OwnedMutexGuard<Option<Pooled>>;
 
+/// Counted among those waiting for the account's one connection while it lives.
+struct Waiting(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Waiting {
+    fn new(count: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Waiting(count)
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 const POOL_CHECK_AFTER: Duration = Duration::from_secs(60);
 /// Some hosts cap the connections of an address (OVH cut them and answered with empty folder
 /// lists). At rest, only IDLE stays open.
 const POOL_CLOSE_AFTER: Duration = Duration::from_secs(120);
 const SYNC_RETRY_AFTER: Duration = Duration::from_secs(5);
+/// A sign-in refused "for now" for this long is no longer passing: the user is asked to sign in again.
+const REFUSED_FOR_NOW_LIMIT: Duration = Duration::from_secs(30 * 60);
 /// A full sync the server cut on both attempts is retried this long after, so a passing cut
 /// (a host dropping a mailbox's sessions now and then) shows for a minute at most.
 const SYNC_FOLLOW_UP: Duration = Duration::from_secs(60);
@@ -252,9 +270,13 @@ pub struct Engine {
     secrets: Secrets,
     events: broadcast::Sender<Event>,
     slots: Mutex<HashMap<(i64, Purpose), Slot>>,
+    /// One connection for everything: requests other than the sync waiting for it, per account.
+    waiting: Mutex<HashMap<i64, Arc<std::sync::atomic::AtomicUsize>>>,
     flush_locks: Mutex<HashMap<i64, Arc<AsyncMutex<()>>>>,
     /// In memory only. The expiry is wall-clock time (see [`oauth::Tokens::expires_at`]).
     tokens: Mutex<HashMap<i64, (String, SystemTime)>>,
+    /// Since when the IMAP server has been turning the account's sign-in down "for now".
+    refused_since: Mutex<HashMap<i64, SystemTime>>,
     /// Microsoft: the calendar's tokens (Graph), apart from the mail's.
     /// Microsoft Graph token, its expiry, and whether it may write to the calendars.
     calendar_tokens: Mutex<HashMap<i64, (String, SystemTime, bool)>>,
@@ -567,6 +589,8 @@ fn synced_span(fetches: Option<(i64, i64)>) -> (Option<i64>, Option<i64>) {
 const UNDO_SEND_DEFAULT: i64 = 10;
 /// Attempts of a failing send (network down at the planned time) before waiting for the user.
 const SEND_ATTEMPTS: i64 = 4;
+/// Tries of a message while the server cannot be reached: about a day at 15 minutes apart.
+const UNREACHABLE_ATTEMPTS: i64 = 100;
 const SNOOZE_FOLDER: &str = "Plus tard";
 /// In the interface's language.
 fn screener_folder() -> String {
@@ -602,6 +626,15 @@ struct Busy<'a> {
 impl<'a> Busy<'a> {
     fn take(set: &'a Mutex<HashSet<i64>>, id: i64) -> Option<Self> {
         set.lock().unwrap().insert(id).then_some(Busy { set, id })
+    }
+}
+
+/// An account's periodic sync under way, taken out of `periodic` when it ends, however it ends.
+struct PeriodicRun(Arc<Engine>, i64);
+
+impl Drop for PeriodicRun {
+    fn drop(&mut self) {
+        self.0.periodic.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.1);
     }
 }
 
@@ -651,6 +684,8 @@ const DKIM_ARRIVAL: i64 = 2 * 3600;
 struct Undo {
     /// (account, queued op).
     ops: Vec<(i64, i64)>,
+    /// What each of `ops` holds, checked before it is removed (ids are reused).
+    op_texts: Vec<String>,
     /// (message, folder and UID before the move).
     moves: Vec<(i64, i64, Option<u32>)>,
     /// Gmail converted to labels: the labels messages had before.
@@ -686,8 +721,10 @@ impl Engine {
             secrets: Secrets::new(),
             events: broadcast::channel(256).0,
             slots: Mutex::default(),
+            waiting: Mutex::default(),
             flush_locks: Mutex::default(),
             tokens: Mutex::default(),
+            refused_since: Mutex::default(),
             calendar_tokens: Mutex::default(),
             calendar_read_only: Mutex::default(),
             auth_refused: Mutex::default(),
@@ -803,22 +840,48 @@ impl Engine {
     }
 
     /// An access token refused although not expired (revoked, or the clock was off) is dropped and
-    /// a fresh one tried, once.
+    /// a fresh one tried, once. So is one the server turns down "for now": Outlook's "authenticated
+    /// but not connected" can stick to a token. Turned down for longer than
+    /// [`REFUSED_FOR_NOW_LIMIT`], the account waits for the user to sign in again, which is what
+    /// clears it then.
     async fn login(&self, account: &Account) -> Result<Session> {
         let credential = self.credential(account).await?;
         let res = imap::connect(&account.imap, &account.username, &credential).await;
         let res = match (res, &credential) {
-            (Err(Error::Auth(_)), Credential::Token(used)) => {
+            (Err(Error::Auth(_) | Error::Refused(_)), Credential::Token(used)) => {
                 self.forget_token(account.id, Some(used.as_str()));
                 let credential = self.credential(account).await?;
                 imap::connect(&account.imap, &account.username, &credential).await
             }
             (res, _) => res,
         };
-        if let Err(Error::Auth(why)) = &res {
-            self.refuse(account.id, why);
+        match &res {
+            Err(Error::Auth(why)) => self.refuse(account.id, why),
+            Err(Error::Refused(why)) => self.refused_for_now(account.id, why, SystemTime::now()),
+            Ok(_) => {
+                self.refused_since.lock().unwrap().remove(&account.id);
+            }
+            Err(_) => {}
         }
         res
+    }
+
+    /// A sign-in turned down "for now" at `now`: past [`REFUSED_FOR_NOW_LIMIT`] since the first
+    /// one, the account waits for the user.
+    fn refused_for_now(&self, account_id: i64, why: &str, now: SystemTime) {
+        if !imap::cured_by_signing_in(why) {
+            return;
+        }
+        let since = *self.refused_since.lock().unwrap().entry(account_id).or_insert(now);
+        if now.duration_since(since).unwrap_or_default() < REFUSED_FOR_NOW_LIMIT {
+            return;
+        }
+        self.refused_since.lock().unwrap().remove(&account_id);
+        let why = crate::tr!(
+            "le serveur refuse la connexion depuis plus de 30 minutes, reconnectez le compte ({why})",
+            "the server has refused the sign-in for more than 30 minutes, sign in again ({why})"
+        );
+        self.refuse(account_id, &why);
     }
 
     /// Only if it is still `used`, when given: a connection that failed with an old token must not
@@ -992,11 +1055,15 @@ impl Engine {
     }
 
     async fn session(&self, account_id: i64, purpose: Purpose) -> Result<Conn> {
-        let purpose = if self.single_connection(account_id) { Purpose::Sync } else { purpose };
+        let single = self.single_connection(account_id);
+        // Waiting behind a sync on the one connection: it gives way between two folders.
+        let _waiting = (single && purpose != Purpose::Sync).then(|| Waiting::new(self.waiting_on(account_id)));
+        let purpose = if single { Purpose::Sync } else { purpose };
         let slot = self.slots.lock().unwrap().entry((account_id, purpose)).or_default().clone();
         let mut guard = tokio::time::timeout(SLOT_WAIT, slot.lock_owned()).await.map_err(|_| {
             Error::Other(crate::tr!("connexion au serveur occupée depuis trop longtemps", "server connection busy for too long"))
         })?;
+        drop(_waiting);
         // Used a moment ago: still alive (TCP keepalive notices a dead one). After a while, a quick
         // NOOP; a server that takes more than 3 s to answer it is not worth waiting for.
         if let Some(conn) = guard.as_mut()
@@ -1014,6 +1081,10 @@ impl Engine {
             }
         }
         Ok(guard)
+    }
+
+    fn waiting_on(&self, account_id: i64) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.waiting.lock().unwrap().entry(account_id).or_default().clone()
     }
 
     async fn close_idle_connections(&self) {
@@ -1768,7 +1839,7 @@ impl Engine {
             let session = &mut guard.as_mut().expect("session open").session;
             let res = bounded(secs, &crate::tr!("téléchargement du message", "downloading the message"), sync::download_body(&self.store, session, id, &loc.mailbox, uid)).await;
             // A cut EXAMINE or FETCH must not leave the dead connection in the slot for the next message.
-            if matches!(res, Err(Error::Io(_) | Error::Imap(_) | Error::Other(_) | Error::Dropped(_))) {
+            if matches!(res, Err(Error::Io(_) | Error::Imap(_) | Error::Other(_) | Error::Dropped(_) | Error::Refused(_))) {
                 *guard = None;
             }
             match res {
@@ -2019,8 +2090,10 @@ impl Engine {
     }
 
     fn enqueue_undoable(&self, account_id: i64, op: &Op, label: &str, undo: &mut Undo) -> Result<()> {
-        let id = self.store.push_op(account_id, &serde_json::to_string(op)?, label, Some(crate::store::now() + UNDO_SECS))?;
+        let text = serde_json::to_string(op)?;
+        let id = self.store.push_op(account_id, &text, label, Some(crate::store::now() + UNDO_SECS))?;
         undo.ops.push((account_id, id));
+        undo.op_texts.push(text);
         Ok(())
     }
 
@@ -2054,7 +2127,7 @@ impl Engine {
         let mut accounts: Vec<i64> = undo.ops.iter().map(|(a, _)| *a).collect();
         accounts.sort_unstable();
         accounts.dedup();
-        let ids: Vec<i64> = undo.ops.iter().map(|(_, id)| *id).collect();
+        let ids: Vec<(i64, String)> = undo.ops.iter().map(|(_, id)| *id).zip(undo.op_texts.iter().cloned()).collect();
         // No replay may take these operations while they are removed. While they are all still held
         // (well before the end of their undo window), no replay takes them, so no need to wait behind
         // one (or behind its connection attempts).
@@ -4454,6 +4527,18 @@ impl Engine {
 
     /// `Scope::Inbox`: the inbox only, when IDLE reports something new.
     pub async fn sync_scoped(self: &Arc<Self>, account_id: i64, scope: sync::Scope) -> Result<Report> {
+        loop {
+            let report = self.sync_scoped_once(account_id, scope.clone()).await?;
+            // Stopped between two folders for a message to open or an action to send (one connection
+            // for everything): taken up again behind them, the connection going to whoever waited
+            // first; the folders done already are left unopened then.
+            if !report.handed_over {
+                return Ok(report);
+            }
+        }
+    }
+
+    async fn sync_scoped_once(self: &Arc<Self>, account_id: i64, scope: sync::Scope) -> Result<Report> {
         // The replay lock keeps an interactive flush from replaying the same operations in parallel.
         let lock = self.flush_lock(account_id);
         let run = self.diag.sync_started(account_id, &scope);
@@ -4465,6 +4550,9 @@ impl Engine {
         // Filled folder by folder, across attempts: what INBOX brought before a later folder failed
         // still goes through the rules, the screener and the notifications below.
         let mut report = Report::default();
+        if self.single_connection(account_id) {
+            report.waiting = Some(self.waiting_on(account_id));
+        }
         // Before this sync moves it: what reached the server since then just arrived.
         let previous_sync = self.store.account(account_id).ok().and_then(|a| a.last_sync);
         let mut steps = crate::perf::Steps::new(|| format!("account {account_id} sync ({scope:?})"));
@@ -5864,6 +5952,9 @@ impl Engine {
                         }
                         let this = this.clone();
                         Some(tokio::spawn(async move {
+                            // Released even when the sync panics: otherwise the account would never
+                            // get a periodic sync again until a restart.
+                            let _periodic = PeriodicRun(this.clone(), account_id);
                             let res = match scope {
                                 sync::Scope::All => this.sync(account_id).await,
                                 scope => this.sync_scoped(account_id, scope).await,
@@ -5871,7 +5962,6 @@ impl Engine {
                             if let Err(e) = res {
                                 tracing::warn!("sync of account {account_id}: {e}");
                             }
-                            this.periodic.lock().unwrap().remove(&account_id);
                         }))
                     })
                     .collect();
@@ -6129,7 +6219,8 @@ impl Engine {
                 } else {
                     this.store.set_setting(AI_MODEL, model.id)?;
                     this.store.delete_setting(AI_FILE)?;
-                    crate::ai::unload();
+                    // Waits for a generation under way: not on an async worker.
+                    let _ = tokio::task::spawn_blocking(crate::ai::unload).await;
                 }
                 this.ai_forget_others();
                 Ok::<_, Error>(())
@@ -6193,12 +6284,19 @@ impl Engine {
             .collect();
         let downloading = self.ai_download.lock().unwrap().as_ref().filter(|d| d.running).and_then(|d| crate::ai::model(&d.model)).map(|m| m.file);
         let Ok(entries) = std::fs::read_dir(&self.ai_dir) else { return };
+        let part_of = |file: &str| Path::new(file).with_extension("part").to_string_lossy().into_owned();
+        // Only what facteur downloads (and its unfinished downloads): a file of the user's own put
+        // in this folder, chosen with "use a file", is theirs.
+        let ours: Vec<String> = crate::ai::MODELS
+            .iter()
+            .chain([&crate::ai::DICTATION])
+            .flat_map(|m| [m.file.to_string(), part_of(m.file)])
+            .collect();
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let part_of = |file: &str| Path::new(file).with_extension("part").to_string_lossy().into_owned();
             let kept = in_use.contains(&name.as_str()) || downloading.is_some_and(|d| name == d || name == part_of(d));
             if !kept
-                && (name.ends_with(".gguf") || name.ends_with(".bin") || name.ends_with(".part"))
+                && ours.contains(&name)
                 && let Err(e) = std::fs::remove_file(entry.path())
             {
                 tracing::warn!("local AI: {name} not deleted: {e}");
@@ -6579,6 +6677,11 @@ async fn persist(mut write: impl FnMut() -> Result<()>) -> Result<()> {
 /// `None`: wait for the user. Tries 2, 3 and 4 come after 1, 2 and 4 minutes. A send that may
 /// have gone (uncertain) is never repeated on its own, nor one the server refused for good.
 fn retry_at(error: &Error, attempts: i64, now: i64) -> Option<i64> {
+    // Offline (on a train, the Wi-Fi gone): nothing reached the server, so no attempt is spent; a
+    // try every 15 minutes at most, for a day.
+    if matches!(error, Error::Unreachable(_)) {
+        return (attempts < UNREACHABLE_ATTEMPTS).then(|| now + (60 << (attempts - 1).clamp(0, 4)).min(15 * 60));
+    }
     // A message that cannot be built (see `deliver`) fails the same way every time.
     let final_error = matches!(error, Error::Uncertain(_) | Error::Rejected(_) | Error::Mime(_));
     (attempts < SEND_ATTEMPTS && !final_error).then(|| now + 60 * (1 << (attempts - 1).clamp(0, 10)))
@@ -7291,6 +7394,10 @@ mod tests {
         assert_eq!(retry_at(&Error::Rejected("550".into()), 1, now), None, "refused for good");
         assert_eq!(retry_at(&Error::Uncertain("cut".into()), 1, now), None, "maybe sent: never repeated on its own");
         assert_eq!(retry_at(&Error::Mime("alias removed".into()), 1, now), None, "cannot be built: the user edits it");
+        let offline = Error::Unreachable("no route to host".into());
+        assert_eq!(retry_at(&offline, SEND_ATTEMPTS + 1, now), Some(now + 15 * 60), "offline: no attempt spent");
+        assert_eq!(retry_at(&offline, 1, now), Some(now + 60));
+        assert_eq!(retry_at(&offline, UNREACHABLE_ATTEMPTS, now), None, "a day later, the user decides");
     }
 
     #[test]
@@ -7633,6 +7740,32 @@ In-Reply-To: <parent@x>\r\nReferences: <root@x> <parent@x>\r\n\r\nBrouillon\r\n"
         engine.finish_release(acc);
         assert_eq!(store.location(moving).unwrap().mailbox_id, inbox);
         assert_eq!(store.setting(&release_key(acc)).unwrap().as_deref(), Some("0"));
+    }
+
+    #[tokio::test]
+    async fn turning_the_ai_off_never_deletes_a_file_of_the_users_own() {
+        let (_dir, engine, _) = test_engine();
+        std::fs::create_dir_all(&engine.ai_dir).unwrap();
+        let own = engine.ai_dir.join("my-model.gguf");
+        let downloaded = engine.ai_dir.join(crate::ai::MODELS[0].file);
+        std::fs::write(&own, b"x").unwrap();
+        std::fs::write(&downloaded, b"x").unwrap();
+        engine.ai_forget_others();
+        assert!(own.exists(), "the user's own file stays");
+        assert!(!downloaded.exists(), "a model facteur downloaded, no longer used, goes");
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_refused_for_now_too_long_asks_the_user() {
+        let (_dir, engine, acc) = test_engine();
+        let start = SystemTime::now();
+        engine.refused_for_now(acc, "User is authenticated but not connected", start);
+        engine.refused_for_now(acc, "User is authenticated but not connected", start + Duration::from_secs(29 * 60));
+        assert!(!engine.auth_refused.lock().unwrap().contains_key(&acc), "still passing");
+        engine.refused_for_now(acc, "User is authenticated but not connected", start + REFUSED_FOR_NOW_LIMIT);
+        let why = engine.auth_refused.lock().unwrap().get(&acc).cloned().expect("waits for the user");
+        assert!(why.contains("authenticated but not connected"), "{why}");
+        assert!(!engine.refused_since.lock().unwrap().contains_key(&acc));
     }
 
     #[tokio::test]

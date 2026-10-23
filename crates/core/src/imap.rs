@@ -175,7 +175,7 @@ async fn authenticate(client: async_imap::Client<Stream>, username: &str, creden
         // A passing refusal (server busy, too many connections) is not the credentials' fault:
         // they must not be set aside waiting for the user.
         async_imap::error::Error::No(msg) | async_imap::error::Error::Bad(msg) if transient_refusal(&msg) => {
-            Error::Other(crate::tr!("connexion refusée pour le moment par le serveur IMAP ({})", "sign-in refused for now by the IMAP server ({})", server_reason(&msg)))
+            Error::Refused(crate::tr!("connexion refusée pour le moment par le serveur IMAP ({})", "sign-in refused for now by the IMAP server ({})", server_reason(&msg)))
         }
         async_imap::error::Error::No(msg) | async_imap::error::Error::Bad(msg) => {
             let what = if crate::i18n::english() { what.1 } else { what.0 };
@@ -187,10 +187,22 @@ async fn authenticate(client: async_imap::Client<Stream>, username: &str, creden
 
 /// Response codes (RFC 5530) of a refusal for a passing reason. Outlook gives no code: "User
 /// is authenticated but not connected" follows an accepted token while its mailbox is briefly
-/// out of reach (or one connection too many).
+/// out of reach (or one connection too many). Gmail gives its limits as an [ALERT]: too many
+/// connections (another app, a phone), or the day's bandwidth used up.
 pub(crate) fn transient_refusal(msg: &str) -> bool {
     let upper = msg.to_ascii_uppercase();
-    ["[UNAVAILABLE]", "[INUSE]", "[LIMIT]", "[SERVERBUG]", "AUTHENTICATED BUT NOT CONNECTED"].iter().any(|code| upper.contains(code))
+    [
+        "[UNAVAILABLE]", "[INUSE]", "[LIMIT]", "[SERVERBUG]", "[THROTTLED]", "AUTHENTICATED BUT NOT CONNECTED",
+        "TOO MANY SIMULTANEOUS CONNECTIONS", "EXCEEDED COMMAND OR BANDWIDTH LIMITS",
+    ]
+    .iter()
+    .any(|code| upper.contains(code))
+}
+
+/// A passing refusal that signing in again clears when it lasts (Outlook's token bound to a
+/// mailbox it no longer reaches); waiting is the only cure for the others.
+pub(crate) fn cured_by_signing_in(msg: &str) -> bool {
+    msg.to_ascii_uppercase().contains("AUTHENTICATED BUT NOT CONNECTED")
 }
 
 /// async-imap renders NO/BAD as `code: None, info: Some("[CODE] text")`: keep only the text.
@@ -612,6 +624,9 @@ pub(crate) mod tests {
         assert!(super::transient_refusal("code: None, info: Some(\"[limit] Too many connections\")"));
         assert!(!super::transient_refusal("code: None, info: Some(\"[AUTHENTICATIONFAILED] Authentication failed.\")"));
         assert!(super::transient_refusal("code: None, info: Some(\"User is authenticated but not connected.\")"));
+        assert!(super::transient_refusal("code: None, info: Some(\"[ALERT] Too many simultaneous connections. (Failure)\")"));
+        assert!(super::transient_refusal("code: None, info: Some(\"[ALERT] Account exceeded command or bandwidth limits. (Failure)\")"));
+        assert!(!super::cured_by_signing_in("Too many simultaneous connections"));
     }
 
     /// A signed-in session on a scripted server: each step answers the next command (`{tag}`

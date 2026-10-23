@@ -4,6 +4,7 @@ use lettre::message::header::ContentType;
 use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::Message;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::{Error, Result};
 use crate::imap::Credential;
@@ -297,7 +298,8 @@ async fn send_with(account: &Account, credential: &Credential, message: &Message
             Security::Tls => AsyncSmtpConnection::connect_tokio1((s.host.as_str(), s.port), timeout, &hello, Some(tls(&s.host)?), None).await,
             _ => AsyncSmtpConnection::connect_tokio1((s.host.as_str(), s.port), timeout, &hello, None, None).await,
         }
-        .map_err(|e| connection_error(&e))?;
+        // Not even connected (no network, name not found, nothing answering): nothing was sent.
+        .map_err(|e| if e.is_permanent() || e.is_client() { connection_error(&e) } else { Error::Unreachable(e.to_string()) })?;
         if matches!(s.security, Security::StartTls) {
             conn.starttls(tls(&s.host)?, &hello).await.map_err(|e| connection_error(&e))?;
         }
@@ -317,7 +319,7 @@ async fn send_with(account: &Account, credential: &Credential, message: &Message
         Ok::<_, Error>((conn, limit))
     };
     let (mut conn, limit) = match tokio::time::timeout(Duration::from_secs(connect_secs), connect).await {
-        Err(_) => return Err(Error::Smtp(stopped())),
+        Err(_) => return Err(Error::Unreachable(stopped())),
         Ok(res) => res?,
     };
     let envelope = message.envelope();
@@ -368,8 +370,16 @@ async fn send_with(account: &Account, credential: &Credential, message: &Message
         conn.abort().await;
         return Err(e);
     }
-    let res = match tokio::time::timeout(Duration::from_secs(send_secs), conn.message(&raw)).await {
+    // Set once the whole body has been written, just before the final dot: until then the server
+    // cannot have accepted the message, and a failure is certain (retried), not uncertain.
+    let body_written = AtomicBool::new(false);
+    let body = Upload { part: Some(&raw), written: &body_written };
+    let res = match tokio::time::timeout(Duration::from_secs(send_secs), conn.message_iter(body)).await {
         Ok(Ok(_)) => Ok(()),
+        Err(_) | Ok(Err(_)) if !body_written.load(Ordering::Relaxed) => Err(Error::Smtp(crate::tr!(
+            "envoi coupé avant la fin du message : il n'est pas parti",
+            "sending cut off before the end of the message: it did not go out"
+        ))),
         // Timeout mid-send: the server may have accepted the message. Resending it on its own
         // could duplicate it for the recipient.
         Err(_) => Err(Error::Uncertain(crate::tr!("le serveur ne répond plus", "the server stopped responding"))),
@@ -382,6 +392,25 @@ async fn send_with(account: &Account, credential: &Credential, message: &Message
         Err(_) => conn.abort().await,
     }
     res
+}
+
+/// The message for lettre's `message_iter`: flags `written` when asked for more after the last
+/// part, that is once the body is fully written and before the end-of-data dot.
+struct Upload<'a> {
+    part: Option<&'a [u8]>,
+    written: &'a AtomicBool,
+}
+
+impl<'a> Iterator for Upload<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        let part = self.part.take();
+        if part.is_none() {
+            self.written.store(true, Ordering::Relaxed);
+        }
+        part
+    }
 }
 
 /// The SIZE an EHLO answer announces; none, or 0 (no limit): `None`.
@@ -443,6 +472,16 @@ pub fn maybe_sent_advice(smtp_host: &str) -> String {
 mod tests {
     use super::*;
     use crate::model::{AuthMethod, Security, ServerConfig};
+
+    #[test]
+    fn the_body_counts_as_written_only_once_fully_handed_over() {
+        let written = AtomicBool::new(false);
+        let mut upload = Upload { part: Some(b"Subject: x\r\n\r\nbody"), written: &written };
+        assert!(upload.next().is_some());
+        assert!(!written.load(Ordering::Relaxed), "a cut while this part is written: certainly not sent");
+        assert!(upload.next().is_none());
+        assert!(written.load(Ordering::Relaxed), "asked for more: only the final dot is left");
+    }
 
     #[test]
     fn reads_the_size_the_server_takes() {
@@ -629,9 +668,9 @@ mod tests {
         assert!(matches!(try_send(fake_server(None, Some("550 5.1.1 no such user"), false).await).await, Err(Error::Rejected(_))));
         // Silence after the data: it may have gone.
         assert!(matches!(try_send(fake_server(None, None, true).await).await, Err(Error::Uncertain(_))));
-        // Nobody listening: certainly not sent.
+        // Nobody listening: certainly not sent, and no attempt spent (offline).
         let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
-        assert!(matches!(try_send(closed).await, Err(Error::Smtp(_))));
+        assert!(matches!(try_send(closed).await, Err(Error::Unreachable(_))));
         // Connection cut before the message data: certainly not sent, so retried (it used to
         // look like an uncertain send, never retried).
         assert!(matches!(try_send(fake_server(None, Some("DROP"), false).await).await, Err(Error::Smtp(_))));

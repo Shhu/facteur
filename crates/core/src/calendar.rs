@@ -198,7 +198,12 @@ struct Zones(Vec<(String, Zone)>);
 
 impl Zones {
     fn read(lines: &[Line]) -> Zones {
+        // An invitation names one zone or two: a few dozen more can only be a message built to
+        // make each one computed (see [`ZONE_PERIODS`]).
+        const MAX_ZONES: usize = 32;
+        const MAX_OBSERVANCES: usize = 16;
         let mut out = Vec::new();
+        let mut seen = 0;
         let mut tzid: Option<String> = None;
         let mut observances: Vec<Observance> = Vec::new();
         let mut current: Option<Vec<&Line>> = None;
@@ -208,11 +213,18 @@ impl Zones {
                 ("BEGIN", "VTIMEZONE") => {
                     tzid = None;
                     observances.clear();
+                    seen += 1;
                 }
                 ("BEGIN", "STANDARD" | "DAYLIGHT") => current = Some(Vec::new()),
-                ("END", "STANDARD" | "DAYLIGHT") => observances.extend(current.take().and_then(|c| Observance::read(&c))),
+                ("END", "STANDARD" | "DAYLIGHT") => {
+                    let read = current.take().and_then(|c| Observance::read(&c));
+                    if observances.len() < MAX_OBSERVANCES {
+                        observances.extend(read);
+                    }
+                }
                 ("END", "VTIMEZONE") => {
-                    if let Some(id) = tzid.take()
+                    if seen <= MAX_ZONES
+                        && let Some(id) = tzid.take()
                         && named_zone(&id).is_none()
                         && let Some(zone) = Observance::zone(&observances)
                     {
@@ -284,7 +296,7 @@ impl Observance {
         let mut onsets: Vec<i64> = std::iter::once(self.start).chain(self.rdates.iter().copied()).map(utc).collect();
         if let Some(rule) = &self.rule {
             // Wall times, computed as if in UTC; two years back are enough for a yearly change.
-            let starts = rule.occurrences(Stamp::Time(self.start, Zone::Utc), wall - 800 * 86400, wall + 1);
+            let starts = rule.occurrences_within(Stamp::Time(self.start, Zone::Utc), wall - 800 * 86400, wall + 1, ZONE_PERIODS);
             onsets.extend(starts.into_iter().map(|s| utc(s.naive())));
         }
         onsets.into_iter().filter(|t| *t <= at).max()
@@ -935,6 +947,9 @@ struct Rule {
 
 /// Safety bound on the periods walked through (the walk also stops at the end of the window).
 const MAX_PERIODS: i64 = 200_000;
+/// For a VTIMEZONE's change rule, computed for each zone an invitation carries: a real one
+/// changes yearly from 1601 at the earliest, and a rule with COUNT is walked from its start.
+const ZONE_PERIODS: i64 = 5_000;
 
 fn weekday(code: &str) -> Option<chrono::Weekday> {
     use chrono::Weekday::*;
@@ -1131,6 +1146,11 @@ impl Rule {
     /// Without COUNT the walk jumps to the periods near `after`; with it, the occurrences before
     /// `after` are counted but not returned.
     fn occurrences(&self, start: Stamp, after: i64, to: i64) -> Vec<Stamp> {
+        self.occurrences_within(start, after, to, MAX_PERIODS)
+    }
+
+    /// [`occurrences`](Self::occurrences), walking at most `max_periods` periods.
+    fn occurrences_within(&self, start: Stamp, after: i64, to: i64, max_periods: i64) -> Vec<Stamp> {
         let first = start.naive();
         let until = self.until.map(|u| u.in_zone_of(start));
         let limit = |s: Stamp| -> bool {
@@ -1153,7 +1173,7 @@ impl Rule {
         };
         let mut found = 1;
         let mut out = if wanted(start) { vec![start] } else { vec![] };
-        'periods: for k in skip..skip.saturating_add(MAX_PERIODS) {
+        'periods: for k in skip..skip.saturating_add(max_periods) {
             if self.period_start(first.date(), k).is_none_or(|d| d > last_day) {
                 break;
             }
@@ -1562,8 +1582,8 @@ fn rework(block: &[String], drop: &[&str], add: Vec<String>, now: i64) -> Option
     Some(out)
 }
 
-/// The text properties `changes` sets: those to drop, and their new lines.
-fn text_changes(changes: &EventChanges) -> (Vec<&'static str>, Vec<String>) {
+/// The text properties `changes` sets on `block`: those to drop, and their new lines.
+fn text_changes(changes: &EventChanges, block: &[String]) -> (Vec<&'static str>, Vec<String>) {
     let mut drop = Vec::new();
     let mut add = Vec::new();
     if let Some(s) = &changes.summary {
@@ -1580,9 +1600,44 @@ fn text_changes(changes: &EventChanges) -> (Vec<&'static str>, Vec<String>) {
     }
     if let Some(list) = &changes.attendees {
         drop.extend(["ORGANIZER", "ATTENDEE"]);
-        add.extend(attendee_lines(list));
+        add.extend(merged_attendees(block, list));
     }
     (drop, add)
+}
+
+/// The guest list `list` asks for, merged into the one the server holds in `block`: a guest who
+/// stays keeps their line as it is (their latest answer, role, delegation), rooms and resources
+/// (never shown, never edited) stay, the removed go and the new ones are added.
+fn merged_attendees(block: &[String], list: &[crate::model::EventAttendee]) -> Vec<String> {
+    let wanted: HashSet<String> = list.iter().filter(|a| !a.organizer).map(|a| a.email.to_lowercase()).collect();
+    let mut organizer = None;
+    let mut kept = Vec::new();
+    let mut present = HashSet::new();
+    for (i, l) in own_props(block) {
+        match l.name.as_str() {
+            "ORGANIZER" => organizer = Some(block[i].clone()),
+            "ATTENDEE" => {
+                let email = mailto(&l.value).to_lowercase();
+                let resource = l.param("CUTYPE").is_some_and(|t| t.eq_ignore_ascii_case("ROOM") || t.eq_ignore_ascii_case("RESOURCE"));
+                if resource || wanted.contains(&email) {
+                    present.insert(email);
+                    kept.push(block[i].clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    let new: Vec<crate::model::EventAttendee> = list.iter().filter(|a| !a.organizer && !present.contains(&a.email.to_lowercase())).cloned().collect();
+    if kept.is_empty() && new.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = match organizer {
+        Some(line) => vec![line],
+        None => attendee_lines(list).into_iter().filter(|l| l.starts_with("ORGANIZER")).collect(),
+    };
+    out.extend(kept);
+    out.extend(attendee_lines(&new));
+    out
 }
 
 /// ORGANIZER and ATTENDEE lines; none without guests.
@@ -1647,7 +1702,7 @@ pub fn edit_event(ics: &str, changes: &EventChanges, now: i64) -> Option<String>
     if events.next().is_some() || is_series(block) || is_override(block) {
         return None;
     }
-    let (mut drop, mut add) = text_changes(changes);
+    let (mut drop, mut add) = text_changes(changes, block);
     if let Some((start, end, all_day)) = changes.times {
         drop.extend(TIMES);
         add.extend(time_lines(start, end, all_day)?);
@@ -1884,7 +1939,7 @@ pub fn rebuild_series(ics: &str, changes: &EventChanges, first: (i64, i64, bool)
     };
     let index = parts.iter().position(|p| matches!(p, Part::Event(_)))?;
     let Part::Event(master) = &parts[index] else { return None };
-    let (mut drop, mut add) = text_changes(changes);
+    let (mut drop, mut add) = text_changes(changes, master);
     drop.extend(["DTSTART", "DTEND", "DURATION", "RRULE", "RDATE", "EXDATE", "EXRULE"]);
     add.extend(times);
     let master = rework(master, &drop, add, now)?;
@@ -1933,7 +1988,7 @@ pub fn edit_occurrence(ics: &str, original: i64, current: (i64, i64, bool), chan
     let series = Series::read(&parts);
     let (index, _) = occurrence_block(&mut parts, &series, original)?;
     let Part::Event(block) = &parts[index] else { return None };
-    let (mut drop, mut add) = text_changes(changes);
+    let (mut drop, mut add) = text_changes(changes, block);
     let (start, end, all_day) = changes.times.unwrap_or(current);
     drop.extend(TIMES);
     add.extend(time_lines(start, end, all_day)?);
@@ -2019,6 +2074,43 @@ pub fn respond_event(ics: &str, me: &[String], partstat: &str, original: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_flood_of_crafted_time_zones_is_read_quickly() {
+        let mut ics = String::from("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\n");
+        for i in 0..1000 {
+            ics.push_str(&format!(
+                "BEGIN:VTIMEZONE\r\nTZID:x{i}\r\nBEGIN:STANDARD\r\nDTSTART:00010101T000000\r\nRRULE:FREQ=DAILY;COUNT=999999999\r\n\
+TZOFFSETFROM:+0100\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n"
+            ));
+        }
+        ics.push_str("BEGIN:VEVENT\r\nUID:u\r\nDTSTART;TZID=x1:20261110T090000\r\nDTEND;TZID=x1:20261110T100000\r\nSUMMARY:x\r\n\
+ORGANIZER:mailto:a@example.org\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n");
+        let started = std::time::Instant::now();
+        let _ = parse(&ics);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn editing_the_guests_keeps_rooms_and_answers_from_the_server() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:20261110T090000Z\r\nDTEND:20261110T100000Z\r\n\
+ORGANIZER;CN=Me:mailto:me@example.org\r\n\
+ATTENDEE;ROLE=OPT-PARTICIPANT;PARTSTAT=ACCEPTED;CN=Ann:mailto:ann@example.org\r\n\
+ATTENDEE;CUTYPE=ROOM;PARTSTAT=ACCEPTED;CN=Room 1:mailto:room1@example.org\r\n\
+ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:bob@example.org\r\nSUMMARY:Meeting\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let guest = |email: &str, response: Option<&str>| crate::model::EventAttendee { email: email.into(), name: None, response: response.map(Into::into), organizer: false };
+        // Bob removed, Carl added; the cached answer of Ann is stale (none), the server's is kept.
+        let changes = EventChanges { attendees: Some(vec![guest("ann@example.org", None), guest("carl@example.org", None)]), ..Default::default() };
+        let out = edit_event(ics, &changes, 1_800_000_000).unwrap().replace("\r\n ", "");
+        assert!(out.contains("ORGANIZER;CN=Me:mailto:me@example.org"), "{out}");
+        assert!(out.contains("ATTENDEE;ROLE=OPT-PARTICIPANT;PARTSTAT=ACCEPTED;CN=Ann:mailto:ann@example.org"), "Ann's line as it was: {out}");
+        assert!(out.contains("CUTYPE=ROOM"), "the room stays: {out}");
+        assert!(!out.contains("bob@example.org"), "{out}");
+        assert!(out.contains("PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:carl@example.org"), "{out}");
+        // Everyone removed but the room: it stays, with the organizer.
+        let out = edit_event(ics, &EventChanges { attendees: Some(vec![]), ..Default::default() }, 1_800_000_000).unwrap().replace("\r\n ", "");
+        assert!(out.contains("CUTYPE=ROOM") && out.contains("ORGANIZER") && !out.contains("ann@example.org"), "{out}");
+    }
 
     const INVITE: &str = "BEGIN:VCALENDAR\r\nPRODID:-//Google Inc//Google Calendar 70.9054//EN\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\n\
 BEGIN:VTIMEZONE\r\nTZID:Europe/Paris\r\nBEGIN:STANDARD\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nDTSTART:19701025T030000\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n\

@@ -625,7 +625,13 @@ mod run {
 
     /// Frees the model's memory when unused for `idle` (the next request loads it again).
     pub fn unload_if_idle(idle: std::time::Duration) -> bool {
-        let mut loaded = LOADED.lock().unwrap_or_else(|e| e.into_inner());
+        // Taken: the model is working, so not idle. Never waited for: the caller is the
+        // scheduler, which a whole generation would hold up (sends, snoozes, reminders).
+        let mut loaded = match LOADED.try_lock() {
+            Ok(loaded) => loaded,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
         if loaded.as_ref().is_some_and(|(_, _, used)| used.elapsed() >= idle) {
             *loaded = None;
             return true;
@@ -752,7 +758,13 @@ mod hear {
     unsafe extern "C" fn quiet(_level: w::ggml_log_level, _text: *const std::os::raw::c_char, _data: *mut std::os::raw::c_void) {}
 
     pub fn unload_if_idle(idle: std::time::Duration) -> bool {
-        let mut loaded = LOADED.lock().unwrap_or_else(|e| e.into_inner());
+        // Taken: the model is working, so not idle. Never waited for: the caller is the
+        // scheduler, which a whole generation would hold up (sends, snoozes, reminders).
+        let mut loaded = match LOADED.try_lock() {
+            Ok(loaded) => loaded,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
         if loaded.as_ref().is_some_and(|(_, _, used)| used.elapsed() >= idle) {
             *loaded = None;
             return true;

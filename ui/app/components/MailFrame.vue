@@ -16,6 +16,9 @@ const height = ref(80)
 const ready = ref(false)
 const slow = ref(false)
 let slowTimer: ReturnType<typeof setTimeout> | undefined
+/** Shown as soon as the message's own document is parsed: `load` also waits for every remote
+ *  image, and one that never answers would keep the spinner up for good. */
+let parsedPoll: ReturnType<typeof setInterval> | undefined
 function waitForLoad() {
   ready.value = false
   slow.value = false
@@ -23,9 +26,17 @@ function waitForLoad() {
   slowTimer = setTimeout(() => {
     slow.value = true
   }, 150)
+  clearInterval(parsedPoll)
+  parsedPoll = setInterval(() => {
+    const doc = frame.value?.contentDocument
+    if (doc && doc.location.href === 'about:srcdoc' && doc.readyState !== 'loading') prepare(doc)
+  }, 100)
 }
 waitForLoad()
-onBeforeUnmount(() => clearTimeout(slowTimer))
+onBeforeUnmount(() => {
+  clearTimeout(slowTimer)
+  clearInterval(parsedPoll)
+})
 const colorMode = useColorMode()
 const { t } = useI18n()
 
@@ -102,11 +113,12 @@ function toggleMarkup(count: number) {
 }
 
 /** Line introducing a quote: "On …, Claire wrote:" and its translations. */
-const ATTRIBUTION = /(?:a écrit|écrit|wrote|schrieb|escribió|ha scritto)\s*:?\s*$/i
+const ATTRIBUTION = /(?:a écrit|écrit|wrote|schrieb|escribió|ha scritto)\s*(?::\s*)?$/i
 /** A forwarded message stays visible: it is the content, not a reminder of the thread. */
 const FORWARDED = /^\s*-{3,}\s*(?:forwarded message|message transféré|weitergeleitete nachricht|mensaje reenviado|messaggio inoltrato)/i
-/** Separators of earlier messages written as text (Outlook in plain text, some webmails). */
-const TEXT_HEADERS = /-{2,}\s*(?:original message|message d'origine|ursprüngliche nachricht|mensaje original)\s*-{2,}/gi
+/** Separators of earlier messages written as text (Outlook in plain text, some webmails). Two
+ *  dashes each side are enough to match: `-{2,}` there backtracks quadratically on long runs. */
+const TEXT_HEADERS = /-{2}\s*(?:original message|message d'origine|ursprüngliche nachricht|mensaje original)\s*-{2}/gi
 
 function decodeText(html: string) {
   return html.replace(/<[^>]*>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#x?0*27;/g, "'").replace(/&amp;/g, '&')
@@ -135,7 +147,7 @@ function collapsePlainQuotes(html: string): string {
   let first = start
   let k = start - 1
   while (k >= 0 && blank(k)) k--
-  if (k >= 0 && ATTRIBUTION.test(text[k]!.trim()) && text[k]!.length < 300) {
+  if (k >= 0 && text[k]!.length < 300 && ATTRIBUTION.test(text[k]!.trim())) {
     first = k
     if (k > 0 && !blank(k - 1) && !/^(?:le|on|am|el|il)\s/i.test(text[k]!.trim()) && /^(?:le|on|am|el|il)\s/i.test(text[k - 1]!.trim())) first = k - 1
   }
@@ -260,7 +272,9 @@ function collapseHtmlQuotes(doc: Document) {
     depth = Math.max(depth, d)
   }
   const headers = wrapper.querySelectorAll(QUOTE_HEADERS).length
-  const written = (content.match(/(?:a écrit|wrote|schrieb|escribió|ha scritto)\s*:/gi)?.length ?? 0) + (content.match(TEXT_HEADERS)?.length ?? 0)
+  // A bounded sample: counting, not reading the whole quote.
+  const sample = content.slice(0, 200_000)
+  const written = (sample.match(/(?:a écrit|wrote|schrieb|escribió|ha scritto)\s*:/gi)?.length ?? 0) + (sample.match(TEXT_HEADERS)?.length ?? 0)
   const count = Math.max(1, depth, headers, written)
   wrapper.insertAdjacentHTML('beforebegin', toggleMarkup(count))
 }
@@ -349,9 +363,21 @@ watch(() => props.darken, applyDark)
 // A new page loads in the frame: hidden again until `onLoad` has fitted it.
 watch(srcdoc, waitForLoad)
 
+/** The document set up once, whether its parsing or its full load comes first. */
+let prepared: Document | null = null
 function onLoad() {
   const doc = frame.value?.contentDocument
   if (!doc) return
+  prepare(doc)
+  // Images now in: the size and the background seen for the dark mode may have changed.
+  fitHeight(doc)
+  applyDark()
+}
+
+function prepare(doc: Document) {
+  if (doc === prepared || !doc.body) return
+  prepared = doc
+  clearInterval(parsedPoll)
   observer?.disconnect()
   if (!props.plain) {
     collapseHtmlQuotes(doc)
@@ -360,7 +386,13 @@ function onLoad() {
     doc.body?.insertAdjacentHTML('beforeend', '<style>html, body { height: auto !important; min-height: 0 !important; }</style>')
   }
   doc.documentElement.classList.toggle('facteur-quotes-open', quotesOpen.value)
-  if (props.highlight) markWords(doc, props.highlight)
+  if (props.highlight) {
+    try {
+      markWords(doc, props.highlight)
+    } catch {
+      // A mark that cannot be placed never keeps the message from showing.
+    }
+  }
   observer = new ResizeObserver(() => fitHeight(doc))
   observer.observe(doc.documentElement)
   fitHeight(doc)

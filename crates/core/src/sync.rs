@@ -79,6 +79,11 @@ pub struct Report {
     /// Gmail's All Mail: those whose DKIM signatures facteur checks on arrival (and a copy moved by
     /// another device, which the check tells apart).
     pub received_ids: Vec<i64>,
+    /// Given by the caller when the account has one connection for everything: how many other
+    /// requests wait for it. Between two folders, the sync then gives it up for them.
+    pub waiting: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    /// The sync stopped early for them: to be resumed.
+    pub handed_over: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,6 +278,7 @@ pub async fn sync_account_into(
     let inbox_drift = labels_model
         && all_states_inbox(store, account.id)?.is_some_and(|(name, here)| statuses.get(&name).and_then(|s| s.messages).is_some_and(|n| i64::from(n) != here));
     let mut untouched = 0;
+    let mut synced = 0;
     for state in states {
         let drift = inbox_drift && state.role == Some(Role::All);
         // Without LIST-STATUS, ask a known folder for its STATUS alone: one command instead of the three
@@ -293,6 +299,12 @@ pub async fn sync_account_into(
         let labelled = labels_model && state.role == Some(Role::All);
         let notify = state.role == Some(Role::Inbox) && !first_pass;
         let received = !first_pass && !matches!(state.role, Some(Role::Trash | Role::Junk | Role::Sent | Role::Drafts | Role::All | Role::Refused));
+        // One folder at least each time, so that the sync always gets further.
+        if synced > 0 && report.waiting.as_ref().is_some_and(|w| w.load(std::sync::atomic::Ordering::Relaxed) > 0) {
+            report.handed_over = true;
+            return Ok(());
+        }
+        synced += 1;
         let name = state.name.clone();
         match watched(&name, sync_mailbox(store, account.id, session, &caps, state, progress)).await {
             Ok((ids, changed)) => {
@@ -1474,14 +1486,18 @@ async fn load_older_labelled(store: &Store, session: &mut Session, label: &Mailb
         .collect();
     let local = store.mailbox_uids_among(all.id, &carrying)?;
     let in_flight = store.in_flight_uids(all.account_id, &all.name)?;
-    let mut missing: Vec<u32> = carrying.into_iter().filter(|u| !local.contains_key(u) && !in_flight.contains(u)).collect();
+    // Those the server will not give are left out: asked again, they would never be cached and
+    // the history fetch would go round for ever.
+    let bad: HashSet<u32> = unreadable().get(&all.id).map(|u| u.bad.clone()).unwrap_or_default();
+    let mut missing: Vec<u32> = carrying.into_iter().filter(|u| !local.contains_key(u) && !in_flight.contains(u) && !bad.contains(u)).collect();
     missing.sort_unstable_by(|a, b| b.cmp(a));
     missing.truncate(count);
     if missing.is_empty() {
         return Ok(0);
     }
-    fetch_headers(store, session, all.account_id, all.id, &mut missing, &mut |_| {}, false).await?;
-    Ok(missing.len())
+    let fetched = fetch_headers(store, session, all.account_id, all.id, &mut missing, &mut |_| {}, false).await?;
+    // What was actually cached: zero ends the fetch even when some could not be read.
+    Ok(fetched.ids.len())
 }
 
 /// Searches the server, beyond the cached window too. Uncached matches are added (newest first,

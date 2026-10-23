@@ -933,8 +933,34 @@ fn register_functions(conn: &Connection) -> rusqlite::Result<()> {
     })
 }
 
+/// Left next to the database when it was found damaged while running.
+fn damage_marker(path: &Path) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push("-damaged");
+    std::path::PathBuf::from(name)
+}
+
+/// The whole file read: a damaged page reported as a corrupt database, which the start offers to
+/// set aside.
+fn check_integrity(path: &Path) -> Result<()> {
+    let conn = Connection::open(path)?;
+    let report: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+    if report.eq_ignore_ascii_case("ok") {
+        tracing::info!("database checked after a damage report: sound");
+        return Ok(());
+    }
+    tracing::error!("database check failed: {report}");
+    Err(Error::Db(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT), Some(report))))
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
+        let marker = damage_marker(path);
+        crate::error::set_damage_marker(marker.clone());
+        if marker.exists() {
+            check_integrity(path)?;
+            let _ = std::fs::remove_file(&marker);
+        }
         let mut store = Self::init(Connection::open(path)?)?;
         match store.compact_if_wasteful() {
             Ok(Some(freed)) => tracing::info!("database compacted: {} MiB given back", freed / (1024 * 1024)),
@@ -4917,7 +4943,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     pub fn undo(
         &self,
-        ops: &[i64],
+        ops: &[(i64, String)],
         moves: &[(i64, i64, Option<u32>)],
         labels: &[(i64, Vec<i64>)],
         snoozes: &[(i64, i64)],
@@ -4925,10 +4951,14 @@ impl Store {
     ) -> Result<Undone> {
         let mut db = self.db();
         let tx = db.transaction()?;
-        let list = ops.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
-        let waiting: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM pending_ops WHERE id IN ({list})"), [], |r| r.get(0))?;
-        if waiting as usize != ops.len() {
-            return Ok(Undone::TooLate);
+        let list = ops.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(",");
+        // The same content too: SQLite gives a replayed operation's id to the next one queued, which
+        // an undo must not remove in its place.
+        for (id, op) in ops {
+            let same: bool = tx.query_row("SELECT EXISTS (SELECT 1 FROM pending_ops WHERE id = ?1 AND op = ?2)", params![id, op], |r| r.get(0))?;
+            if !same {
+                return Ok(Undone::TooLate);
+            }
         }
         if unlocked {
             // A margin, as the engine's own check: a replay starting now still sees them held.
@@ -6011,6 +6041,30 @@ mod tests {
 
     const FLAGS: ServerFlags = ServerFlags { seen: false, flagged: false, answered: false, draft: false };
 
+    #[test]
+    fn damage_found_while_running_is_checked_at_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("facteur.db");
+        drop(Store::open(&path).unwrap());
+        let marker = damage_marker(&path);
+
+        // A false alarm: the check passes and the marker goes.
+        std::fs::write(&marker, b"").unwrap();
+        drop(Store::open(&path).unwrap());
+        assert!(!marker.exists());
+
+        // A page really damaged: the start reports a damaged database (the set-aside dialog).
+        let mut bytes = std::fs::read(&path).unwrap();
+        let page = 4096;
+        for b in &mut bytes[page..page * 3] {
+            *b = 0xA5;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(&marker, b"").unwrap();
+        let err = Store::open(&path).err().expect("damaged");
+        assert!(err.is_damaged_db(), "{err:?}");
+    }
+
     fn setup() -> (Store, i64, i64, i64) {
         let s = Store::open_in_memory().unwrap();
         let srv = ServerConfig { host: "localhost".into(), port: 143, security: Security::None };
@@ -6720,8 +6774,9 @@ mod tests {
 
         // Undo is all or nothing: one operation already gone, and nothing moves.
         s.move_local(id, sent).unwrap();
-        let ops: Vec<i64> = s.pending_ops(acc).unwrap().iter().map(|p| p.id).collect();
-        assert_eq!(s.undo(&[ops[0], 9999], &[(id, inbox, Some(5))], &[], &[], false).unwrap(), Undone::TooLate);
+        let texts = [op.to_string(), serde_json::json!({ "kind": "delete_set", "mailbox": "Sent", "uids": [9] }).to_string()];
+        let ops: Vec<(i64, String)> = s.pending_ops(acc).unwrap().iter().map(|p| p.id).zip(texts).collect();
+        assert_eq!(s.undo(&[ops[0].clone(), (9999, String::new())], &[(id, inbox, Some(5))], &[], &[], false).unwrap(), Undone::TooLate);
         assert_eq!(s.location(id).unwrap().mailbox_id, sent);
         // Without the replay lock: only while all are still held (these never were).
         assert_eq!(s.undo(&ops, &[(id, inbox, Some(5))], &[], &[], true).unwrap(), Undone::Released);
@@ -6730,9 +6785,18 @@ mod tests {
         assert_eq!(s.undo(&ops, &[(id, inbox, Some(5))], &[], &[], false).unwrap(), Undone::Done);
         assert_eq!((s.location(id).unwrap().mailbox_id, s.location(id).unwrap().uid), (inbox, Some(5)));
         assert!(s.pending_ops(acc).unwrap().is_empty());
-        let held = s.push_op(acc, &serde_json::json!({ "kind": "delete_set", "mailbox": "Sent", "uids": [9] }).to_string(), "", Some(now() + 60)).unwrap();
-        assert_eq!(s.undo(&[held], &[], &[], &[], true).unwrap(), Undone::Done);
+        let text = serde_json::json!({ "kind": "delete_set", "mailbox": "Sent", "uids": [9] }).to_string();
+        let held = s.push_op(acc, &text, "", Some(now() + 60)).unwrap();
+        assert_eq!(s.undo(&[(held, text.clone())], &[], &[], &[], true).unwrap(), Undone::Done);
         assert!(s.pending_ops(acc).unwrap().is_empty());
+
+        // Replayed early, its id taken by the next operation queued: that one is not undone.
+        let first = s.push_op(acc, &text, "", Some(now() + 60)).unwrap();
+        s.finish_op(first).unwrap();
+        let pin = r#"{"kind":"store","mailbox":"Archive","uids":[3],"flag":"\\Flagged","add":true}"#;
+        assert_eq!(s.push_op(acc, pin, "", None).unwrap(), first, "SQLite reuses the id");
+        assert_eq!(s.undo(&[(first, text)], &[], &[], &[], false).unwrap(), Undone::TooLate);
+        assert_eq!(s.pending_ops(acc).unwrap().len(), 1, "the pin stays queued");
     }
 
     #[test]
@@ -7767,17 +7831,18 @@ mod tests {
         s.insert_header(acc, all, 5, &header("b@x", None, "b", 2), FLAGS, 10).unwrap();
         let moved = s.insert_header(acc, inbox, 2, &header("b@x", None, "b", 2), FLAGS, 10).unwrap();
         s.move_local(moved, all).unwrap();
-        let op = s.push_op(acc, r#"{"kind":"move_set","mailbox":"INBOX","uids":[2],"dest":"[Gmail]/All"}"#, "", Some(now() + 60)).unwrap();
+        let text = r#"{"kind":"move_set","mailbox":"INBOX","uids":[2],"dest":"[Gmail]/All"}"#.to_string();
+        let op = s.push_op(acc, &text, "", Some(now() + 60)).unwrap();
         s.drop_orphan_placeholders(all, false).unwrap();
         assert!(s.summary(moved).is_ok(), "the move can still be undone");
-        assert_eq!(s.undo(&[op], &[(moved, inbox, Some(2))], &[], &[], false).unwrap(), Undone::Done);
+        assert_eq!(s.undo(&[(op, text.clone())], &[(moved, inbox, Some(2))], &[], &[], false).unwrap(), Undone::Done);
         assert_eq!(s.location(moved).unwrap().mailbox_id, inbox);
 
         // The moved row has gone meanwhile: the undo reports it and changes nothing.
         s.move_local(moved, all).unwrap();
-        let op = s.push_op(acc, r#"{"kind":"move_set","mailbox":"INBOX","uids":[2],"dest":"[Gmail]/All"}"#, "", None).unwrap();
+        let op = s.push_op(acc, &text, "", None).unwrap();
         s.delete_message(moved).unwrap();
-        assert_eq!(s.undo(&[op], &[(moved, inbox, Some(2))], &[], &[], false).unwrap(), Undone::TooLate);
+        assert_eq!(s.undo(&[(op, text)], &[(moved, inbox, Some(2))], &[], &[], false).unwrap(), Undone::TooLate);
         assert_eq!(s.pending_ops(acc).unwrap().len(), 1, "still queued");
     }
 

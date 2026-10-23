@@ -220,7 +220,10 @@ pub struct AttachmentReport {
 
 pub fn inspect(filename: &str, declared_mime: &str, data: &[u8], message_trust: Option<Level>) -> AttachmentReport {
     let detected = Detected::of(data);
-    let extension = ext(filename);
+    // Judged as it will be saved (`safe_filename`): invisible characters and trailing dots, which
+    // the saved name loses, must not hide the extension from this check either.
+    let judged = safe_filename(filename);
+    let extension = ext(&judged);
     let e = extension.as_deref().unwrap_or("");
     let mut score: i32 = 50;
     let mut reasons = Vec::new();
@@ -243,7 +246,14 @@ pub fn inspect(filename: &str, declared_mime: &str, data: &[u8], message_trust: 
     } else if matches!(e, "html" | "htm" | "xhtml" | "shtml" | "mht" | "mhtml") {
         note(&mut score, &mut reasons, -25, tr!("Page web jointe : technique courante pour imiter une page de connexion", "Attached web page: a common trick to imitate a sign-in page"));
     }
-    let parts: Vec<&str> = filename.split('.').collect();
+    let disguised = !trapped && (filename.chars().any(invisible) || filename.trim_end() != filename.trim_end().trim_end_matches('.'));
+    if disguised {
+        note(&mut score, &mut reasons, -40, tr!(
+            "Nom de fichier truqué : caractères invisibles ou points en fin de nom, pour cacher sa vraie extension",
+            "Disguised file name: invisible characters or trailing dots, to hide its real extension"
+        ));
+    }
+    let parts: Vec<&str> = judged.split('.').collect();
     if parts.len() >= 3 && DECOYS.contains(&parts[parts.len() - 2].trim().to_ascii_lowercase().as_str()) && (program_ext || DISK_IMAGES.contains(&e)) {
         note(&mut score, &mut reasons, -30, tr!("Double extension (.{}.{e}) : se fait passer pour un document", "Double extension (.{}.{e}): pretends to be a document", parts[parts.len() - 2].trim().to_ascii_lowercase()));
     }
@@ -392,6 +402,16 @@ pub fn view_mime(filename: &str, data: &[u8]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_disguised_name_does_not_hide_a_program() {
+        for name in ["facture.pdf.js.", "facture.pdf.j\u{200B}s", "facture.pdf.js .."] {
+            let report = inspect(name, "application/octet-stream", b"WScript.Shell", None);
+            assert!(report.trust.is_low(), "{name}: {:?}", report.trust);
+            assert!(report.trust.reasons.iter().any(|r| r.text.contains(".js")), "{name}: {:?}", report.trust.reasons);
+        }
+        assert!(!inspect("rapport.pdf", "application/pdf", b"%PDF-1.7", None).trust.is_low());
+    }
 
     fn zip_with(names: &[&str], encrypted: bool) -> Vec<u8> {
         let mut out = b"PK\x03\x04".to_vec();

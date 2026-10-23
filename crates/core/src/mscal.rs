@@ -162,8 +162,39 @@ pub async fn create(token: &str, calendar_id: &str, key: &str, changes: &EventCh
 }
 
 pub async fn update(token: &str, event_id: &str, changes: &EventChanges) -> Result<Instance> {
-    let req = client()?.patch(url(&["me", "events", event_id])?).header("Content-Type", "application/json").body(serde_json::to_vec(&body(changes)?)?);
+    let mut body = body(changes)?;
+    merge_guests(token, event_id, changes, &mut body).await?;
+    let req = client()?.patch(url(&["me", "events", event_id])?).header("Content-Type", "application/json").body(serde_json::to_vec(&body)?);
     written(&write(req, token).await?)
+}
+
+/// A PATCH replaces the whole guest list: the list asked for is merged into the one Outlook holds
+/// now, so rooms (resources) and optional guests stay as they are.
+async fn merge_guests(token: &str, event_id: &str, changes: &EventChanges, body: &mut serde_json::Value) -> Result<()> {
+    if changes.attendees.is_none() {
+        return Ok(());
+    }
+    let mut read = url(&["me", "events", event_id])?;
+    read.query_pairs_mut().append_pair("$select", "attendees");
+    let current = write(client()?.get(read), token).await?;
+    let wanted: Vec<serde_json::Value> = body["attendees"].as_array().cloned().unwrap_or_default();
+    body["attendees"] = merged_guests(current["attendees"].as_array().map(Vec::as_slice).unwrap_or_default(), &wanted).into();
+    Ok(())
+}
+
+/// `current` entries that stay (rooms and resources, guests still wanted), their answer left out
+/// (read-only in Graph), then the wanted guests not there yet.
+fn merged_guests(current: &[serde_json::Value], wanted: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let email = |g: &serde_json::Value| g["emailAddress"]["address"].as_str().unwrap_or_default().to_lowercase();
+    let wanted_emails: std::collections::HashSet<String> = wanted.iter().map(email).collect();
+    let mut out: Vec<serde_json::Value> = current
+        .iter()
+        .filter(|g| g["type"].as_str() == Some("resource") || wanted_emails.contains(&email(g)))
+        .map(|g| serde_json::json!({ "emailAddress": g["emailAddress"], "type": g["type"] }))
+        .collect();
+    let present: std::collections::HashSet<String> = out.iter().map(email).collect();
+    out.extend(wanted.iter().filter(|g| !present.contains(&email(g))).cloned());
+    out
 }
 
 /// The whole series changed, as for Google (`gcal::update_series`): every date keeps its day and
@@ -172,6 +203,7 @@ pub async fn update(token: &str, event_id: &str, changes: &EventChanges) -> Resu
 pub async fn update_series(token: &str, series_id: &str, changes: &EventChanges, times: Option<(i64, i64)>) -> Result<()> {
     let http = client()?;
     let mut body = body(&EventChanges { times: None, ..changes.clone() })?;
+    merge_guests(token, series_id, changes, &mut body).await?;
     if let Some((at, length)) = times {
         let mut read = url(&["me", "events", series_id])?;
         read.query_pairs_mut().append_pair("$select", "start,isAllDay,originalStartTimeZone");
@@ -434,6 +466,21 @@ fn attendees(item: &serde_json::Value) -> Vec<crate::model::EventAttendee> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guests_merge_into_the_list_outlook_holds() {
+        let person = |a: &str, t: &str| serde_json::json!({ "emailAddress": { "address": a, "name": a }, "type": t, "status": { "response": "accepted" } });
+        let current = vec![person("ann@example.org", "optional"), person("room@example.org", "resource"), person("bob@example.org", "required")];
+        let wanted = vec![
+            serde_json::json!({ "emailAddress": { "address": "ann@example.org", "name": "Ann" }, "type": "required" }),
+            serde_json::json!({ "emailAddress": { "address": "carl@example.org", "name": "Carl" }, "type": "required" }),
+        ];
+        let merged = merged_guests(&current, &wanted);
+        let emails: Vec<&str> = merged.iter().map(|g| g["emailAddress"]["address"].as_str().unwrap()).collect();
+        assert_eq!(emails, ["ann@example.org", "room@example.org", "carl@example.org"]);
+        assert_eq!(merged[0]["type"], "optional", "kept as Outlook has it");
+        assert!(merged[0].get("status").is_none(), "read-only in Graph");
+    }
 
     #[test]
     fn maps_the_calendar_list() {

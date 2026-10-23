@@ -22,6 +22,12 @@ pub enum Error {
     /// The server closed the session or refused a command on it while the account itself is fine
     /// (too many connections, a session cut on its side): a new connection is worth one more try.
     Dropped(String),
+    /// The server refused the sign-in for a passing reason (busy, mailbox briefly out of reach):
+    /// the credentials themselves are not in question, at least for a while.
+    Refused(String),
+    /// The server could not be reached at all (no network, name not found, nothing answering):
+    /// nothing was sent, and it is only a matter of waiting.
+    Unreachable(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -54,7 +60,7 @@ impl std::fmt::Display for Error {
             Error::Mime(e) => (Some(("message invalide", "invalid message")), text(e)),
             Error::Secret(e) => (Some(("trousseau", "keychain")), text(e)),
             Error::NotFound(e) => (Some(("introuvable", "not found")), text(e)),
-            Error::Other(e) | Error::Auth(e) => (None, text(e)),
+            Error::Other(e) | Error::Auth(e) | Error::Refused(e) | Error::Unreachable(e) => (None, text(e)),
             Error::Stale(e) => (Some(("opération périmée", "stale operation")), text(e)),
             Error::Dropped(e) => (Some(("connexion coupée par le serveur", "connection dropped by the server")), text(e)),
             // What to check before sending again depends on the provider: added by the outbox
@@ -136,8 +142,25 @@ impl std::error::Error for Error {
 
 impl From<rusqlite::Error> for Error {
     fn from(e: rusqlite::Error) -> Self {
-        Error::Db(e)
+        let e = Error::Db(e);
+        if e.is_damaged_db()
+            && let Some(marker) = DAMAGE_MARKER.get()
+        {
+            // The next start checks the whole file and offers to set it aside (see `Store::open`):
+            // a page damaged while running is not seen by merely opening the database.
+            if let Err(write) = std::fs::write(marker, b"") {
+                tracing::error!("damaged database, its marker not written: {write}");
+            }
+        }
+        e
     }
+}
+
+/// The file whose presence makes the next start check the database (`Store::open`).
+static DAMAGE_MARKER: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+pub(crate) fn set_damage_marker(path: std::path::PathBuf) {
+    let _ = DAMAGE_MARKER.set(path);
 }
 
 impl From<async_imap::error::Error> for Error {
