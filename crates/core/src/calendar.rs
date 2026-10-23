@@ -466,7 +466,7 @@ pub fn parse(ics: &str) -> Option<Invite> {
     let next = (recurring && start.is_some_and(|(_, day)| !day))
         .then(|| {
             let now = chrono::Utc::now().timestamp();
-            instances(ics, now, now + 2 * 366 * 86400, &[]).into_iter().filter(|i| i.uid == uid && i.end > now).min_by_key(|i| i.start)
+            occurrence_times(ics, &uid, now, now + 2 * 366 * 86400).into_iter().filter(|(_, end)| *end > now).min_by_key(|(start, _)| *start)
         })
         .flatten();
     let address = |l: &Line| Address { name: l.param("CN").map(str::to_string).filter(|n| !n.is_empty()), email: mailto(&l.value) };
@@ -486,8 +486,8 @@ pub fn parse(ics: &str) -> Option<Invite> {
             .map(|l| Attendee { address: address(l), partstat: l.param("PARTSTAT").map(str::to_ascii_uppercase) })
             .collect(),
         recurring,
-        next_start: next.as_ref().map(|i| i.start),
-        next_end: next.as_ref().map(|i| i.end),
+        next_start: next.map(|(start, _)| start),
+        next_end: next.map(|(_, end)| end),
         sequence: get("SEQUENCE").and_then(|l| l.value.trim().parse().ok()).unwrap_or(0),
         cancelled: method == "CANCEL" || get("STATUS").is_some_and(|l| l.value.trim().eq_ignore_ascii_case("CANCELLED")),
         method,
@@ -708,7 +708,7 @@ impl<'a> Shape<'a> {
         let length = match (start, end) {
             (Stamp::Date(s), Some(Stamp::Date(e))) => Length::Days((e - s).num_days().max(1)),
             (Stamp::Date(_), _) => Length::Days(dur.map_or(1, |(d, s)| (d + s.div_euclid(86400)).max(1))),
-            (_, Some(e)) => Length::Timed { days: 0, secs: (e.timestamp()? - start.timestamp()?).max(0) },
+            (_, Some(e)) => Length::Timed { days: 0, secs: (e.timestamp()? - start.timestamp()?).clamp(0, MAX_DURATION_DAYS * 86400) },
             (_, None) => dur.map_or(Length::Timed { days: 0, secs: 0 }, |(days, secs)| Length::Timed { days, secs }),
         };
         let transparent = get("TRANSP").is_some_and(|l| l.value.trim().eq_ignore_ascii_case("TRANSPARENT"));
@@ -872,19 +872,42 @@ pub(crate) fn meeting_link<'a>(texts: impl IntoIterator<Item = &'a str>) -> Opti
 /// here (see [`Rule`] for what is understood), and overridden occurrences are replaced.
 /// `me`: the account's addresses (an event they declined does not take the time).
 pub fn instances(ics: &str, from: i64, to: i64, me: &[String]) -> Vec<Instance> {
+    let mut out = Vec::new();
+    expand(ics, from, to, me, None, |shape, uid, key, at, recurring| out.extend(shape.instance(uid, key, at, recurring)));
+    // A zero-length event at `from` still counts.
+    out.retain(|i| i.start < to && (i.end > from || i.start >= from));
+    out
+}
+
+/// The (start, end) of the event `uid`'s occurrences between `from` and `to`, without building
+/// them (their texts and guests copied for each).
+fn occurrence_times(ics: &str, uid: &str, from: i64, to: i64) -> Vec<(i64, i64)> {
+    let mut out = Vec::new();
+    expand(ics, from, to, &[], Some(uid), |shape, _, _, at, _| {
+        if let (Some(start), Some(end)) = (at.timestamp(), shape.end(at, shape.length)) {
+            out.push((start, end));
+        }
+    });
+    out.retain(|(start, end)| *start < to && (*end > from || *start >= from));
+    out
+}
+
+/// Each occurrence of the object's events (of `only` alone, when given) that may fall between
+/// `from` and `to`: its block's shape, uid, key (empty for a single event), start and whether it
+/// belongs to a series.
+fn expand(ics: &str, from: i64, to: i64, me: &[String], only: Option<&str>, mut emit: impl FnMut(&Shape, &str, String, Stamp, bool)) {
     let lines: Vec<Line> = unfold(ics).iter().filter_map(|l| parse_line(l)).collect();
     let zones = Zones::read(&lines);
-    let blocks = event_blocks(&lines);
-    let mut out = Vec::new();
-    let mut overridden: HashSet<(String, i64)> = HashSet::new();
     let uid_of = |b: &[Line]| b.iter().find(|l| l.name == "UID").map(|l| l.value.trim().to_string());
+    let blocks: Vec<Vec<Line>> = event_blocks(&lines).into_iter().filter(|b| only.is_none_or(|u| uid_of(b).as_deref() == Some(u))).collect();
+    let mut overridden: HashSet<(String, i64)> = HashSet::new();
     // Overrides first: the series skips the occurrences they replace.
     for block in &blocks {
         let (Some(uid), Some(rid)) = (uid_of(block), block.iter().find(|l| l.name == "RECURRENCE-ID")) else { continue };
         let Some(shape) = Shape::read_for(block, &zones, me) else { continue };
         let Some(original) = stamp_of(rid, &zones).map(|s| s.in_zone_of(shape.start)).and_then(Stamp::timestamp) else { continue };
         overridden.insert((uid.clone(), original));
-        out.extend(shape.instance(&uid, original.to_string(), shape.start, true));
+        emit(&shape, &uid, original.to_string(), shape.start, true);
     }
     for block in &blocks {
         if block.iter().any(|l| l.name == "RECURRENCE-ID") {
@@ -894,7 +917,7 @@ pub fn instances(ics: &str, from: i64, to: i64, me: &[String]) -> Vec<Instance> 
         let rule = shape.get("RRULE").map(|l| Rule::parse(&l.value));
         let extra: Vec<Stamp> = block.iter().filter(|l| l.name == "RDATE").flat_map(|l| stamps_of(l, &zones)).collect();
         if rule.is_none() && extra.is_empty() {
-            out.extend(shape.instance(&uid, String::new(), shape.start, false));
+            emit(&shape, &uid, String::new(), shape.start, false);
             continue;
         }
         let excluded: HashSet<i64> = block
@@ -917,12 +940,9 @@ pub fn instances(ics: &str, from: i64, to: i64, me: &[String]) -> Vec<Instance> 
             if ts < after || ts >= to || excluded.contains(&ts) || overridden.contains(&(uid.clone(), ts)) || !seen.insert(ts) {
                 continue;
             }
-            out.extend(shape.instance(&uid, ts.to_string(), at, true));
+            emit(&shape, &uid, ts.to_string(), at, true);
         }
     }
-    // A zero-length event at `from` still counts.
-    out.retain(|i| i.start < to && (i.end > from || i.start >= from));
-    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -948,8 +968,11 @@ struct Rule {
     by_month: Vec<u32>,
 }
 
-/// Safety bound on the periods walked through (the walk also stops at the end of the window).
+/// Safety bound on the periods walked through, and on the days looked at in them (the walk also
+/// stops at the end of the window).
 const MAX_PERIODS: i64 = 200_000;
+/// BYDAY entries a rule may name: the 7 days, with an ordinal or not, are far fewer in practice.
+const MAX_BY_DAY: usize = 64;
 /// For a VTIMEZONE's change rule, computed for each zone an invitation carries: a real one
 /// changes yearly from 1601 at the earliest, and a rule with COUNT is walked from its start.
 const ZONE_PERIODS: i64 = 5_000;
@@ -1037,6 +1060,17 @@ impl Rule {
             }
         }
         rule.freq = freq?;
+        // As many as can mean something, each once: a crafted list (2,000 × MO) would make each
+        // period cost thousands of computations.
+        rule.by_day.sort_by_key(|(ord, wd)| (*ord, wd.num_days_from_monday()));
+        rule.by_day.dedup();
+        rule.by_month_day.sort_unstable();
+        rule.by_month_day.dedup();
+        rule.by_month.sort_unstable();
+        rule.by_month.dedup();
+        if rule.by_day.len() > MAX_BY_DAY || rule.by_month_day.len() > 62 {
+            return None;
+        }
         // Ordinals only make sense within a month here.
         let ordinals = rule.by_day.iter().any(|(o, _)| o.is_some());
         if ordinals && !(rule.freq == Freq::Monthly || (rule.freq == Freq::Yearly && !rule.by_month.is_empty())) {
@@ -1176,11 +1210,17 @@ impl Rule {
         };
         let mut found = 1;
         let mut out = if wanted(start) { vec![start] } else { vec![] };
+        // Days looked at, whatever the periods hold (a yearly rule naming every day has 365).
+        let mut looked = 0;
         'periods: for k in skip..skip.saturating_add(max_periods) {
             if self.period_start(first.date(), k).is_none_or(|d| d > last_day) {
                 break;
             }
             for day in self.period(first.date(), k) {
+                looked += 1;
+                if looked > max_periods {
+                    break 'periods;
+                }
                 let at = start.with(day.and_time(first.time()));
                 if at.naive() <= first {
                     continue;
@@ -1330,7 +1370,8 @@ impl EventChanges {
             location: (location != clean(old.location.as_deref())).then_some(location),
             description: (description != clean(old.description.as_deref())).then_some(description),
             times,
-            zone: zone.filter(|_| times.is_some()),
+            // Kept even with the times unchanged: a series rebuilt for its repetition stays in it.
+            zone,
             reminders,
             // Guests invited already keep their answer.
             attendees: draft.attendees.as_ref().map(|list| {
@@ -1354,7 +1395,7 @@ impl EventChanges {
         }
     }
 
-    /// Whether the times are written in another zone than `old`'s.
+    /// Whether the times are written in another zone than `old`'s (given with the times only).
     pub fn rezoned(&self, old: &crate::model::CalendarEvent) -> bool {
         self.times.is_some_and(|(_, _, all_day)| !all_day) && self.zone.is_some() && self.zone != old.zone
     }
@@ -1378,8 +1419,9 @@ impl EventChanges {
         self.attendees.iter().flatten().filter(|a| !a.organizer).collect()
     }
 
+    /// Nothing to write: the zone alone is no change (it goes with the times).
     pub fn is_empty(&self) -> bool {
-        *self == EventChanges::default()
+        EventChanges { zone: None, ..self.clone() } == EventChanges::default()
     }
 }
 
@@ -1819,9 +1861,14 @@ pub fn first_day(start: i64, end: i64, all_day: bool, zone: Option<&str>) -> Opt
     if all_day {
         return days_of(start, end).map(|d| d.0);
     }
+    day_in(start, zone)
+}
+
+/// The day an instant falls on in an event's zone (`None`: the computer's).
+pub fn day_in(t: i64, zone: Option<&str>) -> Option<NaiveDate> {
     match zone.and_then(zone_named) {
-        Some((_, tz)) => Zone::Named(tz).wall(start).map(|w| w.date()),
-        None => local_date(start),
+        Some((_, tz)) => Zone::Named(tz).wall(t).map(|w| w.date()),
+        None => local_date(t),
     }
 }
 
@@ -1979,6 +2026,13 @@ pub fn edit_series(ics: &str, changes: &EventChanges, current: (i64, i64, bool),
                 add.extend(new.map(|v| text_line(name, &v)));
             }
         }
+        // Reminders and guests are the series' own: the occurrences changed alone keep theirs.
+        if master_block {
+            let others = EventChanges { reminders: changes.reminders.clone(), attendees: changes.attendees.clone(), ..Default::default() };
+            let (more_drop, more_add) = text_changes(&others, block);
+            drop.extend(more_drop);
+            add.extend(more_add);
+        }
         if changes.times.is_some() && delta != 0 || (master_block && changes.times.is_some()) {
             let props = own_props(block);
             for (_, l) in &props {
@@ -2051,10 +2105,12 @@ pub fn series_rule(ics: &str) -> Option<(Option<String>, NaiveDate)> {
         Part::Event(b) if !is_override(b) => Some(b),
         _ => None,
     })?;
-    let first = local_date(series.start?.timestamp()?)?;
+    // The first day in the series' own zone, as the form and series_first read it; the
+    // computer's for one in UTC or floating.
     let first = match series.start? {
         Stamp::Date(d) => d,
-        _ => first,
+        Stamp::Time(t, Zone::Named(tz)) if event_zone(tz.name()).is_some() => t.date(),
+        start => local_date(start.timestamp()?)?,
     };
     Some((prop(master, "RRULE").map(|l| l.value.trim().to_string()), first))
 }
@@ -2329,6 +2385,65 @@ BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-P0DT0H10M0S\r\nEND:VALARM\r\nEND:VEVE
         assert_eq!(EventChanges::all(&crate::model::EventDraft { all_day: true, ..draft.clone() }).zone, None);
         assert_eq!(event_zone("Romance Standard Time").as_deref(), Some("Europe/Paris"));
         assert_eq!(event_zone("UTC"), None);
+    }
+
+    #[test]
+    fn crafted_rules_in_an_invitation_are_read_quickly() {
+        let started = std::time::Instant::now();
+        // 2,000 × MO in BYDAY counts once; a hundred distinct ordinals are no rule anyone writes.
+        let mondays = vec!["MO"; 2000].join(",");
+        assert!(Rule::parse(&format!("FREQ=YEARLY;COUNT=999999999;BYDAY={mondays}")).is_some_and(|r| r.by_day.len() == 1));
+        let ordinals: Vec<String> = (1..=53).flat_map(|n| [format!("{n}MO"), format!("-{n}TU")]).collect();
+        assert!(Rule::parse(&format!("FREQ=MONTHLY;BYDAY={}", ordinals.join(","))).is_none());
+        assert!(Rule::parse("FREQ=WEEKLY;BYDAY=MO,MO,TU").is_some_and(|r| r.by_day.len() == 2), "repeats count once");
+        // Custom zones changing on every day of the year since year 1, with COUNT: bounded.
+        let mut ics = String::from("BEGIN:VCALENDAR\r\n");
+        for i in 0..32 {
+            ics.push_str(&format!(
+                "BEGIN:VTIMEZONE\r\nTZID:x{i}\r\nBEGIN:STANDARD\r\nDTSTART:00010101T000000\r\n\
+RRULE:FREQ=YEARLY;COUNT=999999999;BYDAY=MO,TU,WE,TH,FR,SA,SU\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0200\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n"
+            ));
+        }
+        // A daily series from 1500 that never ends, with a long text: the next date only.
+        let description = "x".repeat(200_000);
+        ics.push_str(&format!(
+            "BEGIN:VEVENT\r\nUID:big\r\nDTSTART;TZID=x1:15000101T090000\r\nDTEND:99991231T100000Z\r\nRRULE:FREQ=DAILY\r\n\
+SUMMARY:Spam\r\nDESCRIPTION:{description}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        ));
+        let invite = parse(&ics).unwrap();
+        assert!(invite.recurring);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_series_in_another_zone_stays_in_it() {
+        use crate::repeat::{Freq, Repeat};
+        // Mondays 06:00 in Tokyo: Sunday evening in Europe and America.
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:t1\r\nDTSTAMP:20261001T000000Z\r\n\
+DTSTART;TZID=Asia/Tokyo:20261019T060000\r\nDTEND;TZID=Asia/Tokyo:20261019T070000\r\nRRULE:FREQ=WEEKLY;BYDAY=MO\r\n\
+SUMMARY:Point\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        // The first day is the series' own, whatever the computer's zone.
+        let monday = chrono::NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        assert_eq!(series_rule(ics).unwrap().1, monday);
+        let start = Zone::Named(chrono_tz::Asia::Tokyo).timestamp(monday.and_hms_opt(6, 0, 0).unwrap()).unwrap();
+        let old = crate::model::CalendarEvent { start, end: start + 3600, zone: Some("Asia/Tokyo".into()), summary: "Point".into(), reminders: vec![10], recurring: true, ..Default::default() };
+
+        // Only the repetition changed: the zone goes with the rebuilt series, not the computer's.
+        let weekly = Repeat { freq: Freq::Weekly, interval: 1, weekdays: vec![0, 2], by_weekday: false, until: None, count: None };
+        let draft = crate::model::EventDraft { summary: "Point".into(), start, end: start + 3600, zone: Some("Asia/Tokyo".into()), repeat: Some(weekly.clone()), ..Default::default() };
+        let changes = EventChanges::between(&old, &draft);
+        assert!(changes.times.is_none() && changes.is_empty() && changes.zone.as_deref() == Some("Asia/Tokyo"));
+        let (first_start, first_end, day) = series_first(monday, start, &draft).unwrap();
+        assert_eq!((first_start, day), (start, monday));
+        let rebuilt = rebuild_series(ics, &changes, (first_start, first_end, false), Some(&weekly), 1_792_400_000).unwrap();
+        assert!(rebuilt.contains("DTSTART;TZID=Asia/Tokyo:20261019T060000\r\n") && rebuilt.contains("BYDAY=MO,WE"), "{rebuilt}");
+
+        // The whole series' reminders and guests change with it (CalDAV), not only its texts.
+        let guest = crate::model::EventAttendee { email: "marie@example.org".into(), ..Default::default() };
+        let changes = EventChanges { reminders: Some(vec![30]), attendees: Some(vec![guest]), ..Default::default() };
+        let out = edit_series(ics, &changes, (old.start, old.end, false), 1_792_400_100).unwrap();
+        assert!(out.contains("TRIGGER:-PT30M\r\n") && !out.contains("TRIGGER:-PT10M"), "{out}");
+        assert!(out.replace("\r\n ", "").contains("mailto:marie@example.org"), "{out}");
     }
 
     #[test]

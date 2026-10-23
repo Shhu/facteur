@@ -158,11 +158,13 @@ pub async fn flush(store: &Store, account_id: i64, session: &mut Session, caps: 
             held = true;
             continue;
         }
-        let op: Op = match serde_json::from_str(&store.op_payload(pending.id)?.unwrap_or_default()) {
+        // Read again: the id listed may since belong to another operation.
+        let Some(payload) = store.replay_payload(pending.id, now)? else { continue };
+        let op: Op = match serde_json::from_str(&payload) {
             Ok(op) => op,
             Err(e) => {
                 tracing::error!("unreadable operation dropped: {e}");
-                store.finish_op(pending.id)?;
+                store.finish_replayed(pending.id, &payload)?;
                 continue;
             }
         };
@@ -199,12 +201,12 @@ pub async fn flush(store: &Store, account_id: i64, session: &mut Session, caps: 
         }
         match bounded(op.timeout_secs(), &what, apply(session, caps, &op, pending.tried, &protected)).await {
             Ok(()) => {
-                store.finish_op(pending.id)?;
+                store.finish_replayed(pending.id, &payload)?;
                 done += 1;
             }
             Err(Error::Stale(why)) => {
                 tracing::warn!("operation dropped: {why}");
-                store.finish_op(pending.id)?;
+                store.finish_replayed(pending.id, &payload)?;
                 recheck_folders(store, account_id, &op);
             }
             Err(e) => match refused(&e) {
@@ -219,13 +221,13 @@ pub async fn flush(store: &Store, account_id: i64, session: &mut Session, caps: 
                         ),
                         _ => (msg, MAX_ATTEMPTS),
                     };
-                    if store.refuse_op(pending.id, &msg, max)? {
+                    if store.refuse_replayed(pending.id, &payload, &msg, max)? {
                         recheck_folders(store, account_id, &op);
                     }
                 }
                 None => {
                     // Kept for the queue details: in both languages, as far as the error's own words go.
-                    store.fail_op(pending.id, &crate::i18n::both(|| e.to_string()), MAX_NETWORK_ATTEMPTS)?;
+                    store.fail_replayed(pending.id, &payload, &crate::i18n::both(|| e.to_string()), MAX_NETWORK_ATTEMPTS)?;
                     if pending.attempts + 1 >= MAX_NETWORK_ATTEMPTS {
                         recheck_folders(store, account_id, &op);
                     }

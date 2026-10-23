@@ -623,7 +623,8 @@ pub fn parse_draft(raw: &[u8]) -> Result<DraftParts> {
         .parse(raw)
         .ok_or_else(|| Error::Mime(crate::tr!("brouillon illisible", "unreadable draft")))?;
     let list = |a: Option<&mail_parser::Address>| addresses(a).iter().map(crate::store::format_address).collect();
-    let html_body = msg.body_html(0).filter(|_| msg.html_bodies().any(|p| p.is_text_html()));
+    // Every body part, as the reader joins them: Apple Mail puts text after an inline photo.
+    let html_body = html_body(&msg);
     let cids = inline_cids(&msg, html_body.as_deref());
     let (rich, shown) = match html_body {
         Some(h) => {
@@ -649,7 +650,7 @@ pub fn parse_draft(raw: &[u8]) -> Result<DraftParts> {
         cc: list(msg.cc()),
         bcc: list(msg.bcc()),
         subject: msg.subject().unwrap_or_default().to_string(),
-        body: msg.body_text(0).map(|t| t.into_owned()).unwrap_or_default(),
+        body: joined_text(msg.text_bodies()).unwrap_or_default(),
         html: rich.clone(),
         message_id: msg.message_id().map(str::to_string),
         in_reply_to,
@@ -658,13 +659,9 @@ pub fn parse_draft(raw: &[u8]) -> Result<DraftParts> {
         attachments: msg
             .attachments()
             .filter(|p| !inline(p))
-            .map(|p| crate::model::OutgoingAttachment {
-                filename: p.attachment_name().unwrap_or("sans-nom").to_string(),
-                mime: p
-                    .content_type()
-                    .map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or("octet-stream")))
-                    .unwrap_or_else(|| "application/octet-stream".into()),
-                data: B64.encode(p.contents()),
+            .map(|p| {
+                let (mime, data) = attachment_file(raw, p);
+                crate::model::OutgoingAttachment { filename: p.attachment_name().unwrap_or("sans-nom").to_string(), mime, data: B64.encode(data) }
             })
             .collect(),
     })
@@ -678,11 +675,17 @@ pub fn attachment(raw: &[u8], index: usize) -> Result<(String, String, Vec<u8>)>
         .attachments()
         .nth(index)
         .ok_or_else(|| Error::NotFound(crate::tr!("pièce jointe {index}", "attachment {index}")))?;
+    let (mime, data) = attachment_file(raw, part);
+    Ok((part.attachment_name().unwrap_or("sans-nom").to_string(), mime, data))
+}
+
+/// An attachment as a file: its type and its bytes as sent. mail-parser hands text parts over as
+/// UTF-8 (transcoded from their charset, or with U+FFFD for the bytes that are not UTF-8), which
+/// would change the file: a reopened draft would save a CSV in Windows-1252 damaged.
+fn attachment_file(raw: &[u8], part: &mail_parser::MessagePart) -> (String, Vec<u8>) {
     let mut mime = part_mime(part);
     let data = match &part.body {
         PartType::Message(m) => m.raw_message().to_vec(),
-        // mail-parser hands text parts over as UTF-8 (transcoded from their charset, or with
-        // U+FFFD for the bytes that are not UTF-8): the file is the bytes as sent.
         PartType::Text(_) | PartType::Html(_) => match original_bytes(raw, part) {
             Some(bytes) => {
                 // Labelled with their charset, for the viewer and a forwarded copy. Only a plain
@@ -697,7 +700,7 @@ pub fn attachment(raw: &[u8], index: usize) -> Result<(String, String, Vec<u8>)>
         },
         _ => part.contents().to_vec(),
     };
-    Ok((part.attachment_name().unwrap_or("sans-nom").to_string(), mime, data))
+    (mime, data)
 }
 
 pub fn mime_charset(mime: &str) -> Option<&str> {
@@ -1603,6 +1606,22 @@ Content-Type: multipart/mixed; boundary=\"m\"\r\n\r\n\
     }
 
     #[test]
+    fn a_reopened_draft_keeps_its_text_attachments_as_they_were() {
+        // A CSV in Windows-1252 with no charset said: 0xE9 is "é", not UTF-8.
+        let csv: &[u8] = b"nom;ville\r\nAndr\xe9;Lyon\r\n";
+        let mut raw = b"From: a@example.org\r\nSubject: Fichier\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"m\"\r\n\r\n\
+--m\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nCi-joint.\r\n\
+--m\r\nContent-Type: text/csv; name=\"liste.csv\"\r\nContent-Disposition: attachment; filename=\"liste.csv\"\r\n\r\n"
+            .to_vec();
+        raw.extend_from_slice(csv);
+        raw.extend_from_slice(b"\r\n--m--\r\n");
+        let draft = parse_draft(&raw).unwrap();
+        let file = B64.decode(&draft.attachments[0].data).unwrap();
+        assert_eq!(file.strip_suffix(b"\r\n").unwrap_or(&file), csv.strip_suffix(b"\r\n").unwrap());
+        assert!(draft.attachments[0].mime.starts_with("text/csv"));
+    }
+
+    #[test]
     fn text_after_an_inline_attachment_is_kept() {
         // Apple Mail: a PDF in the middle of an HTML message, the text going on below it.
         let apple = "From: a@example.org\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"a\"\r\n\r\n\
@@ -1632,6 +1651,11 @@ Content-Type: multipart/mixed; boundary=\"m\"\r\n\r\n\
         let info = body_info(ios.as_bytes());
         assert!(info.text.contains("Here is the photo:") && info.text.contains("The code is 1234."), "{}", info.text);
         assert!(info.preview.contains("The code is 1234."));
+        // The same, reopened as a draft: nothing after the photo is lost.
+        let draft = parse_draft(ios.as_bytes()).unwrap();
+        assert!(draft.body.contains("Here is the photo:") && draft.body.contains("The code is 1234."), "{}", draft.body);
+        let draft = parse_draft(apple.as_bytes()).unwrap();
+        assert!(draft.html.as_deref().is_some_and(|h| h.contains("The price is 40 euros.")), "{:?}", draft.html);
 
         // The same photo between two HTML parts is shown where it was, not as an attachment.
         let html = ios.replace("text/plain", "text/html");

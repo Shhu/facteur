@@ -127,22 +127,41 @@ pub fn read_manifest(account_dir: &Path) -> Option<Manifest> {
     Some(manifest)
 }
 
+/// A long job's session: on an account limited to one connection, given over between two folders
+/// to whoever waits for it (opening a message, a sync), then taken again.
+#[allow(async_fn_in_trait)]
+pub trait Lease {
+    fn session(&mut self) -> &mut Session;
+    async fn give_way(&mut self) -> Result<()>;
+}
+
+impl Lease for Session {
+    fn session(&mut self) -> &mut Session {
+        self
+    }
+
+    async fn give_way(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
 pub async fn backup_account(
-    session: &mut Session,
+    lease: &mut impl Lease,
     email: &str,
     root: &Path,
     mut progress: impl FnMut(Progress),
 ) -> Result<BackupStats> {
     let mut stats = BackupStats::default();
     let mut folders = Vec::new();
-    let listed: Vec<_> = imap::list_mailboxes(session).await?.into_iter().filter(|l| l.selectable).collect();
+    let listed: Vec<_> = imap::list_mailboxes(lease.session()).await?.into_iter().filter(|l| l.selectable).collect();
     std::fs::create_dir_all(root)?;
     let sep = info_sep(root);
     let paths = unique_paths(root, &listed.iter().map(|l| (l.name.as_str(), l.delimiter.as_deref())).collect::<Vec<_>>());
     for (listed, rel) in listed.iter().zip(paths) {
         let dir = root.join(&rel);
         let place = Place { root, dir: &dir, rel: &index::rel_path(root, &dir), sep };
-        let count = backup_folder(session, &listed.name, listed.delimiter.as_deref(), &place, &mut stats, &mut progress).await?;
+        lease.give_way().await?;
+        let count = backup_folder(lease.session(), &listed.name, listed.delimiter.as_deref(), &place, &mut stats, &mut progress).await?;
         stats.folders += 1;
         stats.messages += count;
         folders.push(FolderSummary {
@@ -633,7 +652,7 @@ fn without_delimiter(name: &str, delim: &str) -> String {
 }
 
 pub async fn restore(
-    session: &mut Session,
+    lease: &mut impl Lease,
     root: &Path,
     selection: Selection,
     target: RestoreTarget,
@@ -642,7 +661,7 @@ pub async fn restore(
 ) -> Result<RestoreStats> {
     // Target server's delimiter and namespace (« INBOX.xxx » on Courier/Cyrus).
     let what = crate::tr!("restauration", "restore");
-    let listed = bounded(120, &what, imap::list_mailboxes(session)).await?;
+    let listed = bounded(120, &what, imap::list_mailboxes(lease.session())).await?;
     let delim = listed.iter().find_map(|l| l.delimiter.clone()).unwrap_or_else(|| "/".into());
     let under_inbox = listed
         .iter()
@@ -672,6 +691,8 @@ pub async fn restore(
     // APPENDs refused before the continuation, one after the other.
     let mut refused_in_row = 0;
     for (folder, items) in groups {
+        lease.give_way().await?;
+        let session = lease.session();
         let info = &selection.folders[&folder];
         // A segment holding the target's delimiter ("v1.2" from a '/' server to a '.' one)
         // would otherwise gain a level.

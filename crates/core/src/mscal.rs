@@ -254,11 +254,12 @@ pub async fn update_series(token: &str, series_id: &str, changes: &EventChanges,
 /// A series' recurrence (`Null` when it does not repeat) and its first day, here.
 pub async fn series_rule(token: &str, series_id: &str) -> Result<(serde_json::Value, chrono::NaiveDate)> {
     let mut read = url(&["me", "events", series_id])?;
-    read.query_pairs_mut().append_pair("$select", "start,isAllDay,recurrence");
+    read.query_pairs_mut().append_pair("$select", "start,isAllDay,recurrence,originalStartTimeZone");
     let master = write(client()?.get(read), token).await?;
     let all_day = master["isAllDay"].as_bool() == Some(true);
+    let zone = master["originalStartTimeZone"].as_str().and_then(crate::calendar::event_zone);
     let first = time(&master["start"], all_day).and_then(|t| {
-        if all_day { chrono::DateTime::from_timestamp(t, 0).map(|d| d.date_naive()) } else { crate::calendar::local_date(t) }
+        if all_day { chrono::DateTime::from_timestamp(t, 0).map(|d| d.date_naive()) } else { crate::calendar::day_in(t, zone.as_deref()) }
     });
     let first = first.ok_or_else(|| Error::Other(crate::tr!("Agenda Outlook : série illisible", "Outlook calendar: unreadable series")))?;
     Ok((master["recurrence"].clone(), first))

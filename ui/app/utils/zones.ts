@@ -28,17 +28,23 @@ function offset(ms: number, zone: string): number {
   return Date.UTC(w.y, w.m - 1, w.d, w.h, w.min, w.s) - Math.floor(ms / 1000) * 1000
 }
 
-/** The wall clock of `zone` at an instant (Unix seconds), as a local Date showing those figures:
- *  for the form's date and time fields. */
-export function wallDate(unix: number, zone: string): Date {
+const two = (n: number) => String(n).padStart(2, '0')
+
+/** The wall clock of `zone` at an instant (Unix seconds), as the form's fields write it
+ *  ("2026-10-20", "14:00"). Kept as figures: a local Date would shift a time the computer's own
+ *  clock skips. */
+export function wallFields(unix: number, zone: string): { date: string, time: string } {
   const w = wallParts(unix * 1000, zone)
-  return new Date(w.y, w.m - 1, w.d, w.h, w.min)
+  return { date: `${w.y}-${two(w.m)}-${two(w.d)}`, time: `${two(w.h)}:${two(w.min)}` }
 }
 
-/** The instant (Unix seconds) a wall clock (a local Date's figures) shows in `zone`. A time
+/** The instant (Unix seconds) the form's fields show in `zone`; `null` when unreadable. A time
  *  skipped by a change of clocks is read as after it. */
-export function instantOf(wall: Date, zone: string): number {
-  const asUtc = Date.UTC(wall.getFullYear(), wall.getMonth(), wall.getDate(), wall.getHours(), wall.getMinutes())
+export function instantAt(date: string, time: string, zone: string): number | null {
+  const [y, m, d] = date.split('-').map(Number)
+  const [h, min] = time.split(':').map(Number)
+  if (!y || !m || !d || h === undefined || min === undefined || Number.isNaN(h) || Number.isNaN(min)) return null
+  const asUtc = Date.UTC(y, m - 1, d, h, min)
   let ms = asUtc - offset(asUtc, zone)
   ms = asUtc - offset(ms, zone)
   return Math.round(ms / 1000)

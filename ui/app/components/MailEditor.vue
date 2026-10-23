@@ -3,6 +3,14 @@ import type { Editor } from '@tiptap/vue-3'
 import type { DropdownMenuItem, EditorCustomHandlers, EditorToolbarItem } from '@nuxt/ui'
 
 const html = defineModel<string>({ required: true })
+/** What UEditor is given: the model as it comes from outside. In the composer it is written back
+ *  only by `flush`, so typing does not turn a long quoted thread into HTML at every key. */
+const shown = ref(html.value)
+watch(html, (v) => {
+  if (v !== written) shown.value = v
+})
+/** The HTML this editor wrote out last (its own echo is not content to set again). */
+let written: string | null = null
 const props = withDefaults(defineProps<{
   /** `start`: cursor at the start (reply, above the quote). */
   autofocus?: 'start' | 'end' | boolean
@@ -20,8 +28,9 @@ const props = withDefaults(defineProps<{
   /** Bytes the message already takes outside the editor (attachments). */
   usedBytes?: number
 }>(), { autofocus: false, placeholder: undefined, compact: false, maxImageWidth: undefined, touch: false, composer: false, moreItems: () => [], readonly: false, maxBytes: undefined, usedBytes: 0 })
-/** `files`: non-image files dropped on the editor (to attach). */
-const emit = defineEmits<{ text: [value: string], files: [files: File[]] }>()
+/** `files`: non-image files dropped on the editor (to attach). `changed`: an edit, in the
+ *  composer, before its HTML and text are written out (see `flush`). */
+const emit = defineEmits<{ text: [value: string], files: [files: File[]], changed: [] }>()
 const { t } = useI18n()
 const toast = useToast()
 
@@ -160,15 +169,44 @@ const isImage = (f: File) => f.type.startsWith('image/')
 // directly instead (plain-text version of the mail, target of pasted and dropped images).
 const editorRef = useTemplateRef<{ editor?: Editor }>('editorRef')
 const emitText = (e: Pick<Editor, 'getText'>) => emit('text', e.getText({ blockSeparator: '\n' }))
+/** An edit not yet written out (composer). */
+let pending = false
+let idle: ReturnType<typeof setTimeout> | undefined
+/** The HTML and the plain text written out now, if an edit waits. */
+function flush() {
+  clearTimeout(idle)
+  const e = editorRef.value?.editor
+  if (!pending || !e) return
+  pending = false
+  written = e.getHTML()
+  html.value = written
+  emitText(e)
+}
 watch(() => editorRef.value?.editor, (e, _, onCleanup) => {
   current = e ?? null
   if (!e) return
   if (props.readonly) e.setEditable(false)
   emitText(e)
-  const onUpdate = () => emitText(e)
+  let onUpdate: () => void
+  if (props.composer) {
+    // UEditor's own listener (the editor's `onUpdate` option) writes the whole HTML at every
+    // key: taken off alone, the extensions keep theirs. The edit is only noted, and written out
+    // after a pause or when the composer asks (save, send, close).
+    e.off('update', e.options.onUpdate)
+    onUpdate = () => {
+      pending = true
+      emit('changed')
+      clearTimeout(idle)
+      idle = setTimeout(flush, 700)
+    }
+  } else {
+    // A signature: short, written out by UEditor itself (v-model).
+    onUpdate = () => emitText(e)
+  }
   e.on('update', onUpdate)
   onCleanup(() => {
     e.off('update', onUpdate)
+    clearTimeout(idle)
     if (current === e) current = null
   })
 }, { immediate: true })
@@ -177,7 +215,8 @@ watch(() => editorRef.value?.editor, (e, _, onCleanup) => {
 defineExpose({
   insert(content: string) {
     current?.chain().focus().insertContent(content).run()
-  }
+  },
+  flush
 })
 
 // Read-only while the message is being sent: what is sent is what is shown.
@@ -375,7 +414,7 @@ const toolbar = computed(() => {
       v-if="composer"
       ref="editorRef"
       v-slot="{ editor }"
-      v-model="html"
+      :model-value="shown"
       content-type="html"
       :autofocus="autofocus"
       :handlers="handlers"

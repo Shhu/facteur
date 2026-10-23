@@ -430,7 +430,25 @@ fn settled(store: &Store, account_id: i64, state: &MailboxState, caps: &Caps) ->
     if restoring().contains_key(&state.id) || store.moves_pending_into(state.id)? || !store.in_flight_uids(account_id, &state.name)?.is_empty() {
         return Ok(false);
     }
-    store.folder_settled(state.id, prefetched(store, state)?, PREFETCH_MAX_SIZE, crate::store::now() - PREFETCH_DAYS * 86_400)
+    if !store.folder_settled(state.id, false, PREFETCH_MAX_SIZE, 0)? {
+        return Ok(false);
+    }
+    // Bodies still to fetch, but for those the server would not send.
+    if !prefetched(store, state)? {
+        return Ok(true);
+    }
+    let since = crate::store::now() - PREFETCH_DAYS * 86_400;
+    let missing = store.missing_bodies(state.id, PREFETCH_BODIES, PREFETCH_MAX_SIZE, since)?;
+    let unsent = unsent_bodies().lock().unwrap_or_else(|e| e.into_inner()).get(&state.id).cloned().unwrap_or_default();
+    Ok(missing.iter().all(|(_, uid, _)| unsent.contains(uid)))
+}
+
+/// Per folder, the bodies a prefetch asked for and the server did not send (a damaged message,
+/// Gmail's "Some messages could not be FETCHed"): not asked again until a restart, and no reason
+/// for the folder to be opened at each sync.
+fn unsent_bodies() -> &'static std::sync::Mutex<HashMap<i64, HashSet<u32>>> {
+    static UNSENT: std::sync::OnceLock<std::sync::Mutex<HashMap<i64, HashSet<u32>>>> = std::sync::OnceLock::new();
+    UNSENT.get_or_init(Default::default)
 }
 
 /// Not the bin, junk, nor All Mail (which copies the other folders) unless Gmail's labels make
@@ -875,7 +893,9 @@ async fn refresh_flags(
     // A message the server always refuses (Gmail's "Some messages could not be FETCHed") would make
     // every sync read the whole folder again: after a few full reads that came back partial, the
     // folder is taken as read as far as it goes (until a restart).
-    let given_up = !whole && partial_full_reads(state.id, full.is_some()) >= PARTIAL_FULL_READS;
+    // Only full reads count, in a row: a whole one starts the count over, and a partial
+    // CHANGEDSINCE read always asks for a full one.
+    let given_up = full.is_some() && partial_full_reads(state.id, whole) >= PARTIAL_FULL_READS;
     if !whole && !given_up {
         force_full_flags(state.id);
     }
@@ -906,15 +926,18 @@ async fn refresh_flags(
 /// Full flag reads of a folder in a row that came back partial before it is taken as read.
 const PARTIAL_FULL_READS: u8 = 3;
 
-/// Counts a partial answer (a full read when `full`), and gives the count of full ones so far.
-fn partial_full_reads(mailbox_id: i64, full: bool) -> u8 {
+/// A full flag read of the folder: the count of those in a row that came back partial (0 once
+/// one came back whole).
+fn partial_full_reads(mailbox_id: i64, whole: bool) -> u8 {
     use std::sync::{Mutex, OnceLock};
     static COUNTS: OnceLock<Mutex<HashMap<i64, u8>>> = OnceLock::new();
     let mut counts = COUNTS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
-    let n = counts.entry(mailbox_id).or_default();
-    if full {
-        *n = n.saturating_add(1);
+    if whole {
+        counts.remove(&mailbox_id);
+        return 0;
     }
+    let n = counts.entry(mailbox_id).or_default();
+    *n = n.saturating_add(1);
     *n
 }
 
@@ -943,6 +966,16 @@ async fn open_folder(session: &mut Session, caps: &Caps, name: &str) -> Result<a
 
 /// A known folder whose answer leaves UIDVALIDITY out (or gives 0, which is invalid) was
 /// answered by a failing connection: an error, never a change, which would wipe the cache.
+/// The cached UIDs below `next` the server still has (`still`, its answer to a search of them),
+/// when that is consistent with `departed` messages gone; `None` (the whole list is read instead)
+/// for an empty answer, which may be a refused search, or more gone than the count says.
+fn departures_only(cached: &[u32], still: HashSet<u32>, departed: i64, next: u32) -> Option<HashSet<u32>> {
+    let asked: HashSet<u32> = cached.iter().copied().collect();
+    let known: HashSet<u32> = still.into_iter().filter(|u| *u < next && asked.contains(u)).collect();
+    let gone = asked.len().saturating_sub(known.len()) as i64;
+    (!known.is_empty() && gone <= departed).then_some(known)
+}
+
 fn recreated(known: Option<u32>, read: Option<u32>) -> Result<bool> {
     match (known, read.filter(|v| *v != 0)) {
         (None, _) => Ok(false),
@@ -1073,6 +1106,9 @@ async fn sync_mailbox_locked(
         changed = true;
         state.highestmodseq = None;
         state.sync_from_uid = None;
+        // Read again like a first pass: what comes back is the folder's old mail, not arrivals
+        // (no notification, no rule, nothing held for the screener).
+        state.uidvalidity = None;
     }
     let local = store.mailbox_uids(state.id)?;
     steps.mark("cache");
@@ -1095,11 +1131,25 @@ async fn sync_mailbox_locked(
         // and the whole list is read below.
         let answer = imap::uid_search_checked(session, &format!("UID {next}:*"), 0).await?;
         let arrived: HashSet<u32> = answer.iter().copied().filter(|u| *u >= next).collect();
-        if !answer.is_empty() && count + arrived.len() as i64 == mb.exists as i64 {
+        let departed = count + arrived.len() as i64 - mb.exists as i64;
+        if !answer.is_empty() && departed == 0 {
             let mut known: HashSet<u32> = local.keys().copied().filter(|u| *u < next).collect();
             known.extend(arrived);
             server = Some(known);
             arrived_only = Some(next);
+        } else if !answer.is_empty() && departed > 0 {
+            // Only departures (a delete, a move to spam: Gmail's All Mail loses it): which cached
+            // messages are still there, rather than the folder's whole list (200,000 UIDs).
+            let cached: Vec<u32> = local.keys().copied().filter(|u| *u < next).collect();
+            if !cached.is_empty() {
+                let still = imap::uid_search_checked(session, &format!("UID {}", imap::uid_set(&cached)), 0).await?;
+                if let Some(known) = departures_only(&cached, still, departed, next) {
+                    let mut known = known;
+                    known.extend(arrived);
+                    server = Some(known);
+                    arrived_only = Some(next);
+                }
+            }
         }
     }
     // The list that decides what is gone: a refused search or cut connection must never read as
@@ -1185,6 +1235,9 @@ async fn sync_mailbox_locked(
     // (notifications, rules).
     if let Some(next) = previous_next {
         new_ids.extend(local.iter().filter(|(u, _)| **u >= next && server.contains(u) && !refused.contains(u)).map(|(_, id)| *id));
+    }
+    if recreated {
+        new_ids.clear();
     }
 
     let known: Vec<u32> = local.keys().filter(|u| server.contains(u)).copied().collect();
@@ -1631,9 +1684,11 @@ async fn prefetch_bodies(store: &Store, session: &mut Session, state: &MailboxSt
     }
     let since = crate::store::now() - PREFETCH_DAYS * 86_400;
     let mut budget = PREFETCH_BUDGET;
+    let unsent = unsent_bodies().lock().unwrap_or_else(|e| e.into_inner()).get(&state.id).cloned().unwrap_or_default();
     let missing: Vec<(i64, u32, u32)> = store
         .missing_bodies(state.id, PREFETCH_BODIES, PREFETCH_MAX_SIZE, since)?
         .into_iter()
+        .filter(|(_, uid, _)| !unsent.contains(uid))
         .take_while(|(_, _, size)| {
             let fits = *size <= budget;
             budget = budget.saturating_sub(*size);
@@ -1646,10 +1701,12 @@ async fn prefetch_bodies(store: &Store, session: &mut Session, state: &MailboxSt
     let by_uid: HashMap<u32, i64> = missing.iter().map(|(id, uid, _)| (*uid, *id)).collect();
     let uids: Vec<u32> = by_uid.keys().copied().collect();
     let mut stream = session.uid_fetch(uid_set(&uids), "(UID BODY.PEEK[])").await?;
+    let mut sent: HashSet<u32> = HashSet::new();
     while let Some(f) = stream.try_next().await? {
         if let (Some(uid), Some(raw)) = (f.uid, f.body())
             && let Some(id) = by_uid.get(&uid)
         {
+            sent.insert(uid);
             // The FETCH can take long: a row gone meanwhile may have handed its id to another
             // message, which must not get this body.
             if !store.location(*id).is_ok_and(|l| l.mailbox_id == state.id && l.uid == Some(uid)) {
@@ -1659,6 +1716,13 @@ async fn prefetch_bodies(store: &Store, session: &mut Session, state: &MailboxSt
             alive();
             stored += 1;
         }
+    }
+    drop(stream);
+    // The stream ends quietly on a tagged NO: what was asked and not sent is remembered.
+    let left: Vec<u32> = uids.iter().copied().filter(|u| !sent.contains(u)).collect();
+    if !left.is_empty() {
+        imap::still_open(session).await?;
+        unsent_bodies().lock().unwrap_or_else(|e| e.into_inner()).entry(state.id).or_default().extend(left);
     }
     Ok(stored)
 }
@@ -1702,6 +1766,26 @@ pub async fn download_body(store: &Store, session: &mut Session, id: i64, mailbo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn departures_are_found_among_the_cached_messages_only() {
+        let cached = [10, 11, 12, 20];
+        // One message deleted (Gmail: moved out of All Mail): the others are still there.
+        let still: HashSet<u32> = [10, 12, 20].into();
+        assert_eq!(departures_only(&cached, still, 1, 30), Some([10, 12, 20].into()));
+        // An empty answer is a refused search, never an emptied folder.
+        assert_eq!(departures_only(&cached, HashSet::new(), 4, 30), None);
+        // More gone than the count says: the whole list is read instead.
+        assert_eq!(departures_only(&cached, [10].into(), 1, 30), None);
+    }
+
+    #[test]
+    fn partial_full_reads_count_in_a_row() {
+        let folder = -77;
+        assert_eq!((partial_full_reads(folder, false), partial_full_reads(folder, false)), (1, 2));
+        assert_eq!(partial_full_reads(folder, true), 0, "a whole read starts over");
+        assert_eq!(partial_full_reads(folder, false), 1);
+    }
 
     #[tokio::test]
     async fn stalled_folder_syncs_are_given_up() {

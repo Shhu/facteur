@@ -640,6 +640,51 @@ r#"
 ALTER TABLE calendar_events ADD COLUMN zone TEXT;
 UPDATE calendars SET ctag = NULL, synced_at = NULL;
 "#,
+r#"
+-- The `handled` triggers stay silent while this table has a row: a folder emptied for a reset
+-- (UIDVALIDITY changed) or an undone move is no thread leaving the inbox.
+CREATE TABLE handled_quiet (on_ INTEGER NOT NULL);
+DROP TRIGGER handled_on_delete;
+DROP TRIGGER handled_on_move;
+DROP TRIGGER handled_on_unlabel;
+CREATE TRIGGER handled_on_delete AFTER DELETE ON messages
+WHEN NOT EXISTS (SELECT 1 FROM handled_quiet)
+ AND EXISTS (SELECT 1 FROM mailboxes WHERE id = old.mailbox_id AND role = 'inbox')
+ AND EXISTS (SELECT 1 FROM accounts WHERE id = old.account_id)
+BEGIN
+    INSERT OR REPLACE INTO handled VALUES (old.account_id, old.thread_id, CAST(strftime('%s', 'now') AS INTEGER));
+END;
+CREATE TRIGGER handled_on_move AFTER UPDATE OF mailbox_id ON messages
+WHEN old.mailbox_id <> new.mailbox_id
+ AND NOT EXISTS (SELECT 1 FROM handled_quiet)
+ AND EXISTS (SELECT 1 FROM mailboxes WHERE id = old.mailbox_id AND role = 'inbox')
+BEGIN
+    INSERT OR REPLACE INTO handled VALUES (old.account_id, old.thread_id, CAST(strftime('%s', 'now') AS INTEGER));
+END;
+CREATE TRIGGER handled_on_unlabel AFTER DELETE ON labels
+WHEN NOT EXISTS (SELECT 1 FROM handled_quiet)
+ AND EXISTS (SELECT 1 FROM mailboxes WHERE id = old.mailbox_id AND role = 'inbox')
+BEGIN
+    INSERT OR REPLACE INTO handled
+    SELECT m.account_id, m.thread_id, CAST(strftime('%s', 'now') AS INTEGER)
+    FROM messages m JOIN accounts a ON a.id = m.account_id WHERE m.id = old.message_id;
+END;
+"#,
+r#"
+-- Sends that failed before reaching the server (offline, an account waiting to be signed in
+-- again), counted apart from real attempts: a day offline does not use up a message's tries.
+ALTER TABLE outbox ADD COLUMN offline INTEGER NOT NULL DEFAULT 0;
+"#,
+r#"
+-- Each CalDAV object's ETag when last read: a changed calendar is read again only for the objects
+-- whose ETag changed, not whole.
+CREATE TABLE caldav_etags (
+    calendar_id INTEGER NOT NULL REFERENCES calendars(id) ON DELETE CASCADE,
+    href        TEXT NOT NULL,
+    etag        TEXT NOT NULL,
+    PRIMARY KEY (calendar_id, href)
+) WITHOUT ROWID;
+"#,
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -927,6 +972,9 @@ fn db_status(conn: &Connection, op: std::ffi::c_int) -> Option<i64> {
     (rc == rusqlite::ffi::SQLITE_OK).then_some(current as i64)
 }
 
+/// Bytes of the file each reader maps.
+const READER_MMAP: i64 = 256 << 20;
+
 pub(crate) fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -1010,7 +1058,7 @@ impl Store {
             )?;
             // Read-only (the file cannot be modified), temporary tables still allowed. Modest
             // cache: there are three of them, open for days.
-            conn.execute_batch("PRAGMA cache_size = -8192; PRAGMA temp_store = MEMORY; PRAGMA mmap_size = 268435456;")?;
+            conn.execute_batch(&format!("PRAGMA cache_size = -8192; PRAGMA temp_store = MEMORY; PRAGMA mmap_size = {READER_MMAP};"))?;
             register_functions(&conn)?;
             #[cfg(feature = "perf")]
             let mut conn = conn;
@@ -1082,12 +1130,34 @@ impl Store {
         if wasted * COMPACT_FREE_SHARE < before || wasted < min_free {
             return Ok(None);
         }
+        // Windows does not shorten a file other connections have mapped: the readers let go of
+        // theirs meanwhile. Never waited for (a reader may be waiting for the writer held here):
+        // busy, the compaction is for another time.
+        let mut readers = Vec::new();
+        for reader in &self.readers {
+            match reader.try_lock() {
+                Ok(r) => readers.push(r),
+                Err(_) => return Ok(None),
+            }
+        }
+        for r in &readers {
+            r.execute_batch("PRAGMA mmap_size = 0;")?;
+        }
         // The copy VACUUM builds goes to a temporary file, not to memory (the size of the base).
         db.execute_batch("PRAGMA temp_store = FILE;")?;
         let done = db.execute_batch("VACUUM;");
         let _ = db.execute_batch("PRAGMA temp_store = MEMORY; PRAGMA wal_checkpoint(TRUNCATE);");
+        for r in &readers {
+            let _ = r.execute_batch(&format!("PRAGMA mmap_size = {READER_MMAP};"));
+        }
         done?;
-        Ok(Some(before.saturating_sub(file_len()).max(0) as u64))
+        let freed = before.saturating_sub(file_len()).max(0) as u64;
+        // A file left as long would be rewritten whole at every launch: told as a failure, which
+        // waits a week.
+        if freed == 0 {
+            return Err(Error::Other("the database file was not shortened".into()));
+        }
+        Ok(Some(freed))
     }
 
     #[track_caller]
@@ -1190,7 +1260,20 @@ impl Store {
     /// Its rows go with it (foreign keys); its settings too, which an account given the same id
     /// later would otherwise take over. The people known only through it leave the composer's
     /// suggestions: `contacts` is counted again from the mail left.
+    /// Its messages go in short steps first: each one deleted unindexes its text, and a large
+    /// account in one transaction would hold the writer (every other account's writes) for a minute.
     pub fn delete_account(&self, id: i64) -> Result<()> {
+        loop {
+            let mut db = self.db();
+            let tx = db.transaction()?;
+            quiet_handled(&tx, true)?;
+            let n = tx.execute("DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE account_id = ?1 LIMIT 2000)", [id])?;
+            quiet_handled(&tx, false)?;
+            tx.commit()?;
+            if n == 0 {
+                break;
+            }
+        }
         let mut db = self.db();
         let tx = db.transaction()?;
         tx.execute("DELETE FROM accounts WHERE id = ?1", [id])?;
@@ -1647,6 +1730,9 @@ impl Store {
     /// Only with nothing on its way for the account (the queue names copies by folder and UID):
     /// `false` when it has to wait. A failed op does not hold it back: it waits for the user,
     /// and the folder and UID it names stay valid on Gmail's server.
+    /// In steps, the writer let go between them (the copies' deletion unindexes their text): a
+    /// conversion cut by a quit goes on at the next sync, its copies hidden meanwhile (a label
+    /// lists its messages through `labels` only).
     pub fn convert_to_labels(&self, account_id: i64) -> Result<bool> {
         let mut db = self.db();
         let tx = db.transaction()?;
@@ -1656,7 +1742,9 @@ impl Store {
             .query_row("SELECT id FROM mailboxes WHERE account_id = ?1 AND role = 'all'", [account_id], |r| r.get(0))
             .optional()?;
         let Some(all) = all else { return Ok(false) };
-        if busy {
+        // Begun already: only hidden copies are left to delete, which no queued op names.
+        let begun: bool = tx.query_row("SELECT EXISTS (SELECT 1 FROM mailboxes WHERE account_id = ?1 AND is_label = 1)", [account_id], |r| r.get(0))?;
+        if busy && !begun {
             return Ok(false);
         }
         // Their counts as folders no longer hold: the folder listing gives them again.
@@ -1683,15 +1771,26 @@ impl Store {
             ),
             params![account_id, all],
         )?;
-        let doomed: Vec<i64> = {
-            let mut st = tx.prepare(
-                "SELECT m.id FROM messages m JOIN mailboxes b ON b.id = m.mailbox_id WHERE b.account_id = ?1 AND b.is_label = 1",
-            )?;
-            st.query_map([account_id], |r| r.get(0))?.collect::<Result<_, _>>()?
-        };
-        let n = delete_ids(&tx, &doomed)?;
-        tx.execute("UPDATE accounts SET labels_model = 1 WHERE id = ?1", [account_id])?;
         tx.commit()?;
+        drop(db);
+        let mut n = 0;
+        loop {
+            let mut db = self.db();
+            let tx = db.transaction()?;
+            let doomed: Vec<i64> = {
+                let mut st = tx.prepare(
+                    "SELECT m.id FROM messages m JOIN mailboxes b ON b.id = m.mailbox_id WHERE b.account_id = ?1 AND b.is_label = 1 LIMIT 500",
+                )?;
+                st.query_map([account_id], |r| r.get(0))?.collect::<Result<_, _>>()?
+            };
+            if doomed.is_empty() {
+                tx.execute("UPDATE accounts SET labels_model = 1 WHERE id = ?1", [account_id])?;
+                tx.commit()?;
+                break;
+            }
+            n += delete_ids(&tx, &doomed)?;
+            tx.commit()?;
+        }
         tracing::info!("account {account_id} converted to Gmail labels: {n} copies became labels or left");
         Ok(true)
     }
@@ -2318,7 +2417,24 @@ fn delete_ids(tx: &Transaction, ids: &[i64]) -> Result<usize> {
 
 /// Deletes every message of a folder (emptied, or recreated on the server), bodies kept for the
 /// copies that stay elsewhere.
+/// The `handled` triggers silent (`true`) or not for what follows in `tx`.
+fn quiet_handled(tx: &Transaction, quiet: bool) -> Result<()> {
+    tx.execute("DELETE FROM handled_quiet", [])?;
+    if quiet {
+        tx.execute("INSERT INTO handled_quiet VALUES (1)", [])?;
+    }
+    Ok(())
+}
+
+/// A folder's rows going for a reset or its removal: no thread is handled by it.
 fn delete_mailbox_rows(tx: &Transaction, mailbox_id: i64) -> Result<usize> {
+    quiet_handled(tx, true)?;
+    let n = delete_mailbox_rows_now(tx, mailbox_id);
+    quiet_handled(tx, false)?;
+    n
+}
+
+fn delete_mailbox_rows_now(tx: &Transaction, mailbox_id: i64) -> Result<usize> {
     let holders: Vec<i64> = {
         let mut st = tx.prepare("SELECT m.id FROM messages m JOIN bodies b ON b.message_id = m.id WHERE m.mailbox_id = ?1")?;
         st.query_map([mailbox_id], |r| r.get(0))?.collect::<Result<_, _>>()?
@@ -4598,12 +4714,20 @@ impl Store {
     /// Claims a message that is due: it becomes in-flight and can no longer be cancelled. `None`
     /// if there is none.
     pub fn claim_outgoing(&self, now: i64) -> Result<Option<(i64, Draft, Option<i64>)>> {
+        self.claim_outgoing_except(now, &[])
+    }
+
+    /// The next due message of an account not in `busy` (its sending lanes taken).
+    pub fn claim_outgoing_except(&self, now: i64, busy: &[i64]) -> Result<Option<(i64, Draft, Option<i64>)>> {
         let db = self.db();
+        let skip = busy.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
         let row: Option<(i64, String, Option<i64>)> = db
             .query_row(
-                "UPDATE outbox SET state = 'sending'
-                 WHERE id = (SELECT id FROM outbox WHERE state = 'pending' AND send_at <= ?1 ORDER BY send_at LIMIT 1)
-                 RETURNING id, draft, remind_after",
+                &format!(
+                    "UPDATE outbox SET state = 'sending'
+                     WHERE id = (SELECT id FROM outbox WHERE state = 'pending' AND send_at <= ?1 AND account_id NOT IN ({skip}) ORDER BY send_at LIMIT 1)
+                     RETURNING id, draft, remind_after"
+                ),
                 [now],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -4620,25 +4744,47 @@ impl Store {
         }
     }
 
+    /// A claimed message back to pending, before anything was tried (no sending lane free).
+    pub fn unclaim_outgoing(&self, id: i64) -> Result<()> {
+        self.db().execute("UPDATE outbox SET state = 'pending' WHERE id = ?1 AND state = 'sending'", [id])?;
+        Ok(())
+    }
+
     pub fn delete_outgoing(&self, id: i64) -> Result<()> {
         self.db().execute("DELETE FROM outbox WHERE id = ?1", [id])?;
         Ok(())
     }
 
     /// Send failure: retry at `retry_at`, or give up (`None`) until the user acts.
-    pub fn outgoing_failed(&self, id: i64, error: &str, retry_at: Option<i64>) -> Result<()> {
+    /// `offline`: it never reached the server (counted apart, see [`Store::outgoing_tries`]).
+    pub fn outgoing_failed(&self, id: i64, error: &str, retry_at: Option<i64>, offline: bool) -> Result<()> {
         self.db().execute(
-            "UPDATE outbox SET attempts = attempts + 1, error = ?2,
+            "UPDATE outbox SET attempts = attempts + (?4 = 0), offline = offline + (?4 = 1), error = ?2,
                     state = CASE WHEN ?3 IS NULL THEN 'failed' ELSE 'pending' END,
                     send_at = COALESCE(?3, send_at)
              WHERE id = ?1",
-            params![id, error, retry_at],
+            params![id, error, retry_at, offline],
         )?;
         Ok(())
     }
 
     pub fn outgoing_attempts(&self, id: i64) -> Result<i64> {
-        Ok(self.read().query_row("SELECT attempts FROM outbox WHERE id = ?1", [id], |r| r.get(0))?)
+        Ok(self.outgoing_tries(id)?.0)
+    }
+
+    /// (attempts the server saw, tries that never reached it).
+    pub fn outgoing_tries(&self, id: i64) -> Result<(i64, i64)> {
+        Ok(self.read().query_row("SELECT attempts, offline FROM outbox WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))?)
+    }
+
+    /// The account's sends waiting after a failure are due now (the account signed in again, the
+    /// network back); how many.
+    pub fn retry_outgoing_now(&self, account_id: Option<i64>, now: i64) -> Result<usize> {
+        Ok(self.db().execute(
+            "UPDATE outbox SET send_at = ?2
+             WHERE state = 'pending' AND (attempts > 0 OR offline > 0) AND send_at > ?2 AND (?1 IS NULL OR account_id = ?1)",
+            params![account_id, now],
+        )?)
     }
 
     /// Takes a message out of the outbox to edit it; impossible once it is sending.
@@ -4915,6 +5061,32 @@ impl Store {
         Ok(self.read().query_row("SELECT op FROM pending_ops WHERE id = ?1", [id], |r| r.get(0)).optional()?)
     }
 
+    /// The operation to replay now, read again: ids are reused once the last row goes, so the row
+    /// listed may since be another operation, perhaps one still held for undo (`None` then).
+    pub fn replay_payload(&self, id: i64, now: i64) -> Result<Option<String>> {
+        Ok(self
+            .read()
+            .query_row("SELECT op FROM pending_ops WHERE id = ?1 AND failed = 0 AND (not_before IS NULL OR not_before <= ?2)", params![id, now], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// A replayed operation done (or dropped): removed only if the row still holds it, not a newer
+    /// operation that took its id meanwhile.
+    pub fn finish_replayed(&self, id: i64, op: &str) -> Result<()> {
+        self.db().execute("DELETE FROM pending_ops WHERE id = ?1 AND op = ?2", params![id, op])?;
+        Ok(())
+    }
+
+    /// [`fail_op`](Self::fail_op) for a replayed operation, counted only if the row still holds it.
+    pub fn fail_replayed(&self, id: i64, op: &str, error: &str, max: i64) -> Result<bool> {
+        self.count_failure("attempts", id, Some(op), error, max)
+    }
+
+    /// [`refuse_op`](Self::refuse_op) for a replayed operation, counted only if the row still holds it.
+    pub fn refuse_replayed(&self, id: i64, op: &str, error: &str, max: i64) -> Result<bool> {
+        self.count_failure("refusals", id, Some(op), error, max)
+    }
+
     /// Queued operations on the folders themselves: (kind, folder, destination).
     pub fn pending_folder_ops(&self, account_id: i64) -> Result<Vec<(String, String, Option<String>)>> {
         let db = self.read();
@@ -5012,6 +5184,8 @@ impl Store {
             }
         }
         tx.execute(&format!("DELETE FROM pending_ops WHERE id IN ({list})"), [])?;
+        // A move undone is no thread leaving the inbox: back to the archive, it keeps its date.
+        quiet_handled(&tx, true)?;
         for (id, mailbox_id, uid) in moves.iter().rev() {
             // A copy may have been added at that location meanwhile: it makes room.
             if let Some(uid) = uid {
@@ -5029,6 +5203,7 @@ impl Store {
             queue_pending_flags(&tx, *id, None)?;
         }
         replace_labels(&tx, labels)?;
+        quiet_handled(&tx, false)?;
         for (account_id, thread_id) in snoozes {
             tx.execute("DELETE FROM snoozes WHERE account_id = ?1 AND thread_id = ?2", params![account_id, thread_id])?;
         }
@@ -5068,12 +5243,20 @@ impl Store {
     /// `true` when it has just become failed: its folders should then be read again in full
     /// (`op_folders`, `sync::recheck_op_folders`).
     pub fn fail_op(&self, id: i64, error: &str, max: i64) -> Result<bool> {
+        self.count_failure("attempts", id, None, error, max)
+    }
+
+    /// One more `counter` (attempts or refusals) for the operation `id` (holding `op`, when
+    /// given); whether it has just become failed.
+    fn count_failure(&self, counter: &str, id: i64, op: Option<&str>, error: &str, max: i64) -> Result<bool> {
         let failed: Option<bool> = self
             .db()
             .query_row(
-                "UPDATE pending_ops SET attempts = attempts + 1, last_error = ?2, failed = (attempts + 1 >= ?3) WHERE id = ?1
-                 RETURNING failed",
-                params![id, error, max],
+                &format!(
+                    "UPDATE pending_ops SET {counter} = {counter} + 1, last_error = ?2, failed = ({counter} + 1 >= ?3)
+                     WHERE id = ?1 AND (?4 IS NULL OR op = ?4) RETURNING failed"
+                ),
+                params![id, error, max, op],
                 |r| r.get(0),
             )
             .optional()?;
@@ -5083,16 +5266,7 @@ impl Store {
     /// [`fail_op`](Self::fail_op) for a refusal by the server: counted apart from the network
     /// cuts, so that a few cuts before do not make one refusal final.
     pub fn refuse_op(&self, id: i64, error: &str, max: i64) -> Result<bool> {
-        let failed: Option<bool> = self
-            .db()
-            .query_row(
-                "UPDATE pending_ops SET refusals = refusals + 1, last_error = ?2, failed = (refusals + 1 >= ?3) WHERE id = ?1
-                 RETURNING failed",
-                params![id, error, max],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(failed.unwrap_or(false))
+        self.count_failure("refusals", id, None, error, max)
     }
 
     /// (account, pending, failed) for each account.
@@ -5846,6 +6020,72 @@ impl Store {
         Ok(changed)
     }
 
+    /// The ETag of each CalDAV object of the calendar, as last read.
+    pub fn caldav_etags(&self, calendar_id: i64) -> Result<HashMap<String, String>> {
+        let db = self.read();
+        let mut st = db.prepare("SELECT href, etag FROM caldav_etags WHERE calendar_id = ?1")?;
+        let rows = st.query_map([calendar_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// A CalDAV calendar read again in part: `listed`, the objects it holds in the window with their
+    /// ETag; `fetched`, those read again, whose events are `events`. The events of objects no
+    /// longer listed go, those of the objects read again are replaced, the others stay.
+    pub fn update_calendar_objects(
+        &self,
+        calendar_id: i64,
+        account_id: i64,
+        remote_id: &str,
+        listed: &[(String, String)],
+        fetched: &HashSet<String>,
+        events: &[crate::calendar::Instance],
+        ctag: Option<&str>,
+    ) -> Result<bool> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        if !calendar_still_fetched(&tx, calendar_id, account_id, remote_id)? {
+            return Ok(false);
+        }
+        let present: HashSet<&str> = listed.iter().map(|(h, _)| h.as_str()).collect();
+        let mut changed = false;
+        {
+            // Rows of objects gone or read again, and rows without an object (written locally
+            // before the server named them).
+            let mut st = tx.prepare("SELECT id, href FROM calendar_events WHERE calendar_id = ?1")?;
+            let stale: Vec<i64> = st
+                .query_map([calendar_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))?
+                .filter_map(|r| r.ok())
+                .filter(|(_, href)| href.as_deref().is_none_or(|h| !present.contains(h) || fetched.contains(h)))
+                .map(|(id, _)| id)
+                .collect();
+            let mut delete = tx.prepare("DELETE FROM calendar_events WHERE id = ?1")?;
+            for id in stale {
+                changed = true;
+                delete.execute([id])?;
+            }
+            let mut keep: HashSet<(&str, &str)> = HashSet::new();
+            let mut upsert = tx.prepare(UPSERT_EVENT)?;
+            for e in events {
+                if !keep.insert((e.uid.as_str(), e.instance.as_str())) {
+                    continue;
+                }
+                changed |= upsert.execute(params![
+                    calendar_id, e.uid, e.instance, e.start, e.end, e.all_day, e.summary,
+                    e.location, e.description, e.status, e.organizer, e.url, e.busy,
+                    e.href, e.recurring, e.own, e.series, e.response, json_list(&e.attendees), e.meeting, json_list(&e.reminders), e.zone,
+                ])? > 0;
+            }
+            tx.execute("DELETE FROM caldav_etags WHERE calendar_id = ?1", [calendar_id])?;
+            let mut etag = tx.prepare("INSERT OR REPLACE INTO caldav_etags (calendar_id, href, etag) VALUES (?1, ?2, ?3)")?;
+            for (href, tag) in listed {
+                etag.execute(params![calendar_id, href, tag])?;
+            }
+        }
+        tx.execute("UPDATE calendars SET ctag = ?2, synced_at = ?3, error = NULL WHERE id = ?1", params![calendar_id, ctag, now()])?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
     /// Why the last sync of a calendar failed (`None`: it did not). Returns whether it changed.
     /// `account_id`, `remote_id`: as for [`Store::replace_calendar_events`].
     pub fn set_calendar_error(&self, calendar_id: i64, account_id: i64, remote_id: &str, error: Option<&str>) -> Result<bool> {
@@ -6231,6 +6471,26 @@ mod tests {
         assert_eq!(s.messages_from_pattern(acc, "@example.org", Role::Screener).unwrap(), vec![held]);
         let thread = s.summary(held).unwrap().thread_id;
         assert_eq!(s.snoozed_messages(later, thread, &[]).unwrap(), vec![held]);
+    }
+
+    #[test]
+    fn a_gmail_conversion_goes_in_steps_and_resumes() {
+        let (s, acc, inbox, _) = setup();
+        let all = s.upsert_mailbox(acc, "[Gmail]/All Mail", Some("/"), Some(Role::All), true).unwrap();
+        for uid in 1..=1200 {
+            let h = header(&format!("m{uid}@x"), None, "Sujet", i64::from(uid));
+            s.insert_header(acc, all, uid, &h, FLAGS, 10).unwrap();
+            s.insert_header(acc, inbox, uid, &h, FLAGS, 10).unwrap();
+        }
+        // Cut after its first step (facteur closed): folders made labels, copies still there,
+        // and an operation queued since.
+        s.db().execute("UPDATE mailboxes SET is_label = 1 WHERE id = ?1", [inbox]).unwrap();
+        s.push_op(acc, r#"{"kind":"store","mailbox":"[Gmail]/All Mail","uids":[1],"flag":"\\Seen","add":true}"#, "", None).unwrap();
+        assert!(s.convert_to_labels(acc).unwrap(), "goes on: only hidden copies are left");
+        assert!(s.labels_model(acc).unwrap());
+        let count = |sql: &str| s.read().query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(count(&format!("SELECT COUNT(*) FROM messages WHERE mailbox_id = {inbox}")), 0);
+        assert_eq!(count(&format!("SELECT COUNT(*) FROM labels WHERE mailbox_id = {inbox}")), 1200);
     }
 
     #[test]
@@ -6745,9 +7005,18 @@ mod tests {
         assert!(freed > 2000 * 4000, "the file itself is shorter: {freed}");
         assert_eq!(s.db().query_row("PRAGMA freelist_count", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
         assert_eq!(s.db().query_row("PRAGMA temp_store", [], |r| r.get::<_, i64>(0)).unwrap(), 2, "back to memory");
-        // The readers still see the rewritten file.
+        // The readers still see the rewritten file, and map it again.
         assert_eq!(s.read().query_row("SELECT count(*) FROM accounts", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert!(s.readers.iter().all(|r| r.lock().unwrap().query_row("PRAGMA mmap_size", [], |r| r.get::<_, i64>(0)).unwrap() == READER_MMAP));
         assert_eq!(s.compact_above(0).unwrap(), None);
+
+        // A reader busy: no compaction now (Windows would not shorten a file it maps), nor a wait.
+        s.db().execute_batch("CREATE TABLE junk(b BLOB); WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) INSERT INTO junk SELECT zeroblob(4000) FROM n; DROP TABLE junk;").unwrap();
+        if let Some(reader) = s.readers.first() {
+            let _busy = reader.lock().unwrap();
+            assert_eq!(s.compact_above(0).unwrap(), None);
+        }
+        assert!(s.compact_above(0).unwrap().is_some());
     }
 
     #[test]
@@ -6876,6 +7145,55 @@ mod tests {
     }
 
     #[test]
+    fn a_replay_finishes_its_own_operation_not_the_one_that_took_its_id() {
+        let (s, acc, _, _) = setup();
+        let d1 = r#"{"kind":"save_draft","raw":"D1"}"#;
+        let d2 = r#"{"kind":"save_draft","raw":"D2"}"#;
+        // D1 replays; meanwhile the composer saves again: D1's row goes, D2 takes its id.
+        let id = s.push_op(acc, d1, "", None).unwrap();
+        assert_eq!(s.replay_payload(id, now()).unwrap().as_deref(), Some(d1));
+        s.finish_op(id).unwrap();
+        assert_eq!(s.push_op(acc, d2, "", None).unwrap(), id, "SQLite reuses the id");
+        // D1's upload ends, or fails: D2 stays queued, untouched.
+        s.finish_replayed(id, d1).unwrap();
+        assert!(!s.fail_replayed(id, d1, "cut", 1).unwrap() && !s.refuse_replayed(id, d1, "NO", 1).unwrap());
+        let left = s.pending_ops(acc).unwrap();
+        assert_eq!((left.len(), left[0].attempts), (1, 0));
+        assert_eq!(s.op_payload(id).unwrap().as_deref(), Some(d2));
+        s.finish_replayed(id, d2).unwrap();
+        assert!(s.pending_ops(acc).unwrap().is_empty());
+        // An id taken by an operation still held for undo is not replayed early.
+        let held = s.push_op(acc, d1, "", Some(now() + 60)).unwrap();
+        assert_eq!(s.replay_payload(held, now()).unwrap(), None);
+    }
+
+    #[test]
+    fn sends_waiting_offline_keep_their_tries_and_go_once_back() {
+        let (s, acc, _, _) = setup();
+        let draft = Draft { account_id: acc, to: vec!["a@x".into()], subject: "Train".into(), ..Default::default() };
+        let id = s.queue_outgoing(&draft, 100, false, None).unwrap();
+        let fresh = s.queue_outgoing(&draft, 5000, false, None).unwrap();
+        s.claim_outgoing(150).unwrap().unwrap();
+        // Offline three times: no attempt the server saw.
+        for _ in 0..3 {
+            s.outgoing_failed(id, "offline", Some(9000), true).unwrap();
+        }
+        assert_eq!(s.outgoing_tries(id).unwrap(), (0, 3));
+        // Signed in again or back online: due now; a send never tried keeps its own time.
+        assert_eq!(s.retry_outgoing_now(Some(acc), 200).unwrap(), 1);
+        assert_eq!(s.next_outgoing().unwrap(), Some(200));
+        assert_eq!(s.retry_outgoing_now(None, 200).unwrap(), 0);
+        assert!(s.claim_outgoing(4000).unwrap().is_some_and(|(claimed, _, _)| claimed == id));
+        assert!(s.claim_outgoing(4000).unwrap().is_none(), "{fresh} waits for its time");
+        // An account whose lanes are taken: its due message stays pending, cancellable.
+        let due = s.queue_outgoing(&draft, 4100, false, None).unwrap();
+        assert!(s.claim_outgoing_except(4200, &[acc]).unwrap().is_none());
+        let (claimed, _, _) = s.claim_outgoing(4200).unwrap().unwrap();
+        s.unclaim_outgoing(claimed).unwrap();
+        assert!(s.take_outgoing(due).unwrap().is_some(), "still cancellable");
+    }
+
+    #[test]
     fn outbox_claim_and_cancel() {
         let (s, acc, _, _) = setup();
         let draft = Draft { account_id: acc, to: vec!["a@x".into()], subject: "Bonjour".into(), ..Default::default() };
@@ -6889,7 +7207,7 @@ mod tests {
         assert!(s.take_outgoing(soon).unwrap().is_none(), "too late to cancel a send in progress");
         assert!(s.claim_outgoing(150).unwrap().is_none(), "already claimed");
 
-        s.outgoing_failed(soon, "réseau", Some(200)).unwrap();
+        s.outgoing_failed(soon, "réseau", Some(200), false).unwrap();
         assert_eq!(s.outbox().unwrap()[0].state, "pending");
         s.claim_outgoing(250).unwrap().unwrap();
         assert_eq!(s.interrupted_outgoing().unwrap(), 1);
@@ -7133,6 +7451,39 @@ mod tests {
         // Nothing written for an account being removed.
         s.delete_account(acc).unwrap();
         assert_eq!(s.read().query_row("SELECT COUNT(*) FROM handled", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_folder_reset_or_an_undo_is_no_thread_handled() {
+        let (s, acc, inbox, _) = setup();
+        let archive = s.upsert_mailbox(acc, "Archives", Some("/"), Some(Role::Archive), true).unwrap();
+        let handled = || s.read().query_row("SELECT COUNT(*) FROM handled", [], |r| r.get::<_, i64>(0)).unwrap();
+        // The inbox recreated on the server (UIDVALIDITY changed): its rows go, nothing is handled.
+        s.insert_header(acc, inbox, 1, &header("a@x", None, "Gardé", 100), FLAGS, 10).unwrap();
+        s.clear_mailbox(inbox).unwrap();
+        assert_eq!(handled(), 0);
+        // Moved back to the inbox from Done, then undone: it keeps no new handled date.
+        let id = s.insert_header(acc, archive, 1, &header("b@x", None, "Traité", 100), FLAGS, 10).unwrap();
+        let text = serde_json::json!({ "kind": "move_set", "mailbox": "Archives", "dest": "INBOX", "uids": [1] }).to_string();
+        let op = s.push_op(acc, &text, "", Some(now() + 60)).unwrap();
+        s.move_local(id, inbox).unwrap();
+        assert_eq!(s.undo(&[(op, text)], &[(id, archive, Some(1))], &[], &[], false).unwrap(), Undone::Done);
+        assert_eq!((s.location(id).unwrap().mailbox_id, handled()), (archive, 0));
+        // A real archive still is.
+        s.move_local(id, inbox).unwrap();
+        s.move_local(id, archive).unwrap();
+        assert_eq!(handled(), 1);
+    }
+
+    #[test]
+    fn a_large_account_is_removed_in_steps() {
+        let (s, acc, inbox, _) = setup();
+        for uid in 1..=2500 {
+            s.insert_header(acc, inbox, uid, &header(&format!("m{uid}@x"), None, "Sujet", i64::from(uid)), FLAGS, 10).unwrap();
+        }
+        s.delete_account(acc).unwrap();
+        let left = |table: &str| s.read().query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!((left("messages"), left("accounts"), left("handled"), left("handled_quiet")), (0, 0, 0, 0));
     }
 
     #[test]
@@ -8154,6 +8505,40 @@ mod tests {
         s.set_calendar_ignored(acc, false).unwrap();
         assert_eq!(s.calendars().unwrap().len(), 1);
         assert_eq!(s.sync_calendar_list(acc, CalendarSource::Caldav, &[cal("b", true)]).unwrap().0.len(), 1, "used again");
+    }
+
+    #[test]
+    fn a_caldav_calendar_is_read_again_only_where_it_changed() {
+        use crate::calendar::{Instance, RemoteCalendar};
+        let (s, acc, _, _) = setup();
+        let cal = RemoteCalendar { remote_id: "https://dav.example/c/".into(), name: "c".into(), color: None, read_only: false, enabled: true, ctag: None };
+        let c = s.sync_calendar_list(acc, CalendarSource::Caldav, &[cal]).unwrap().0[0].id;
+        let ev = |href: &str, uid: &str, start: i64| Instance {
+            uid: uid.into(), summary: uid.into(), start, end: start + 10, busy: true, href: Some(href.into()), ..Default::default()
+        };
+        let (a, b) = ("https://dav.example/c/a.ics".to_string(), "https://dav.example/c/b.ics".to_string());
+        let listed = vec![(a.clone(), "\"1\"".to_string()), (b.clone(), "\"1\"".to_string())];
+        let all: HashSet<String> = [a.clone(), b.clone()].into();
+        s.update_calendar_objects(c, acc, "https://dav.example/c/", &listed, &all, &[ev(&a, "a", 100), ev(&b, "b", 200)], None).unwrap();
+        assert_eq!(s.caldav_etags(c).unwrap().len(), 2);
+        let ids = || s.calendar_events(0, 1000).unwrap().into_iter().map(|e| (e.uid, e.id)).collect::<Vec<_>>();
+        let before = ids();
+        // b changed (a new ETag), a did not: only b is read again; a keeps its row.
+        let listed = vec![(a.clone(), "\"1\"".to_string()), (b.clone(), "\"2\"".to_string())];
+        let known = s.caldav_etags(c).unwrap();
+        let to_read: HashSet<String> = listed.iter().filter(|(h, e)| known.get(h) != Some(e)).map(|(h, _)| h.clone()).collect();
+        assert_eq!(to_read, [b.clone()].into());
+        let mut moved = ev(&b, "b", 250);
+        moved.summary = "b (moved)".into();
+        assert!(s.update_calendar_objects(c, acc, "https://dav.example/c/", &listed, &to_read, &[moved], None).unwrap());
+        let after = s.calendar_events(0, 1000).unwrap();
+        assert_eq!(after[0].id, before[0].1, "a untouched");
+        assert_eq!((after[1].summary.as_str(), after[1].start), ("b (moved)", 250));
+        // a deleted on the server: no longer listed, its events go.
+        let listed = vec![(b.clone(), "\"2\"".to_string())];
+        assert!(s.update_calendar_objects(c, acc, "https://dav.example/c/", &listed, &HashSet::new(), &[], None).unwrap());
+        assert_eq!(s.calendar_events(0, 1000).unwrap().iter().map(|e| e.uid.as_str()).collect::<Vec<_>>(), ["b"]);
+        assert_eq!(s.caldav_etags(c).unwrap().len(), 1);
     }
 
     #[test]

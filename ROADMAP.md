@@ -112,15 +112,18 @@ What remains to be done, by theme. Decisions already made are noted under each i
 - Done: errors of queued operations kept in both languages too (the server's own words as they
   came).
 - Done (October 2026): an audit in ten domains (sync, queue, concurrency, SQLite, network,
-  interface, hostile mail, MIME, calendars, lifecycle), 44 findings, 41 fixed with their tests.
-  Left on purpose:
-  - Typing in a reply with a long quote serializes the whole editor on each key: the plain text
-    should be computed when sending instead (a debounce could send a message short of its last
-    characters).
-  - A CalDAV calendar is read again whole (expanded, 14 months) on any change, and fails above
-    32 MiB: per-object ETags or `sync-collection` instead, to be tested on a real CalDAV account.
-  - The one-time Gmail label conversion rewrites bodies in one transaction (off the async
-    workers now); chunking it only matters for accounts not converted yet.
+  interface, hostile mail, MIME, calendars, lifecycle), 44 findings, all fixed with their tests.
+  The last three since: the composer writes a long reply's HTML out after a pause or when saving
+  or sending, not at every key; a CalDAV calendar is read again only for the objects whose ETag
+  changed, in batches (no answer of the whole calendar, no 32 MiB limit); the one-time Gmail
+  label conversion goes in short steps, and resumes when cut.
+- Done (October 2026): a second audit in the same ten domains, 38 findings, all fixed, with
+  regression tests where a test can reach them. Among them: the local AI in a process of its own
+  (`facteur --ai-worker`: a graphics driver failing ends it, not facteur, and the processor takes
+  over), mail text never read as the model's control tokens and the summary in bullet points
+  only (checked against the real model with injected mails), crafted invitations bounded, sends
+  made offline kept waiting instead of given up, long jobs giving the one connection over between
+  folders, queued operations finished only if still theirs.
 
 ## Distribution
 

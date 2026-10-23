@@ -11,26 +11,49 @@ export function useDictation() {
   let limit: ReturnType<typeof setTimeout> | undefined
   const MAX_SECONDS = 300
 
+  /** Asking for the microphone: a second click meanwhile starts nothing more. */
+  let starting = false
+  /** Bumped by each release: a start still waiting for the microphone then lets it go. */
+  let generation = 0
+
   async function start(onLimit: () => void) {
-    if (recording.value || transcribing.value) return
-    stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } })
+    if (recording.value || transcribing.value || starting) return
+    starting = true
+    const asked = ++generation
+    let media: MediaStream
+    try {
+      media = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } })
+    } finally {
+      starting = false
+    }
+    // Stopped, cancelled or closed while the microphone was being opened.
+    if (asked !== generation) {
+      media.getTracks().forEach(t => t.stop())
+      return
+    }
+    stream = media
     context = new AudioContext({ sampleRate: 16000 })
     const source = context.createMediaStreamSource(stream)
     node = context.createScriptProcessor(4096, 1, 1)
-    chunks = []
+    // Its own buffer: a processor left over could not add to the next recording.
+    const own: Float32Array[] = []
+    chunks = own
     length = 0
     node.onaudioprocess = (e) => {
+      if (chunks !== own) return
       const data = new Float32Array(e.inputBuffer.getChannelData(0))
-      chunks.push(data)
+      own.push(data)
       length += data.length
     }
     source.connect(node)
     node.connect(context.destination)
     recording.value = true
+    clearTimeout(limit)
     limit = setTimeout(onLimit, MAX_SECONDS * 1000)
   }
 
   function release() {
+    generation++
     clearTimeout(limit)
     node?.disconnect()
     stream?.getTracks().forEach(t => t.stop())

@@ -1461,6 +1461,12 @@ pub fn run() {
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
                 tracing::info!("facteur exiting");
+                // The servers are told: Outlook would otherwise turn down the next launch's
+                // sign-ins for a minute.
+                if let Some(engine) = app.try_state::<Arc<Engine>>() {
+                    let engine = engine.inner().clone();
+                    tauri::async_runtime::block_on(async move { engine.sign_out().await });
+                }
                 if let Some(guard) = app.try_state::<LogGuard>() {
                     drop(guard.0.lock().unwrap_or_else(|e| e.into_inner()).take());
                 }

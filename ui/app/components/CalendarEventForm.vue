@@ -113,9 +113,9 @@ const zoneItems = computed(() => {
 /** Where the times fall on the computer's clock, when the event is set in another zone. */
 const localHint = computed(() => {
   if (form.allDay || zone.value === localZone()) return null
-  const start = parse(form.startDate, form.startTime)
-  if (!start) return null
-  const at = new Date(instantOf(start, zone.value) * 1000)
+  const start = instantAt(form.startDate, form.startTime, zone.value)
+  if (start === null) return null
+  const at = new Date(start * 1000)
   return t('tools.calendar.event.localTime', { time: at.toLocaleString(undefined, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) })
 })
 
@@ -176,7 +176,9 @@ const rebuilds = computed(() => {
   const before = seriesRepeat.value
   if (!e?.recurring || scope.value !== 'series' || !before) return false
   const start = new Date(e.start * 1000)
-  if (form.startDate !== dateText(start) || form.allDay !== e.all_day) return true
+  // The first day as the event's own zone gives it, as the engine compares it.
+  const day = e.all_day ? dateText(start) : wallFields(e.start, zoneBefore.value).date
+  if (form.startDate !== day || form.allDay !== e.all_day) return true
   if (!form.allDay && zone.value !== zoneBefore.value) return true
   return JSON.stringify(toRepeat(repeat.value)) !== JSON.stringify(toRepeat(fromRepeat(before, start)))
 })
@@ -207,19 +209,21 @@ function fill() {
   if (e) {
     zone.value = zoneBefore.value
     reminders.value = [...e.reminders]
-    const start = e.all_day ? new Date(e.start * 1000) : wallDate(e.start, zone.value)
+    const start = new Date(e.start * 1000)
     // A whole day ends at the midnight after its last day: the form shows that last day, a
     // calendar day before (not 24 hours: the day clocks change has 23 or 25).
-    const after = e.all_day ? new Date(e.end * 1000) : wallDate(e.end, zone.value)
-    const end = e.all_day ? new Date(Math.max(start.getTime(), addDays(dayStart(after), -1).getTime())) : after
+    const after = new Date(e.end * 1000)
+    const end = new Date(Math.max(start.getTime(), addDays(dayStart(after), -1).getTime()))
+    const from = e.all_day ? { date: dateText(start), time: timeText(start) } : wallFields(e.start, zone.value)
+    const to = e.all_day ? { date: dateText(end), time: timeText(end) } : wallFields(e.end, zone.value)
     Object.assign(form, {
       summary: e.summary,
       calendarId: e.calendar_id,
       allDay: e.all_day,
-      startDate: dateText(start),
-      startTime: timeText(start),
-      endDate: dateText(end),
-      endTime: timeText(end),
+      startDate: from.date,
+      startTime: from.time,
+      endDate: to.date,
+      endTime: to.time,
       location: e.location ?? '',
       description: e.description ?? ''
     })
@@ -281,9 +285,9 @@ function draft(): EventDraft | null {
       reminders: reminders.value
     }
   }
-  const start = parse(form.startDate, form.startTime)
-  const end = parse(form.endDate, form.endTime)
-  if (!start || !end) return null
+  const start = instantAt(form.startDate, form.startTime, zone.value)
+  const end = instantAt(form.endDate, form.endTime, zone.value)
+  if (start === null || end === null) return null
   // The zone is sent once changed: an event left in its own keeps it, a new one in the computer's
   // is written as before.
   const before = props.event ? validZone(props.event.zone) : null
@@ -292,8 +296,8 @@ function draft(): EventDraft | null {
     summary: form.summary,
     location: form.location || null,
     description: form.description || null,
-    start: instantOf(start, zone.value),
-    end: instantOf(end, zone.value),
+    start,
+    end,
     all_day: false,
     repeat: toRepeat(repeat.value),
     attendees: guestList(),
@@ -428,6 +432,7 @@ async function remove() {
               v-model="zone"
               :items="zoneItems"
               value-key="value"
+              virtualize
               icon="i-lucide-globe"
               :search-input="{ placeholder: t('tools.calendar.event.searchZone'), icon: 'i-lucide-search' }"
               :aria-label="t('tools.calendar.event.zone')"

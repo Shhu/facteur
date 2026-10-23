@@ -81,6 +81,53 @@ const CARD_LIST_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 /// ignore that and send whole vCards, photos included: each answer stays bounded.
 const CARDS_PER_REQUEST: usize = 100;
 
+/// Objects asked for in one calendar-multiget: a calendar of any size is read in answers of
+/// bounded size.
+const MULTIGET_CHUNK: usize = 50;
+
+fn time_range(from: i64, to: i64) -> (String, String) {
+    let utc = |t: i64| chrono::DateTime::from_timestamp(t, 0).map(|d| d.format("%Y%m%dT%H%M%SZ").to_string()).unwrap_or_default();
+    (utc(from), utc(to))
+}
+
+/// The objects with an event in the window: their address and ETag only.
+fn etags_body(from: i64, to: i64) -> String {
+    let (start, end) = time_range(from, to);
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><d:getetag/></d:prop>
+  <c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT"><c:time-range start="{start}" end="{end}"/></c:comp-filter></c:comp-filter></c:filter>
+</c:calendar-query>"#
+    )
+}
+
+/// These objects, their recurring events expanded over the window by the server.
+fn multiget_body(hrefs: &[String], from: i64, to: i64) -> String {
+    let (start, end) = time_range(from, to);
+    let escape = |h: &str| h.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let list: String = hrefs.iter().map(|h| format!("<d:href>{}</d:href>", escape(h))).collect();
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<c:calendar-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><d:getetag/><c:calendar-data><c:expand start="{start}" end="{end}"/></c:calendar-data></d:prop>
+  {list}
+</c:calendar-multiget>"#
+    )
+}
+
+/// (address, ETag) of each object listed.
+fn parse_etags(xml: &str, base: &Url) -> Result<Vec<(String, String)>> {
+    let doc = document(xml)?;
+    Ok(responses(&doc)
+        .into_iter()
+        .filter_map(|(href, props)| {
+            let etag = props.into_iter().find(|p| is(p, DAV, "getetag")).map(text).filter(|e| !e.is_empty())?;
+            Some((base.join(&href).ok()?.to_string(), etag))
+        })
+        .collect())
+}
+
 fn cards_body(hrefs: &[String]) -> String {
     let escape = |h: &str| h.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     let list: String = hrefs.iter().map(|h| format!("<d:href>{}</d:href>", escape(h))).collect();
@@ -497,6 +544,29 @@ impl Client {
         parse_calendars(&xml, &base)
     }
 
+    /// Address and ETag of each object with an event in the window: what changed since the last
+    /// sync is told by them, without its content.
+    pub async fn etags(&self, calendar: &Url, from: i64, to: i64) -> Result<Vec<(String, String)>> {
+        let (base, xml) = self.dav("REPORT", calendar, "1", &etags_body(from, to), MAX_REPORT).await?;
+        parse_etags(&xml, &base)
+    }
+
+    /// The events of these objects (absolute addresses), read in batches: none of the answers
+    /// grows with the calendar.
+    pub async fn objects(&self, calendar: &Url, hrefs: &[String], from: i64, to: i64, me: &[String]) -> Result<Vec<Instance>> {
+        let mut out = Vec::new();
+        for chunk in hrefs.chunks(MULTIGET_CHUNK) {
+            // Paths, as servers expect them in a multiget.
+            let paths: Vec<String> = chunk.iter().filter_map(|h| Url::parse(h).ok()).map(|u| u.path().to_string()).collect();
+            let (base, xml) = self.dav("REPORT", calendar, "1", &multiget_body(&paths, from, to), MAX_REPORT).await?;
+            for (href, ics) in parse_calendar_data(&xml)? {
+                let href = base.join(&href).ok().map(|u| u.to_string());
+                out.extend(crate::calendar::instances(&ics, from, to, me).into_iter().map(|i| Instance { href: href.clone(), ..i }));
+            }
+        }
+        Ok(out)
+    }
+
     /// The server is asked to expand recurring events; those it leaves whole are expanded by
     /// [`crate::calendar::instances`].
     pub async fn events(&self, calendar: &Url, from: i64, to: i64, me: &[String]) -> Result<Vec<Instance>> {
@@ -697,6 +767,20 @@ fn checked(answer: Answer) -> Result<Answer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_calendar_is_listed_by_etags_and_read_in_batches() {
+        let base = Url::parse("https://dav.example/cal/y/").unwrap();
+        let xml = r#"<d:multistatus xmlns:d="DAV:">
+ <d:response><d:href>/cal/y/a.ics</d:href><d:propstat><d:prop><d:getetag>"1"</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+ <d:response><d:href>/cal/y/b%20c.ics</d:href><d:propstat><d:prop><d:getetag>"7"</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+</d:multistatus>"#;
+        let listed = parse_etags(xml, &base).unwrap();
+        assert_eq!(listed, [("https://dav.example/cal/y/a.ics".to_string(), "\"1\"".to_string()), ("https://dav.example/cal/y/b%20c.ics".to_string(), "\"7\"".to_string())]);
+        let body = multiget_body(&["/cal/y/a&b.ics".into()], 0, 86400);
+        assert!(body.contains("<c:calendar-multiget") && body.contains("<d:href>/cal/y/a&amp;b.ics</d:href>") && body.contains("<c:expand start=\"19700101T000000Z\""));
+        assert!(etags_body(0, 86400).contains("<d:getetag/></d:prop>") && !etags_body(0, 86400).contains("calendar-data"));
+    }
 
     #[test]
     fn candidates_for_an_address() {

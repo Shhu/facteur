@@ -25,8 +25,10 @@ export function useCalendar() {
     try {
       const [list, states] = await Promise.all([api.calendars(), api.calendarStatus()])
       if (mine !== calendarsRequest) return
-      calendars.value = list
-      statuses.value = states
+      // Read again at each mail sync, rarely changed: the screens built on them are not redone
+      // for the same lists.
+      if (JSON.stringify(list) !== JSON.stringify(calendars.value)) calendars.value = list
+      if (JSON.stringify(states) !== JSON.stringify(statuses.value)) statuses.value = states
       loaded.value = true
     } catch {
       // The engine may not know calendars yet: nothing shown, the next change retries.

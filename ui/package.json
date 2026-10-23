@@ -7,6 +7,7 @@
     "dev": "nuxt dev",
     "generate": "nuxt generate",
     "typecheck": "nuxt typecheck",
+    "test": "TZ=Europe/Paris vitest run",
     "postinstall": "nuxt prepare"
   },
   "dependencies": {
@@ -28,6 +29,7 @@
   },
   "devDependencies": {
     "typescript": "^5.9.3",
+    "vitest": "^5.0.5",
     "vue-tsc": "^3.3.13"
   }
 }

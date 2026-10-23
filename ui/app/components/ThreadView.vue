@@ -459,6 +459,8 @@ const toast = useToast()
 const summary = ref<{ thread: number, text: string | null, error: string | null } | null>(null)
 watch(() => props.threadId, () => {
   summary.value = null
+  findingEvent.value = false
+  suggestion.value = null
 })
 async function summarize() {
   const thread = props.threadId
@@ -478,9 +480,12 @@ async function eventFromMessage() {
   // The latest message received (not one of our replies): the one proposing the appointment.
   const model = [...messages.value].reverse().find(m => !isMine(m.from?.email, props.accountId)) ?? latest.value
   if (!model || findingEvent.value) return
+  const thread = props.threadId
   findingEvent.value = true
   try {
     const found = await api.aiFindEvent(model.id)
+    // Another thread shown meanwhile: the answer was for the one left.
+    if (props.threadId !== thread) return
     if (!found) {
       toast.add({ title: t('mail.threadView.ai.noEvent'), icon: 'i-lucide-calendar-x' })
       return
@@ -489,9 +494,9 @@ async function eventFromMessage() {
     suggestion.value = found
     eventFormOpen.value = true
   } catch (e) {
-    showError(e)
+    if (props.threadId === thread) showError(e)
   } finally {
-    findingEvent.value = false
+    if (props.threadId === thread) findingEvent.value = false
   }
 }
 const aiItems = computed<DropdownMenuItem[]>(() => (aiReady.value

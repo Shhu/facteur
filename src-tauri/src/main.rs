@@ -1,6 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    // The local AI's own process (facteur_core::ai): a graphics driver failing ends it, not the
+    // app.
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("--ai-worker") {
+        facteur_core::ai::worker_main(args.next().as_deref() != Some("cpu"));
+        return;
+    }
     // Started by the self-update (selfupdate.rs) while the previous instance quits: wait for it
     // first, or the single-instance guard would hand this launch to it and exit.
     #[cfg(windows)]

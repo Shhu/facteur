@@ -215,38 +215,77 @@ impl Pooled {
 type Slot = Arc<AsyncMutex<Option<Pooled>>>;
 type Conn = OwnedMutexGuard<Option<Pooled>>;
 
-/// A session for a long job: its own, or the account's one connection, given back afterwards.
-enum Dedicated {
+/// A session for a long job (backup, restore, history): its own, or the account's one connection,
+/// given over between two steps to whoever waits for it (see [`backup::Lease`]).
+struct Dedicated<'a> {
+    engine: &'a Engine,
+    account_id: i64,
+    held: Option<Held>,
+}
+
+enum Held {
     Own(Session),
     Shared(Conn),
 }
 
-impl Dedicated {
+impl Dedicated<'_> {
     /// Its own is closed; the shared one goes back to the pool.
-    async fn finish(self) {
-        if let Dedicated::Own(mut session) = self {
-            logout(&mut session).await;
+    async fn finish(mut self) {
+        match self.held.take() {
+            Some(Held::Own(mut session)) => logout(&mut session).await,
+            Some(Held::Shared(conn)) => drop(conn),
+            None => {}
         }
     }
 }
 
-impl std::ops::Deref for Dedicated {
+impl Drop for Dedicated<'_> {
+    /// Not finished (an error, a timeout mid-command): the shared connection is in an uncertain
+    /// state, closed rather than handed to the next user.
+    fn drop(&mut self) {
+        if let Some(Held::Shared(mut conn)) = self.held.take() {
+            *conn = None;
+        }
+    }
+}
+
+impl backup::Lease for Dedicated<'_> {
+    fn session(&mut self) -> &mut Session {
+        match self.held.as_mut().expect("session held") {
+            Held::Own(session) => session,
+            Held::Shared(conn) => &mut conn.as_mut().expect("session open").session,
+        }
+    }
+
+    async fn give_way(&mut self) -> Result<()> {
+        let shared = matches!(self.held, Some(Held::Shared(_)));
+        if !shared || self.engine.waiting_on(self.account_id).load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return Ok(());
+        }
+        // Given back whole: the one waiting takes it (the lock is fair), this job queues after.
+        if let Some(Held::Shared(conn)) = self.held.take() {
+            drop(conn);
+        }
+        tokio::task::yield_now().await;
+        self.held = Some(Held::Shared(self.engine.session(self.account_id, Purpose::Background).await?));
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for Dedicated<'_> {
     type Target = Session;
 
     fn deref(&self) -> &Session {
-        match self {
-            Dedicated::Own(session) => session,
-            Dedicated::Shared(conn) => &conn.as_ref().expect("session open").session,
+        match self.held.as_ref().expect("session held") {
+            Held::Own(session) => session,
+            Held::Shared(conn) => &conn.as_ref().expect("session open").session,
         }
     }
 }
 
-impl std::ops::DerefMut for Dedicated {
+impl std::ops::DerefMut for Dedicated<'_> {
     fn deref_mut(&mut self) -> &mut Session {
-        match self {
-            Dedicated::Own(session) => session,
-            Dedicated::Shared(conn) => &mut conn.as_mut().expect("session open").session,
-        }
+        backup::Lease::session(self)
     }
 }
 
@@ -272,7 +311,15 @@ const POOL_CHECK_AFTER: Duration = Duration::from_secs(60);
 const POOL_CLOSE_AFTER: Duration = Duration::from_secs(120);
 const SYNC_RETRY_AFTER: Duration = Duration::from_secs(5);
 /// A sign-in refused "for now" for this long is no longer passing: the user is asked to sign in again.
+/// The waits before the next tries of a sign-in Outlook turns down "for now".
+const REFUSED_RETRIES: [Duration; 3] = [Duration::from_secs(5), Duration::from_secs(15), Duration::from_secs(30)];
+/// The longest a keychain write is waited for.
+const KEYCHAIN_WAIT: Duration = Duration::from_secs(5);
 const REFUSED_FOR_NOW_LIMIT: Duration = Duration::from_secs(30 * 60);
+/// Refusals "for now" further apart are no run: a sleep or an evening between them.
+const REFUSED_FOR_NOW_GAP: Duration = Duration::from_secs(10 * 60);
+/// At least this many refusals in the run before the account waits for the user.
+const REFUSED_FOR_NOW_COUNT: u32 = 5;
 /// A full sync the server cut on both attempts is retried this long after, so a passing cut
 /// (a host dropping a mailbox's sessions now and then) shows for a minute at most.
 const SYNC_FOLLOW_UP: Duration = Duration::from_secs(60);
@@ -316,7 +363,8 @@ pub struct Engine {
     /// In memory only. The expiry is wall-clock time (see [`oauth::Tokens::expires_at`]).
     tokens: Mutex<HashMap<i64, (String, SystemTime)>>,
     /// Since when the IMAP server has been turning the account's sign-in down "for now".
-    refused_since: Mutex<HashMap<i64, SystemTime>>,
+    /// Refusals "for now" in a row: (the first, the last, how many).
+    refused_since: Mutex<HashMap<i64, (SystemTime, SystemTime, u32)>>,
     /// Microsoft: the calendar's tokens (Graph), apart from the mail's.
     /// Microsoft Graph token, its expiry, and whether it may write to the calendars.
     calendar_tokens: Mutex<HashMap<i64, (String, SystemTime, bool)>>,
@@ -596,9 +644,11 @@ fn series_repeat(rule: Option<crate::repeat::Repeat>) -> SeriesRepeat {
 /// facteur cannot write back keeps the series' days.
 fn series_plan(e: &CalendarEvent, draft: &EventDraft, changes: &crate::calendar::EventChanges, now: &SeriesRepeat, first: chrono::NaiveDate) -> Result<Option<Option<crate::repeat::Repeat>>> {
     // Another zone: the series is written again in it.
+    // Days compared in the event's zone: a time change across the computer's midnight is no move.
     let moved = changes.rezoned(e)
-        || changes.times.is_some_and(|(start, _, all_day)| {
-            all_day != e.all_day || crate::calendar::local_date(start) != crate::calendar::local_date(e.start)
+        || changes.times.is_some_and(|(start, end, all_day)| {
+            all_day != e.all_day
+                || crate::calendar::first_day(start, end, all_day, changes.zone.as_deref()) != crate::calendar::first_day(e.start, e.end, e.all_day, e.zone.as_deref())
         });
     // Compared as written: weekly on no day named is weekly on the first day's.
     let written = |r: &Option<crate::repeat::Repeat>| r.as_ref().map(|r| r.rrule(first, None));
@@ -879,11 +929,7 @@ impl Engine {
                     // written again later if the keychain refuses it now.
                     // Bounded: this lock holds every connection of the account, and a keychain can
                     // block for long. Too slow, it is written later like a refused write.
-                    let saved = match tokio::time::timeout(Duration::from_secs(5), self.store_secret(account.id, new_refresh)).await {
-                        Ok(res) => res,
-                        Err(_) => Err(Error::Secret(crate::tr!("trousseau trop lent", "keychain too slow"))),
-                    };
-                    if let Err(e) = saved {
+                    if let Err(e) = self.store_secret(account.id, new_refresh).await {
                         tracing::error!("account {}: new refresh token not saved to the keychain (retried later): {e}", account.id);
                         self.secret_cache.lock().unwrap().insert(account.id, new_refresh.to_string());
                         self.unsaved_secrets.lock().unwrap().insert(account.id);
@@ -907,7 +953,27 @@ impl Engine {
             (Err(Error::Auth(_) | Error::Refused(_)), Credential::Token(used)) => {
                 self.forget_token(account.id, Some(used.as_str()));
                 let credential = self.credential(account).await?;
-                imap::connect(&account.imap, &account.username, &credential).await
+                match imap::connect(&account.imap, &account.username, &credential).await {
+                    // The provider has just issued that token: the grant holds, the server is the
+                    // one failing (an Outlook backend issue). Signing in again would give the same
+                    // token: it is a passing refusal.
+                    Err(Error::Auth(why)) => Err(Error::Refused(why)),
+                    // Outlook turns sign-ins down this way for about a minute after a launch (its
+                    // new token or the last session's end not taken in yet): tried again a few
+                    // times over that minute before telling.
+                    Err(Error::Refused(why)) if imap::cured_by_signing_in(&why) => {
+                        let mut res = Err(Error::Refused(why));
+                        for wait in REFUSED_RETRIES {
+                            tokio::time::sleep(wait).await;
+                            res = imap::connect(&account.imap, &account.username, &credential).await;
+                            if !matches!(&res, Err(Error::Refused(_))) {
+                                break;
+                            }
+                        }
+                        res
+                    }
+                    res => res,
+                }
             }
             (res, _) => res,
         };
@@ -922,14 +988,24 @@ impl Engine {
         res
     }
 
-    /// A sign-in turned down "for now" at `now`: past [`REFUSED_FOR_NOW_LIMIT`] since the first
-    /// one, the account waits for the user.
+    /// A sign-in turned down "for now" at `now`: refused again and again for
+    /// [`REFUSED_FOR_NOW_LIMIT`] (none more than [`REFUSED_FOR_NOW_GAP`] apart, at least
+    /// [`REFUSED_FOR_NOW_COUNT`] times), the account waits for the user.
     fn refused_for_now(&self, account_id: i64, why: &str, now: SystemTime) {
         if !imap::cured_by_signing_in(why) {
             return;
         }
-        let since = *self.refused_since.lock().unwrap().entry(account_id).or_insert(now);
-        if now.duration_since(since).unwrap_or_default() < REFUSED_FOR_NOW_LIMIT {
+        let (since, count) = {
+            let mut runs = self.refused_since.lock().unwrap();
+            let run = runs.entry(account_id).or_insert((now, now, 0));
+            if now.duration_since(run.1).unwrap_or_default() > REFUSED_FOR_NOW_GAP {
+                *run = (now, now, 0);
+            }
+            run.1 = now;
+            run.2 += 1;
+            (run.0, run.2)
+        };
+        if now.duration_since(since).unwrap_or_default() < REFUSED_FOR_NOW_LIMIT || count < REFUSED_FOR_NOW_COUNT {
             return;
         }
         self.refused_since.lock().unwrap().remove(&account_id);
@@ -961,6 +1037,17 @@ impl Engine {
     fn clear_refusal(&self, account_id: i64) {
         if self.auth_refused.lock().unwrap().remove(&account_id).is_some() {
             self.emit(Event::AuthChanged { account_id, error: None });
+        }
+        // Its sends that waited for it go now.
+        self.retry_sends_now(Some(account_id));
+    }
+
+    /// Sends waiting after a failure go at once (an account signed in again, the network back).
+    fn retry_sends_now(&self, account_id: Option<i64>) {
+        match self.store.retry_outgoing_now(account_id, crate::store::now()) {
+            Ok(0) => {}
+            Ok(_) => self.scheduler.notify_one(),
+            Err(e) => tracing::warn!("waiting sends not brought forward: {e}"),
         }
     }
 
@@ -1028,6 +1115,7 @@ impl Engine {
             *last = Some(Instant::now());
         }
         tracing::info!("resumed (wake from sleep or back online): syncing now");
+        self.retry_sends_now(None);
         // Kept connections may belong to the network before (and on Linux, Instant does not
         // count the sleep): each is checked with a NOOP before its next use. One in use is left
         // alone, and none is closed here (one connection for everything must stay one).
@@ -1072,10 +1160,14 @@ impl Engine {
         Ok(secret)
     }
 
+    /// Bounded: a keychain waiting for an unlock prompt must not hold the caller (the account's
+    /// OAuth lock, the periodic loop). Too slow, the secret is written again later.
     async fn store_secret(&self, account_id: i64, secret: &str) -> Result<()> {
         let owned = secret.to_string();
-        tokio::task::spawn_blocking(move || Secrets::new().set(account_id, &owned))
+        let write = tokio::task::spawn_blocking(move || Secrets::new().set(account_id, &owned));
+        tokio::time::timeout(KEYCHAIN_WAIT, write)
             .await
+            .map_err(|_| Error::Secret(crate::tr!("trousseau trop lent", "keychain too slow")))?
             .map_err(|e| Error::Secret(e.to_string()))??;
         self.secret_cache.lock().unwrap().insert(account_id, secret.to_string());
         self.unsaved_secrets.lock().unwrap().remove(&account_id);
@@ -1153,6 +1245,26 @@ impl Engine {
 
     fn waiting_on(&self, account_id: i64) -> Arc<std::sync::atomic::AtomicUsize> {
         self.waiting.lock().unwrap().entry(account_id).or_default().clone()
+    }
+
+    /// At quit: every connection is closed with a LOGOUT, the listening ones stopped first, so
+    /// that a server counting sessions (Outlook) does not turn down the next launch's sign-ins for
+    /// the ones it still believes open. Bounded: quitting must not wait for a slow server.
+    pub async fn sign_out(&self) {
+        for stop in self.idle_stops.lock().unwrap().values() {
+            let _ = stop.send(true);
+        }
+        let slots: Vec<Slot> = self.slots.lock().unwrap().values().cloned().collect();
+        let mut sessions = Vec::new();
+        for slot in slots {
+            if let Ok(mut guard) = slot.try_lock_owned()
+                && let Some(conn) = guard.take()
+            {
+                sessions.push(conn.session);
+            }
+        }
+        let out = futures::future::join_all(sessions.iter_mut().map(logout));
+        let _ = tokio::time::timeout(Duration::from_secs(2), out).await;
     }
 
     async fn close_idle_connections(&self) {
@@ -1669,6 +1781,8 @@ impl Engine {
             let mut fresh_inbox = Vec::new();
             let states: Vec<_> = self.store.mailbox_states(account_id)?.into_iter().filter(|s| s.selectable).collect();
             for state in states {
+                // On an account limited to one connection, whoever waits for it goes first.
+                backup::Lease::give_way(&mut session).await?;
                 let label = crate::utf7::decode(&state.name);
                 let total = state.server_count.unwrap_or(0).max(0) as usize;
                 let what = crate::tr!("récupération de l'historique", "fetching history");
@@ -1694,6 +1808,7 @@ impl Engine {
                     let state = self.store.mailbox_state(state.id)?;
                     let done = self.store.uid_stats(state.id)?.0;
                     self.emit(Event::SyncProgress { account_id, mailbox: label.clone(), done, total: total.max(done) });
+                    backup::Lease::give_way(&mut session).await?;
                     let n = bounded(600, &what, sync::load_older(&self.store, &mut session, state, sync::WINDOW)).await?;
                     added += n;
                     if n == 0 {
@@ -1703,7 +1818,7 @@ impl Engine {
                 }
             }
             session.finish().await;
-            self.after_inbox_arrivals(account_id, &fresh_inbox);
+            self.after_inbox_arrivals(account_id, &fresh_inbox, false);
             Ok(added)
         }
         .await;
@@ -2002,9 +2117,27 @@ impl Engine {
             });
         }
         let summary = self.store.summary(id)?;
-        let parsed = {
+        // Off the async workers with the parse: an invitation's rules and a long text are read
+        // here (a crafted invite must not hold a worker). An invitation has its own card;
+        // otherwise a day and time in the sender's own words (the quoted thread left out) offer to
+        // make an event.
+        let (parsed, invite, appointment) = {
             let raw = raw.clone();
-            blocking(move || mime::parse_body(&raw)).await?
+            let (date, subject) = (summary.date, summary.subject.clone());
+            blocking(move || {
+                let parsed = mime::parse_body(&raw)?;
+                let invite = parsed.calendar.as_deref().and_then(crate::calendar::parse);
+                let appointment = match invite {
+                    Some(_) => None,
+                    None => {
+                        let text = parsed.text.clone().unwrap_or_else(|| crate::mime::html_to_text(&parsed.html));
+                        let received = chrono::DateTime::from_timestamp(date, 0).map(|d| d.with_timezone(&chrono::Local).date_naive());
+                        received.and_then(|day| crate::ai::appointment(&crate::ai::fresh(&text), &subject_core(&subject), day, crate::store::now()))
+                    }
+                };
+                Ok((parsed, invite, appointment))
+            })
+            .await?
         };
         let (mut signals, context) = self.trust_parts(id, Some(&parsed.headers.signals))?;
         // Before the images are allowed, so that a forged signature never loads them.
@@ -2018,20 +2151,10 @@ impl Engine {
         }
         let trust = crate::trust::evaluate(&signals, &context);
         let sender_key = parsed.headers.from.as_ref().and_then(|a| crate::avatars::sender_key(&a.email));
-        let invite = parsed.calendar.as_deref().and_then(crate::calendar::parse).map(|mut i| {
+        let invite = invite.map(|mut i| {
             i.my_response = self.store.setting(&format!("rsvp:{}", i.uid)).ok().flatten();
             i
         });
-        // An invitation has its own card. Otherwise a day and time in the sender's own words (the
-        // quoted thread left out) offer to make an event.
-        let appointment = match invite {
-            Some(_) => None,
-            None => {
-                let text = parsed.text.clone().unwrap_or_else(|| crate::mime::html_to_text(&parsed.html));
-                let received = chrono::DateTime::from_timestamp(summary.date, 0).map(|d| d.with_timezone(&chrono::Local).date_naive());
-                received.and_then(|day| crate::ai::appointment(&crate::ai::fresh(&text), &subject_core(&summary.subject), day, crate::store::now()))
-            }
-        };
         Ok(MessageDetail {
             summary,
             cc: parsed.headers.cc,
@@ -3619,16 +3742,47 @@ impl Engine {
             }
         }
         drop(guard);
-        self.after_inbox_arrivals(account_id, &fresh_inbox);
+        self.after_inbox_arrivals(account_id, &fresh_inbox, true);
         self.emit(Event::Changed { account_id });
         Ok(())
     }
 
+    /// New mail told to the interface (notification, counters). With Gmail's labels, an arrival
+    /// is shown from the inbox, not from All Mail.
+    fn tell_new_mail(&self, account_id: i64, ids: &[i64], held: &HashSet<i64>) {
+        let inbox = match self.store.labels_model(account_id) {
+            Ok(true) => self.store.mailbox_by_role(account_id, Role::Inbox).ok().flatten().map(|m| m.id),
+            _ => None,
+        };
+        let messages: Vec<NewMail> = ids
+            .iter()
+            .filter_map(|&id| {
+                let m = self.store.summary(id).ok()?;
+                Some(NewMail {
+                    id,
+                    thread_id: m.thread_id,
+                    mailbox_id: inbox.unwrap_or(m.mailbox_id),
+                    from: m.from,
+                    subject: m.subject,
+                    preview: m.preview,
+                    // "People only": what the smart inbox does not file with people.
+                    bulk: self.store.message_category(id).map_or(true, |c| c != Category::People),
+                    trust: self.trust(id, None).map(|t| t.level).unwrap_or(crate::trust::Level::Medium),
+                    held: held.contains(&id),
+                })
+            })
+            .collect();
+        if !messages.is_empty() {
+            self.emit(Event::NewMail { account_id, messages });
+        }
+    }
+
     /// Messages that reached the inbox cache outside a regular sync (history, folder refresh):
-    /// blocked senders, rules and the screener apply to them as after a sync, without notification
-    /// (they may be old messages filling a gap). Arrivals held back for the screener
-    /// (`Store::insert_headers_held`) go through it here too, then show.
-    fn after_inbox_arrivals(self: &Arc<Self>, account_id: i64, ids: &[i64]) {
+    /// blocked senders, rules and the screener apply to them as after a sync. Told as new mail
+    /// only when `arrivals` (a folder refresh catching what just came); a history fetch fills gaps
+    /// with old mail. Arrivals held back for the screener (`Store::insert_headers_held`) go
+    /// through it here too, then show.
+    fn after_inbox_arrivals(self: &Arc<Self>, account_id: i64, ids: &[i64], arrivals: bool) {
         let waiting = self.store.unscreened(account_id).unwrap_or_default();
         if ids.is_empty() && waiting.is_empty() {
             return;
@@ -3643,11 +3797,16 @@ impl Engine {
         let mut left: Vec<i64> = fresh.into_iter().filter(|id| !ruled.moved.contains(id)).collect();
         let more: Vec<i64> = waiting.iter().copied().filter(|id| !left.contains(id) && !blocked.contains(id) && !ruled.moved.contains(id)).collect();
         left.extend(more);
-        if let Err(e) = self.screen(account_id, &left) {
+        let (held, refused) = self.screen(account_id, &left).unwrap_or_else(|e| {
             tracing::warn!("screener of account {account_id}: {e}");
-        }
+            Default::default()
+        });
         if let Err(e) = self.store.clear_unscreened(&waiting) {
             tracing::warn!("screener of account {account_id}: {e}");
+        }
+        if arrivals {
+            let told: Vec<i64> = ids.iter().copied().filter(|id| !blocked.contains(id) && !ruled.contains(id) && !refused.contains(id)).collect();
+            self.tell_new_mail(account_id, &told, &held);
         }
     }
 
@@ -3920,12 +4079,18 @@ impl Engine {
             Error::Smtp(text) | Error::Mime(text) => Error::Mime(text),
             e => e,
         })?;
-        let credential = self.credential(&account).await?;
+        // No credential (the account waits to be signed in again, the keychain or the OAuth
+        // provider out of reach): the message waits, no attempt spent.
+        let waiting = |e: Error| match e {
+            Error::Unreachable(_) => e,
+            e => Error::Unreachable(e.to_string()),
+        };
+        let credential = self.credential(&account).await.map_err(waiting)?;
         let mut sent = smtp::send(&account, &credential, &message).await;
         // An access token refused although not expired (as for IMAP, `login`): a fresh one, once.
         if let (Err(Error::Auth(_)), Credential::Token(used)) = (&sent, &credential) {
             self.forget_token(account.id, Some(used.as_str()));
-            let credential = self.credential(&account).await?;
+            let credential = self.credential(&account).await.map_err(waiting)?;
             sent = smtp::send(&account, &credential, &message).await;
         }
         match sent {
@@ -4474,8 +4639,11 @@ impl Engine {
 
     async fn run_due(self: &Arc<Self>) {
         let now = crate::store::now();
+        // Accounts whose two sending lanes are taken: their messages stay pending (still
+        // cancellable, not "interrupted" by a quit) until a lane frees and runs this again.
+        let mut busy: Vec<i64> = Vec::new();
         loop {
-            let (id, draft, remind) = match self.store.claim_outgoing(now) {
+            let (id, draft, remind) = match self.store.claim_outgoing_except(now, &busy) {
                 Ok(Some(claimed)) => claimed,
                 Ok(None) => break,
                 Err(e) => {
@@ -4483,9 +4651,17 @@ impl Engine {
                     break;
                 }
             };
+            let lane = self.send_lane(draft.account_id);
+            let Ok(permit) = lane.try_acquire_owned() else {
+                if let Err(e) = self.store.unclaim_outgoing(id) {
+                    tracing::error!("outbox: {e}");
+                }
+                busy.push(draft.account_id);
+                continue;
+            };
             // Each delivery in its own task: a slow or stuck server delays neither the other messages nor
             // the snoozes and follow-ups below.
-            self.spawn(self.clone().deliver_outgoing(id, draft, remind));
+            self.spawn(self.clone().deliver_outgoing(id, draft, remind, permit));
         }
 
         for (account_id, thread_id, mids, until) in self.store.snoozed().unwrap_or_default() {
@@ -4532,13 +4708,17 @@ impl Engine {
         }
     }
 
-    async fn deliver_outgoing(self: Arc<Self>, id: i64, draft: Draft, remind: Option<i64>) {
+    /// Two sends at a time per account: a batch of scheduled messages falling due together must
+    /// not open as many connections (servers limit them, and a 4xx would spend an attempt).
+    fn send_lane(&self, account_id: i64) -> Arc<tokio::sync::Semaphore> {
+        self.sending.lock().unwrap().entry(account_id).or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(2))).clone()
+    }
+
+    /// `_lane`: the account's sending lane, held until the send ends; the messages that waited
+    /// for it are looked at again then.
+    async fn deliver_outgoing(self: Arc<Self>, id: i64, draft: Draft, remind: Option<i64>, _lane: tokio::sync::OwnedSemaphorePermit) {
         self.emit(Event::OutboxChanged);
         let (account_id, subject) = (draft.account_id, draft.subject.clone());
-        // Two at a time per account: a batch of scheduled messages falling due together must not
-        // open as many connections (servers limit them, and a 4xx would spend an attempt).
-        let lane = self.sending.lock().unwrap().entry(account_id).or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(2))).clone();
-        let _lane = lane.acquire_owned().await;
         let res = std::panic::AssertUnwindSafe(self.deliver(draft, remind)).catch_unwind().await.unwrap_or_else(|_| {
             // Not known how far it went: treated like a cut in the middle of the transfer.
             Err(Error::Uncertain(crate::tr!("erreur interne pendant l'envoi", "internal error while sending")))
@@ -4560,21 +4740,25 @@ impl Engine {
                     e => e,
                 };
                 tracing::warn!("send {id}: {e}");
-                let attempts = self.store.outgoing_attempts(id).unwrap_or(0) + 1;
-                let retry = retry_at(&e, attempts, crate::store::now());
+                let offline = matches!(e, Error::Unreachable(_));
+                let (attempts, tries) = self.store.outgoing_tries(id).unwrap_or((0, 0));
+                let (attempts, tries) = if offline { (attempts, tries + 1) } else { (attempts + 1, tries) };
+                let retry = retry_at(&e, attempts, tries, crate::store::now());
                 // Otherwise the message would stay "sending" for the rest of the session.
-                if let Err(db) = persist(|| self.store.outgoing_failed(id, &e.to_string(), retry)).await {
+                if let Err(db) = persist(|| self.store.outgoing_failed(id, &e.to_string(), retry, offline)).await {
                     tracing::error!("send {id}: failure not recorded, the message may stay as being sent: {db}");
                 }
                 // Tell on the first failure and on giving up, not at every attempt.
-                if attempts == 1 || retry.is_none() {
+                if attempts + tries == 1 || retry.is_none() {
                     self.emit(Event::SendFailed { id, account_id, subject, error: e.to_string(), retrying: retry.is_some() });
                 }
-                // The scheduler may be asleep for longer than the next try.
-                self.scheduler.notify_one();
             }
         }
         self.emit(Event::OutboxChanged);
+        // The lane frees: messages that waited for it go; and the scheduler may be asleep for
+        // longer than a retry.
+        drop(_lane);
+        self.scheduler.notify_one();
     }
 
     fn check_follow_ups(&self, now: i64) {
@@ -4808,36 +4992,8 @@ impl Engine {
         let received: Vec<i64> = report.received_ids.iter().copied().filter(|id| !blocked.contains(id) && !refused.contains(id)).collect();
         let arrived_since = (crate::store::now() - DKIM_ARRIVAL).min(previous_sync.map_or(i64::MAX, |t| t - 600));
         self.check_dkim(&received, arrived_since);
-        {
-            // With Gmail's labels, an arrival is shown from the inbox, not from All Mail.
-            let inbox = match self.store.labels_model(account_id) {
-                Ok(true) => self.store.mailbox_by_role(account_id, Role::Inbox).ok().flatten().map(|m| m.id),
-                _ => None,
-            };
-            let messages: Vec<NewMail> = report
-                .new_inbox_ids
-                .iter()
-                .filter(|id| !blocked.contains(id) && !ruled.contains(id) && !refused.contains(id))
-                .filter_map(|&id| {
-                    let m = self.store.summary(id).ok()?;
-                    Some(NewMail {
-                        id,
-                        thread_id: m.thread_id,
-                        mailbox_id: inbox.unwrap_or(m.mailbox_id),
-                        from: m.from,
-                        subject: m.subject,
-                        preview: m.preview,
-                        // "People only": what the smart inbox does not file with people.
-                        bulk: self.store.message_category(id).map_or(true, |c| c != Category::People),
-                        trust: self.trust(id, None).map(|t| t.level).unwrap_or(crate::trust::Level::Medium),
-                        held: held.contains(&id),
-                    })
-                })
-                .collect();
-            if !messages.is_empty() {
-                self.emit(Event::NewMail { account_id, messages });
-            }
-        }
+        let arrived: Vec<i64> = report.new_inbox_ids.iter().copied().filter(|id| !blocked.contains(id) && !ruled.contains(id) && !refused.contains(id)).collect();
+        self.tell_new_mail(account_id, &arrived, &held);
         // No change, no reload of the interface; after an error the sync may have stopped halfway, so
         // reload to be safe.
         let changed = res.is_err() || report.changed;
@@ -4855,11 +5011,13 @@ impl Engine {
     /// So that a long backup blocks neither the sync nor reading. With one connection for
     /// everything, the account's own is taken instead (queued behind the sync): a second one
     /// would bring back the cut sessions that mode is there to avoid.
-    async fn dedicated_session(&self, account: &Account) -> Result<Dedicated> {
-        if self.single_connection(account.id) {
-            return Ok(Dedicated::Shared(self.session(account.id, Purpose::Background).await?));
-        }
-        Ok(Dedicated::Own(self.login(account).await?))
+    async fn dedicated_session(&self, account: &Account) -> Result<Dedicated<'_>> {
+        let held = if self.single_connection(account.id) {
+            Held::Shared(self.session(account.id, Purpose::Background).await?)
+        } else {
+            Held::Own(self.login(account).await?)
+        };
+        Ok(Dedicated { engine: self, account_id: account.id, held: Some(held) })
     }
 
     /// The interface may have been reloaded during the operation: the engine is the reference.
@@ -5299,6 +5457,13 @@ impl Engine {
         // Behind the mail's refresh, which may rotate the refresh token.
         let lock = self.oauth_locks.lock().unwrap().entry(account.id).or_default().clone();
         let _refreshing = lock.lock().await;
+        // Refreshed meanwhile by another request that held the lock.
+        if let Some((token, expires_at, writable)) = self.calendar_tokens.lock().unwrap().get(&account.id).cloned()
+            && expires_at > SystemTime::now() + Duration::from_secs(60)
+            && (writable || !write)
+        {
+            return Ok(token);
+        }
         let refresh_token = self.secret(account.id).await?;
         // An account known to read only is not asked for writing at every refresh, only for a write.
         let read_only = !write && self.calendar_read_only.lock().unwrap().contains(&account.id);
@@ -5995,11 +6160,29 @@ impl Engine {
                 continue;
             }
             let Ok(url) = reqwest::Url::parse(&row.remote_id) else { continue };
-            match client.events(&url, from, to, &me).await {
-                Ok(events) => {
-                    changed.fetch_or(self.store.replace_calendar_events(row.id, account.id, &row.remote_id, &events, ctag.as_deref())?, Ordering::Relaxed);
+            // Window moved since: every object read again (in batches all the same).
+            let whole = row.synced_at.is_none_or(|t| t <= fresh_after);
+            match self.read_caldav_calendar(&client, &url, row.id, whole, (from, to), &me).await {
+                Ok(Some((listed, fetched, events))) => {
+                    changed.fetch_or(
+                        self.store.update_calendar_objects(row.id, account.id, &row.remote_id, &listed, &fetched, &events, ctag.as_deref())?,
+                        Ordering::Relaxed,
+                    );
                     outcome.synced += 1;
                 }
+                // The server cannot list its objects' ETags: read whole, as one answer.
+                Ok(None) => match client.events(&url, from, to, &me).await {
+                    Ok(events) => {
+                        changed.fetch_or(self.store.replace_calendar_events(row.id, account.id, &row.remote_id, &events, ctag.as_deref())?, Ordering::Relaxed);
+                        outcome.synced += 1;
+                    }
+                    Err(e @ Error::Auth(_)) => return Err(e),
+                    Err(e) => {
+                        tracing::warn!("CalDAV calendar {} of account {}: {e}", row.id, account.id);
+                        changed.fetch_or(self.store.set_calendar_error(row.id, account.id, &row.remote_id, Some(&e.to_string()))?, Ordering::Relaxed);
+                        outcome.failed.push((row.name.clone(), e));
+                    }
+                },
                 Err(e @ Error::Auth(_)) => return Err(e),
                 Err(e) => {
                     tracing::warn!("CalDAV calendar {} of account {}: {e}", row.id, account.id);
@@ -6009,6 +6192,29 @@ impl Engine {
             }
         }
         outcome.result()
+    }
+
+    /// A CalDAV calendar's objects in the window and the events of those to read again (all when
+    /// `whole`, else those new or whose ETag changed); `None` when the server does not list
+    /// ETags (an empty or refused listing), for the whole read instead.
+    async fn read_caldav_calendar(
+        &self,
+        client: &crate::caldav::Client,
+        url: &reqwest::Url,
+        calendar_id: i64,
+        whole: bool,
+        (from, to): (i64, i64),
+        me: &[String],
+    ) -> Result<Option<(Vec<(String, String)>, HashSet<String>, Vec<crate::calendar::Instance>)>> {
+        let listed = match client.etags(url, from, to).await {
+            Ok(listed) => listed,
+            Err(e @ Error::Auth(_)) => return Err(e),
+            Err(_) => return Ok(None),
+        };
+        let known = if whole { HashMap::new() } else { self.store.caldav_etags(calendar_id)? };
+        let fetched: Vec<String> = listed.iter().filter(|(href, etag)| known.get(href) != Some(etag)).map(|(href, _)| href.clone()).collect();
+        let events = client.objects(url, &fetched, from, to, me).await?;
+        Ok(Some((listed, fetched.into_iter().collect(), events)))
     }
 
     pub fn start_background(self: &Arc<Self>, interval: Duration) {
@@ -6466,17 +6672,40 @@ impl Engine {
 
     /// A thread summed up in a few points, by the local model.
     pub async fn ai_summarize(self: &Arc<Self>, account_id: i64, thread_id: i64) -> Result<String> {
-        let mut messages = Vec::new();
-        for m in self.thread(account_id, thread_id, None)? {
-            let detail = self.message(m.id).await?;
+        const BUDGET: usize = 12_000;
+        let mut thread = self.thread(account_id, thread_id, None)?;
+        thread.sort_by_key(|m| std::cmp::Reverse(m.date));
+        // The latest first, until the text the model is given is full: a long thread's oldest
+        // messages are neither downloaded nor parsed. One that cannot be read is left out.
+        let (mut messages, mut used, mut failed) = (Vec::new(), 0, None);
+        for m in thread {
+            let detail = match self.message(m.id).await {
+                Ok(detail) => detail,
+                Err(e) => {
+                    tracing::info!("summary: message {} left out: {e}", m.id);
+                    failed.get_or_insert(e);
+                    continue;
+                }
+            };
             let body = detail.text.clone().unwrap_or_else(|| crate::mime::html_to_text(&detail.html));
             let from = m.from.as_ref().map(|a| a.name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| a.email.clone())).unwrap_or_default();
+            used += crate::ai::fresh(&body).len().min(3000) + from.len() + 40;
             messages.push((from, m.date, body));
+            if used >= BUDGET {
+                break;
+            }
+        }
+        if messages.is_empty()
+            && let Some(e) = failed
+        {
+            return Err(e);
         }
         messages.sort_by_key(|(_, date, _)| *date);
-        let text = crate::ai::thread_text(&messages, 12_000);
-        let instructions = crate::ai::summary_instructions(!crate::i18n::english());
-        self.ai_answer(vec![("system".into(), instructions), ("user".into(), text)], 400, None).await
+        let text = crate::ai::thread_text(&messages, BUDGET);
+        let french = !crate::i18n::english();
+        let instructions = crate::ai::summary_instructions(french);
+        let text = crate::ai::summary_request(&text, french);
+        self.ai_answer(vec![("system".into(), instructions), ("user".into(), text)], 400, Some(crate::ai::SUMMARY_GRAMMAR)).await
     }
 
     /// The appointment a message proposes or confirms, found by the local model, its day and
@@ -6823,14 +7052,18 @@ async fn persist(mut write: impl FnMut() -> Result<()>) -> Result<()> {
 
 /// `None`: wait for the user. Tries 2, 3 and 4 come after 1, 2 and 4 minutes. A send that may
 /// have gone (uncertain) is never repeated on its own, nor one the server refused for good.
-fn retry_at(error: &Error, attempts: i64, now: i64) -> Option<i64> {
-    // Offline (on a train, the Wi-Fi gone): nothing reached the server, so no attempt is spent; a
-    // try every 15 minutes at most, for a day.
+/// `attempts`: those the server saw; `offline`: the tries that never reached it. Each counts this
+/// failure already.
+fn retry_at(error: &Error, attempts: i64, offline: i64, now: i64) -> Option<i64> {
+    // Offline (on a train, the Wi-Fi gone, the account waiting to be signed in again): nothing
+    // reached the server, so no attempt is spent; a try every 15 minutes at most, for a day.
     if matches!(error, Error::Unreachable(_)) {
-        return (attempts < UNREACHABLE_ATTEMPTS).then(|| now + (60 << (attempts - 1).clamp(0, 4)).min(15 * 60));
+        return (offline < UNREACHABLE_ATTEMPTS).then(|| now + (60 << (offline - 1).clamp(0, 4)).min(15 * 60));
     }
-    // A message that cannot be built (see `deliver`) fails the same way every time.
-    let final_error = matches!(error, Error::Uncertain(_) | Error::Rejected(_) | Error::Mime(_));
+    // A message that cannot be built (see `deliver`) fails the same way every time. Refused
+    // credentials too (with a fresh token already): each try is a failed sign-in, which servers
+    // answer by locking the account out.
+    let final_error = matches!(error, Error::Uncertain(_) | Error::Rejected(_) | Error::Mime(_) | Error::Auth(_));
     (attempts < SEND_ATTEMPTS && !final_error).then(|| now + 60 * (1 << (attempts - 1).clamp(0, 10)))
 }
 
@@ -6897,6 +7130,25 @@ impl IdleChanges {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_series_time_change_across_the_computers_midnight_is_no_move() {
+        // 15:00 in Los Angeles, the next day in Europe or Asia: moved to 14:00 the same day.
+        let tz: chrono_tz::Tz = "America/Los_Angeles".parse().unwrap();
+        let at = |h| chrono::TimeZone::with_ymd_and_hms(&tz, 2026, 10, 20, h, 0, 0).earliest().unwrap().timestamp();
+        let e = CalendarEvent { start: at(15), end: at(16), zone: Some("America/Los_Angeles".into()), recurring: true, ..Default::default() };
+        let rule = SeriesRepeat { repeat: None, custom: true };
+        let first = chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        let draft = EventDraft { start: at(14), end: at(15), zone: e.zone.clone(), ..Default::default() };
+        let changes = crate::calendar::EventChanges::between(&e, &draft);
+        assert!(changes.times.is_some());
+        // A custom rule left alone and no date moved: the times move, the series is not rebuilt.
+        assert_eq!(series_plan(&e, &draft, &changes, &rule, first).unwrap(), None);
+        // The next day in Los Angeles is a move, even on the same day elsewhere.
+        let later = EventDraft { start: at(15) + 86400, end: at(16) + 86400, ..draft };
+        let changes = crate::calendar::EventChanges::between(&e, &later);
+        assert!(series_plan(&e, &later, &changes, &rule, first).is_err(), "a custom rule asks for its own calendar app");
+    }
     use crate::mime::HeaderInfo;
     use crate::store::ServerFlags;
 
@@ -7535,16 +7787,20 @@ mod tests {
         assert_eq!(cutoff(Some(5), None), Some(5));
         assert_eq!(cutoff(None, None), None);
         let now = 1000;
-        assert_eq!(retry_at(&Error::Smtp("451 greylisted".into()), 1, now), Some(now + 60));
-        assert_eq!(retry_at(&Error::Smtp("451".into()), 3, now), Some(now + 240));
-        assert_eq!(retry_at(&Error::Smtp("451".into()), SEND_ATTEMPTS, now), None, "then the user decides");
-        assert_eq!(retry_at(&Error::Rejected("550".into()), 1, now), None, "refused for good");
-        assert_eq!(retry_at(&Error::Uncertain("cut".into()), 1, now), None, "maybe sent: never repeated on its own");
-        assert_eq!(retry_at(&Error::Mime("alias removed".into()), 1, now), None, "cannot be built: the user edits it");
+        assert_eq!(retry_at(&Error::Smtp("451 greylisted".into()), 1, 0, now), Some(now + 60));
+        assert_eq!(retry_at(&Error::Smtp("451".into()), 3, 0, now), Some(now + 240));
+        assert_eq!(retry_at(&Error::Smtp("451".into()), SEND_ATTEMPTS, 0, now), None, "then the user decides");
+        assert_eq!(retry_at(&Error::Rejected("550".into()), 1, 0, now), None, "refused for good");
+        assert_eq!(retry_at(&Error::Uncertain("cut".into()), 1, 0, now), None, "maybe sent: never repeated on its own");
+        assert_eq!(retry_at(&Error::Mime("alias removed".into()), 1, 0, now), None, "cannot be built: the user edits it");
+        // A refused SMTP sign-in is not tried again on its own: servers lock accounts out for it.
+        assert_eq!(retry_at(&Error::Auth("535 5.7.139 SmtpClientAuthentication is disabled".into()), 1, 0, now), None);
         let offline = Error::Unreachable("no route to host".into());
-        assert_eq!(retry_at(&offline, SEND_ATTEMPTS + 1, now), Some(now + 15 * 60), "offline: no attempt spent");
-        assert_eq!(retry_at(&offline, 1, now), Some(now + 60));
-        assert_eq!(retry_at(&offline, UNREACHABLE_ATTEMPTS, now), None, "a day later, the user decides");
+        assert_eq!(retry_at(&offline, 0, SEND_ATTEMPTS + 1, now), Some(now + 15 * 60), "offline: no attempt spent");
+        assert_eq!(retry_at(&offline, 0, 1, now), Some(now + 60));
+        assert_eq!(retry_at(&offline, 0, UNREACHABLE_ATTEMPTS, now), None, "a day later, the user decides");
+        // Three tries offline, then one greylisting once back: not the last attempt.
+        assert_eq!(retry_at(&Error::Smtp("451".into()), 1, 3, now), Some(now + 60));
     }
 
     #[test]
@@ -7608,7 +7864,7 @@ mod tests {
         engine.set_setting("undo_send", "10").unwrap();
         let draft = Draft { account_id: acc, to: vec!["bob@example.org".into()], subject: "Devis".into(), body: "x".into(), draft_id: Some("first@example.org".into()), ..Default::default() };
         let id = engine.send(draft, None, None).await.unwrap().expect("undo window");
-        store.outgoing_failed(id, "uncertain", None).unwrap();
+        store.outgoing_failed(id, "uncertain", None, false).unwrap();
         let back = engine.cancel_send(id).unwrap();
         assert!(back.draft_id.is_some_and(|d| d != "first@example.org"));
     }
@@ -7906,10 +8162,18 @@ In-Reply-To: <parent@x>\r\nReferences: <root@x> <parent@x>\r\n\r\nBrouillon\r\n"
     async fn a_sign_in_refused_for_now_too_long_asks_the_user() {
         let (_dir, engine, acc) = test_engine();
         let start = SystemTime::now();
-        engine.refused_for_now(acc, "User is authenticated but not connected", start);
-        engine.refused_for_now(acc, "User is authenticated but not connected", start + Duration::from_secs(29 * 60));
+        let why = "User is authenticated but not connected";
+        let at = |minutes: u64| start + Duration::from_secs(minutes * 60);
+        // Once before a night's sleep, once on waking: no run, nothing asked.
+        engine.refused_for_now(acc, why, at(0));
+        engine.refused_for_now(acc, why, at(600));
+        assert!(!engine.auth_refused.lock().unwrap().contains_key(&acc), "two isolated refusals");
+        // Refused every few minutes from then on, for half an hour: the user is asked.
+        for minutes in [605, 612, 619, 626] {
+            engine.refused_for_now(acc, why, at(minutes));
+        }
         assert!(!engine.auth_refused.lock().unwrap().contains_key(&acc), "still passing");
-        engine.refused_for_now(acc, "User is authenticated but not connected", start + REFUSED_FOR_NOW_LIMIT);
+        engine.refused_for_now(acc, why, at(630));
         let why = engine.auth_refused.lock().unwrap().get(&acc).cloned().expect("waits for the user");
         assert!(why.contains("authenticated but not connected"), "{why}");
         assert!(!engine.refused_since.lock().unwrap().contains_key(&acc));
@@ -7935,7 +8199,7 @@ In-Reply-To: <parent@x>\r\nReferences: <root@x> <parent@x>\r\n\r\nBrouillon\r\n"
 
         // Whatever path comes next (a folder refresh here, or a sync left halfway before), the
         // waiting message goes through the screener, then is released.
-        engine.after_inbox_arrivals(acc, &[]);
+        engine.after_inbox_arrivals(acc, &[], false);
         let screener = store.mailbox_by_role(acc, Role::Screener).unwrap().expect("created").id;
         assert_eq!(store.location(id).unwrap().mailbox_id, screener);
         assert!(store.unscreened(acc).unwrap().is_empty());
@@ -7992,7 +8256,17 @@ In-Reply-To: <parent@x>\r\nReferences: <root@x> <parent@x>\r\n\r\nBrouillon\r\n"
             store.insert_header(acc, inbox, 4, &h, UNSEEN, 10).unwrap()
         };
 
-        engine.after_inbox_arrivals(acc, &[shop, bank, promo, mine]);
+        // Caught by a folder refresh (Gmail: saving a draft syncs All Mail): told as new mail.
+        let mut events = engine.subscribe();
+        engine.after_inbox_arrivals(acc, &[shop, bank, promo, mine], true);
+        let mut told: Vec<(i64, bool)> = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let Event::NewMail { messages, .. } = event {
+                told.extend(messages.iter().map(|m| (m.id, m.held)));
+            }
+        }
+        told.sort();
+        assert_eq!(told, vec![(shop, true), (mine, false)], "filed or marked read by a rule: not told");
 
         assert!(!store.rules(Some(acc)).unwrap().iter().find(|r| r.id == broken).unwrap().enabled);
         assert_eq!(store.location(bank).unwrap().mailbox_id, archive);

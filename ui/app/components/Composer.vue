@@ -138,6 +138,16 @@ watch(draft, (d, prev) => {
   timer = setTimeout(save, autosaveDelay())
 }, { deep: true })
 
+/** A keystroke in the text: unsaved now, saved after the usual delay (its HTML is written out on
+ *  a pause, or by the save itself). */
+function onEdited() {
+  if (quiet || !draft.value) return
+  dirty.value = true
+  clearTimeout(timer)
+  if (sending.value) return
+  timer = setTimeout(save, autosaveDelay())
+}
+
 function onText(text: string) {
   const d = draft.value
   if (!d || d.body === text) return
@@ -167,6 +177,8 @@ let inFlight: Promise<boolean> | null = null
 /** Saves the draft if it changed. Resolves to false when the save failed (the draft is then
  *  still unsaved: the caller must not drop it). */
 async function save(): Promise<boolean> {
+  // What was typed since the last pause goes in first.
+  editor.value?.flush()
   clearTimeout(timer)
   // Being sent: a save now would put back in Drafts what the engine is taking out of it (should
   // the send fail, the save follows).
@@ -503,8 +515,10 @@ let sendJob: Promise<void> | null = null
 async function send(at: number | null = null) {
   const d = draft.value
   if (!d || sending.value) return
-  // The address still being typed goes too (⌘↵ while the cursor is in the field).
+  // The address still being typed goes too (⌘↵ while the cursor is in the field), and the text
+  // typed since the last pause.
   flushRecipients()
+  editor.value?.flush()
   if (!d.to.length && !d.cc.length && !d.bcc.length) {
     toast.add({ title: t('app.composer.noRecipient'), color: 'warning', icon: 'i-lucide-user-x' })
     return
@@ -584,15 +598,21 @@ async function toggleDictation() {
     }
     return
   }
+  // Only into the draft it was said for: another one opened meanwhile gets nothing.
+  const said = draft.value
   try {
     const text = await dictation.stop(locale.value === 'en' ? 'en' : 'fr')
-    if (text) editor.value?.insert(`${escapeHtml(text)} `)
+    if (text && draft.value === said && open.value) editor.value?.insert(`${escapeHtml(text)} `)
   } catch (e) {
     showError(e)
   }
 }
+// The draft closed, sent or replaced: the microphone stops, what it heard is dropped.
+watch([open, draft], ([isOpen, current], [, before]) => {
+  if (!isOpen || current !== before) dictation.cancel()
+})
 const dictationLabel = computed(() => (dictation.recording.value ? t('app.composer.dictation.stop') : dictation.transcribing.value ? t('app.composer.dictation.writing') : t('app.composer.dictation.start')))
-const editor = useTemplateRef<{ insert: (html: string) => void }>('editor')
+const editor = useTemplateRef<{ insert: (html: string) => void, flush: () => void }>('editor')
 /** The templates screen sits under the window: closed first, its draft kept (reopened from Drafts). */
 async function manageTemplates() {
   await close()
@@ -820,6 +840,7 @@ defineShortcuts({
             :placeholder="$t('app.composer.bodyPlaceholder')"
             @update:model-value="(v) => { if (draft) draft.html = v }"
             @text="onText"
+            @changed="onEdited"
             @files="attach"
           >
             <template #footer>
@@ -1017,6 +1038,7 @@ defineShortcuts({
               :placeholder="$t('app.composer.bodyPlaceholder')"
               @update:model-value="(v) => { if (draft) draft.html = v }"
               @text="onText"
+              @changed="onEdited"
               @files="attach"
             />
           </div>

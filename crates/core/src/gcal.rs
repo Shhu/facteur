@@ -346,7 +346,8 @@ pub async fn series_rule(token: &str, calendar_id: &str, series_id: &str) -> Res
     let rule = master["recurrence"].as_array().into_iter().flatten().filter_map(|r| r.as_str()).find_map(|r| r.strip_prefix("RRULE:")).map(str::to_string);
     let first = match time(&master["start"]) {
         Some((t, true)) => chrono::DateTime::from_timestamp(t, 0).map(|d| d.date_naive()),
-        Some((t, false)) => crate::calendar::local_date(t),
+        // In the series' own zone, as series_first reads it.
+        Some((t, false)) => crate::calendar::day_in(t, master["start"]["timeZone"].as_str().and_then(crate::calendar::event_zone).as_deref()),
         None => None,
     };
     Ok((rule, first.ok_or_else(|| Error::Other(crate::tr!("Google Agenda : série illisible", "Google Calendar: unreadable series")))?))
