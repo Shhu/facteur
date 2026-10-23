@@ -29,9 +29,9 @@ export function useOps() {
     await refresh()
   }
 
-  async function discard(id: number) {
+  async function discard(id: number, createdAt: number) {
     try {
-      await api.discardOp(id)
+      await api.discardOp(id, createdAt)
     } catch (e) {
       showError(e)
     }

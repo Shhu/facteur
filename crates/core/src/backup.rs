@@ -128,11 +128,12 @@ pub fn read_manifest(account_dir: &Path) -> Option<Manifest> {
 }
 
 /// A long job's session: on an account limited to one connection, given over between two folders
-/// to whoever waits for it (opening a message, a sync), then taken again.
+/// or batches to whoever waits for it (opening a message, a sync), then taken again.
 #[allow(async_fn_in_trait)]
 pub trait Lease {
     fn session(&mut self) -> &mut Session;
-    async fn give_way(&mut self) -> Result<()>;
+    /// Whether the connection was given over: another may have selected a folder meanwhile.
+    async fn give_way(&mut self) -> Result<bool>;
 }
 
 impl Lease for Session {
@@ -140,8 +141,8 @@ impl Lease for Session {
         self
     }
 
-    async fn give_way(&mut self) -> Result<()> {
-        Ok(())
+    async fn give_way(&mut self) -> Result<bool> {
+        Ok(false)
     }
 }
 
@@ -161,7 +162,7 @@ pub async fn backup_account(
         let dir = root.join(&rel);
         let place = Place { root, dir: &dir, rel: &index::rel_path(root, &dir), sep };
         lease.give_way().await?;
-        let count = backup_folder(lease.session(), &listed.name, listed.delimiter.as_deref(), &place, &mut stats, &mut progress).await?;
+        let count = backup_folder(lease, &listed.name, listed.delimiter.as_deref(), &place, &mut stats, &mut progress).await?;
         stats.folders += 1;
         stats.messages += count;
         folders.push(FolderSummary {
@@ -291,7 +292,7 @@ struct Place<'a> {
 /// Returns how many of the folder's messages are in the backup. The index is only opened between
 /// network exchanges: a SQLite connection must not live across an `.await` (not `Send`).
 async fn backup_folder(
-    session: &mut Session,
+    lease: &mut impl Lease,
     name: &str,
     delimiter: Option<&str>,
     place: &Place<'_>,
@@ -309,7 +310,7 @@ async fn backup_folder(
     // Every exchange is bounded: a connection dead during an automatic backup (sleep) must not
     // leave it "in progress" until a restart.
     let what = crate::tr!("sauvegarde", "backup");
-    let mb = bounded(120, &what, async { Ok(session.examine(name).await?) }).await?;
+    let mb = bounded(120, &what, async { Ok(lease.session().examine(name).await?) }).await?;
     let validity = mb.uid_validity.unwrap_or(0);
     let mut have: HashMap<u32, String> = HashMap::new();
     let mut total_files = 0;
@@ -332,7 +333,7 @@ async fn backup_folder(
 
     // Checked: async-imap takes a refused or cut SEARCH for an empty folder, which would have
     // this one reported saved with none of its new messages.
-    let server: HashSet<u32> = match bounded(300, &what, imap::uid_search_checked(session, "ALL", mb.exists)).await {
+    let server: HashSet<u32> = match bounded(300, &what, imap::uid_search_checked(lease.session(), "ALL", mb.exists)).await {
         Ok(server) => server,
         // The connection still answers: the server refuses this folder's search. Its messages
         // not saved yet count as failed (the backup is not reported complete), the other
@@ -348,10 +349,10 @@ async fn backup_folder(
     // Files saved under another UIDVALIDITY (the folder was recreated on the server): the
     // messages already there are taken over by their new UID instead of downloaded again.
     if total_files > have.len() && !missing.is_empty() {
-        adopt_previous(session, place, validity, &mut missing, &mut have).await?;
+        adopt_previous(lease.session(), place, validity, &mut missing, &mut have).await?;
     }
     if !missing.is_empty() {
-        let copied = copy_saved_elsewhere(session, place, validity, &mut missing).await?;
+        let copied = copy_saved_elsewhere(lease.session(), place, validity, &mut missing).await?;
         stats.copied += copied;
         total_files += copied;
     }
@@ -360,11 +361,18 @@ async fn backup_folder(
     progress(Progress { mailbox: label.clone(), done: 0, total });
 
     for (i, chunk) in missing.chunks(CHUNK).enumerate() {
+        // The connection given over meanwhile: the folder selected again, unless recreated.
+        if i > 0 && lease.give_way().await? {
+            let again = bounded(120, &what, async { Ok(lease.session().examine(name).await?) }).await?;
+            if again.uid_validity != mb.uid_validity {
+                return Ok(total_files);
+            }
+        }
         // One message at a time, written then dropped: a batch of large messages does not fit in
         // memory. The index follows in one transaction once the batch is on the disk.
         let mut written = Vec::new();
         {
-            let mut stream = bounded(120, &what, async { Ok(session.uid_fetch(uid_set(chunk), "(UID FLAGS INTERNALDATE BODY.PEEK[])").await?) }).await?;
+            let mut stream = bounded(120, &what, async { Ok(lease.session().uid_fetch(uid_set(chunk), "(UID FLAGS INTERNALDATE BODY.PEEK[])").await?) }).await?;
             // Bounded per message rather than per chunk: 25 large messages on a slow link take
             // the time they need, a server gone silent still stops the backup.
             while let Some(f) = bounded(600, &what, async { Ok(stream.try_next().await?) }).await? {
@@ -393,7 +401,7 @@ async fn backup_folder(
         let unsaved: Vec<u32> = chunk.iter().copied().filter(|u| !written.iter().any(|(w, ..)| w == u)).collect();
         if !unsaved.is_empty() {
             let query = format!("UID {}", uid_set(&unsaved));
-            let still = bounded(120, &what, imap::uid_search_checked(session, &query, 0)).await?;
+            let still = bounded(120, &what, imap::uid_search_checked(lease.session(), &query, 0)).await?;
             stats.failed += unsaved.iter().filter(|u| still.contains(u)).count();
         }
         // The renames themselves reach the disk before the index records the files.
@@ -418,7 +426,7 @@ async fn backup_folder(
         {
             // Bounded per response like the download: the flags of a huge folder on a slow
             // server take the time they need, a server gone silent still stops the backup.
-            let mut stream = bounded(120, &what, async { Ok(session.uid_fetch("1:*", "(UID FLAGS)").await?) }).await?;
+            let mut stream = bounded(120, &what, async { Ok(lease.session().uid_fetch("1:*", "(UID FLAGS)").await?) }).await?;
             while let Some(f) = bounded(300, &what, async { Ok(stream.try_next().await?) }).await? {
                 let Some(uid) = f.uid else { continue };
                 let Some(current) = have.get(&uid) else { continue };
@@ -745,6 +753,19 @@ pub async fn restore(
         // Without a Message-ID: (arrival date, size), on the server or sent in this run.
         let mut appended_anon: HashSet<(i64, i64)> = HashSet::new();
         for (i, item) in items.iter().enumerate() {
+            // The connection may go to another between two: back, it may have a folder selected
+            // (an EXISTS before APPEND's continuation fails the message), closed again. Examined
+            // first: CLOSE on a folder the sync selected read-write would expunge what other
+            // clients only marked deleted.
+            if i > 0
+                && i % CHUNK == 0
+                && lease.give_way().await?
+                && let Err(e) = bounded(60, &what, deselect(lease.session(), mailbox)).await
+                && !matches!(e, Error::Imap(async_imap::error::Error::Bad(_) | async_imap::error::Error::No(_)))
+            {
+                return Err(interrupted(e, &stats));
+            }
+            let session = lease.session();
             let again = item.message_id.as_ref().is_some_and(|m| appended.contains(&(m.clone(), item.size)));
             let anon = anon_key(item);
             let anon_there = anon.is_some_and(|k| present_anon.contains(&k) || appended_anon.contains(&k));
@@ -829,6 +850,14 @@ fn interrupted(e: Error, stats: &RestoreStats) -> Error {
     }
     let n = stats.messages;
     Error::Other(crate::tr!("restauration interrompue après {n} message(s) renvoyé(s) : {e}", "restore interrupted after {n} message(s) uploaded: {e}"))
+}
+
+/// Leaves the folder selected without expunging anything: EXAMINE (read-only) first, so CLOSE
+/// never removes messages another client only marked deleted. A server refusing either (none
+/// selected) is no failure.
+async fn deselect(session: &mut Session, mailbox: &str) -> Result<()> {
+    session.examine(mailbox).await?;
+    Ok(session.close().await?)
 }
 
 /// Message-IDs (without brackets) already in `mailbox`, and (arrival date, size) of those without
@@ -1293,7 +1322,14 @@ mod tests {
     /// A session against a scripted server: one reply (with `{tag}` for the command's tag) per
     /// command after the login.
     async fn scripted(script: Vec<&'static str>) -> Session {
+        recorded(script).await.0
+    }
+
+    /// As `scripted`, with the commands the server received.
+    async fn recorded(script: Vec<&'static str>) -> (Session, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = heard.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1303,6 +1339,7 @@ mod tests {
             w.write_all(b"* OK ready\r\n").await.unwrap();
             for reply in std::iter::once("{tag} OK signed in").chain(script) {
                 let Ok(Some(line)) = lines.next_line().await else { return };
+                log.lock().unwrap().push(line.split_once(' ').map_or(line.clone(), |(_, c)| c.to_string()));
                 let tag = line.split(' ').next().unwrap_or("*").to_string();
                 let _ = w.write_all(format!("{}\r\n", reply.replace("{tag}", &tag)).as_bytes()).await;
             }
@@ -1311,7 +1348,16 @@ mod tests {
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut client = async_imap::Client::new(imap::Stream::Plain(tcp));
         client.read_response().await.unwrap();
-        client.login("u", "p").await.map_err(|(e, _)| e).unwrap()
+        (client.login("u", "p").await.map_err(|(e, _)| e).unwrap(), heard)
+    }
+
+    #[tokio::test]
+    async fn the_connection_given_back_is_deselected_without_expunging() {
+        let examine = "* 0 EXISTS\r\n* OK [UIDVALIDITY 1] ok\r\n{tag} OK [READ-ONLY] done";
+        let (mut session, heard) = recorded(vec![examine, "{tag} OK closed"]).await;
+        deselect(&mut session, "Archives").await.unwrap();
+        // The sync may have left INBOX selected read-write: CLOSE only once read-only.
+        assert_eq!(heard.lock().unwrap()[1..], ["EXAMINE \"Archives\"".to_string(), "CLOSE".to_string()]);
     }
 
     #[tokio::test]

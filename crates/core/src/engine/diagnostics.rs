@@ -50,6 +50,11 @@ impl Tracker {
         self.listeners.lock().unwrap_or_else(|e| e.into_inner()).remove(&account_id);
     }
 
+    /// A sync runs on some account.
+    pub(super) fn any_sync(&self) -> bool {
+        self.syncs.lock().unwrap_or_else(|e| e.into_inner()).values().any(|s| !s.running.is_empty())
+    }
+
     /// The returned guard records the sync as interrupted if dropped unfinished.
     pub(super) fn sync_started(&self, account_id: i64, scope: &Scope) -> SyncRun<'_> {
         let id = self.next_run.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

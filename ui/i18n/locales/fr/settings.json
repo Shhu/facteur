@@ -481,6 +481,7 @@
       "title": "IA sur cet ordinateur",
       "help": "Un modèle de langage qui tourne sur votre ordinateur, pour résumer les fils et créer un événement à partir d'un message.",
       "unavailable": "Cette version de facteur n'a pas l'IA locale.",
+      "oldProcessor": "Ce processeur n'a pas les instructions AVX2 qu'il faut à l'IA locale.",
       "private": "Tout reste sur cet ordinateur : aucun message ni aucun texte n'est envoyé à un serveur. Seul le fichier du modèle est téléchargé, une fois.",
       "tier": {
         "light": "Léger",
@@ -505,12 +506,17 @@
         "title": "Carte graphique",
         "help": "Les calculs passent par la carte graphique quand l'ordinateur en a une, plus vite qu'avec le processeur seul. Désactivez si l'IA devient plus lente ou instable.",
         "using": "Utilisée : {card}. Désactivez si l'IA devient plus lente ou instable.",
-        "off": "Désactivée : l'IA n'utilise que le processeur."
+        "off": "Désactivée : l'IA n'utilise que le processeur.",
+        "failed": "La carte graphique a planté pendant un calcul : l'IA utilise le processeur seul.",
+        "retry": "Réessayer"
       },
       "dictation": {
         "title": "Dictée",
         "help": "Dicter vos messages : un bouton micro dans le rédacteur. La voix est transcrite sur cet ordinateur (modèle de {size}).",
         "ready": "Prête",
+        "language": "Langue parlée",
+        "languageHelp": "Celle de votre voix, quelle que soit la langue de facteur. Choisie par le modèle si vous ne la fixez pas.",
+        "languageAuto": "Détection automatique",
         "offTitle": "Désactiver la dictée ?",
         "offConfirm": "Le modèle de dictée est supprimé de l'ordinateur ({size} libérés)."
       }

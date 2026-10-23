@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { open as pickFile } from '@tauri-apps/plugin-dialog'
 import { confirm } from '~/composables/useConfirm'
+import { DICTATION_LANGUAGE } from '~/composables/useDictation'
 import type { AiModel } from '~/utils/types'
 
 /** The local AI, off unless turned on here: a model to download (or a file of one's own), its
@@ -81,6 +82,22 @@ async function installDictation() {
     showError(e)
   }
 }
+/** The language spoken to the microphone: found by the model unless one is chosen. */
+const spoken = ref('auto')
+const spokenItems = computed(() => [
+  { label: t('settings.ai.dictation.languageAuto'), value: 'auto' },
+  { label: 'Français', value: 'fr' },
+  { label: 'English', value: 'en' }
+])
+onMounted(async () => {
+  const v = await api.getSetting(DICTATION_LANGUAGE).catch(() => null)
+  spoken.value = v === 'fr' || v === 'en' ? v : 'auto'
+})
+async function setSpoken(v: string) {
+  spoken.value = v
+  await api.setSetting(DICTATION_LANGUAGE, v).catch(showError)
+}
+
 async function dictationOff() {
   if (download.value?.model === status.value?.dictation_model.id) {
     await cancel()
@@ -132,7 +149,7 @@ async function turnOff() {
     <div class="flex items-center gap-4">
       <div class="flex min-w-0 flex-1 flex-col gap-0.5">
         <span class="text-sm font-semibold text-highlighted">{{ t('settings.ai.title') }}</span>
-        <span class="text-[13px] text-muted">{{ status?.available === false ? t('settings.ai.unavailable') : t('settings.ai.help') }}</span>
+        <span class="text-[13px] text-muted">{{ status?.available === false ? t(status.processor_unsupported ? 'settings.ai.oldProcessor' : 'settings.ai.unavailable') : t('settings.ai.help') }}</span>
       </div>
       <USwitch v-model="switchOn" size="lg" :disabled="!status?.available" :aria-label="t('settings.ai.title')" />
     </div>
@@ -210,6 +227,20 @@ async function turnOff() {
         </div>
         <USwitch v-model="dictationOn" size="lg" :disabled="!!download && textDownloading" :aria-label="t('settings.ai.dictation.title')" />
       </div>
+      <div v-if="status.dictation" class="flex flex-wrap items-center gap-x-4 gap-y-1.5">
+        <div class="flex min-w-48 flex-1 flex-col">
+          <span class="text-[13px] font-medium text-default">{{ t('settings.ai.dictation.language') }}</span>
+          <span class="text-xs text-muted">{{ t('settings.ai.dictation.languageHelp') }}</span>
+        </div>
+        <USelect
+          :model-value="spoken"
+          :items="spokenItems"
+          size="sm"
+          class="w-48"
+          :aria-label="t('settings.ai.dictation.language')"
+          @update:model-value="(v: string) => setSpoken(v)"
+        />
+      </div>
       <div v-if="download && downloading && !textDownloading" class="flex flex-col gap-2">
         <div class="flex items-center gap-3 text-sm">
           <span class="min-w-0 flex-1 truncate">{{ t('settings.ai.downloading', { name: downloading.name }) }}</span>
@@ -226,10 +257,21 @@ async function turnOff() {
           <UIcon name="i-lucide-cpu" class="size-4 text-muted" />
           {{ t('settings.ai.graphics.title') }}
         </span>
-        <span class="text-[13px] text-muted">
+        <span v-if="graphicsOn && status.graphics_failed" class="text-[13px] text-muted">
+          {{ t('settings.ai.graphics.failed') }}
+        </span>
+        <span v-else class="text-[13px] text-muted">
           {{ graphicsOn && status.card ? t('settings.ai.graphics.using', { card: status.card }) : t(graphicsOn ? 'settings.ai.graphics.help' : 'settings.ai.graphics.off') }}
         </span>
       </div>
+      <UButton
+        v-if="graphicsOn && status.graphics_failed"
+        :label="t('settings.ai.graphics.retry')"
+        color="neutral"
+        variant="outline"
+        size="sm"
+        @click="graphicsOn = true"
+      />
       <USwitch v-model="graphicsOn" size="lg" :aria-label="t('settings.ai.graphics.title')" />
     </div>
   </div>

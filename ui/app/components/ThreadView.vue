@@ -23,11 +23,22 @@ const details = reactive(new Map<number, MessageDetail>())
 const loadingIds = reactive(new Set<number>())
 const expanded = reactive(new Set<number>())
 
+/** Read once per loaded message: its whole HTML is parsed, and the thread reloads at each sync. */
+const invites = new WeakMap<MessageDetail, ReturnType<typeof inviteState>>()
+function inviteOf(d: MessageDetail & { invite: NonNullable<MessageDetail['invite']> }) {
+  let state = invites.get(d)
+  if (!state) {
+    state = inviteState(d.invite, d.html)
+    invites.set(d, state)
+  }
+  return state
+}
+
 /** Invitation thread: from the latest loaded ICS, else guessed from the subject until it loads. */
 const invitation = computed(() => {
   for (const m of [...messages.value].reverse()) {
     const d = details.get(m.id)
-    if (d?.invite) return { ...inviteState(d.invite, d.html), title: d.invite.summary }
+    if (d?.invite) return { ...inviteOf(d as MessageDetail & { invite: NonNullable<MessageDetail['invite']> }), title: d.invite.summary }
   }
   const first = messages.value[0]
   const guess = first ? inviteFromSubject(first.subject, first.has_attachments) : null
@@ -352,7 +363,7 @@ function onHere(action: (ids: number[]) => Promise<number | null | void>, label?
   if (!ids.length) return Promise.resolve()
   return run(async () => {
     const token = await action(ids)
-    listStale.bump()
+    listStale.bump({ account_id: props.accountId, thread_id: props.threadId, mailbox_id: props.mailboxId })
     return token
   }, true, label, icon)
 }

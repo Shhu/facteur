@@ -853,6 +853,8 @@ export interface AiModel {
 /** The local AI: off (`model` null), or the model in use (an offered one's id, or `file`). */
 export interface AiStatus {
   available: boolean
+  /** Built with the local AI, but the processor cannot run it (no AVX2). */
+  processor_unsupported: boolean
   model: string | null
   file: string | null
   ready: boolean
@@ -868,6 +870,8 @@ export interface AiStatus {
   /** The graphics card may be used, and the one the model last ran on. */
   graphics: boolean
   card: string | null
+  /** The card failed the AI (now or at an earlier launch): the processor until tried again. */
+  graphics_failed: boolean
 }
 
 /** An appointment the local AI found in a message. Times null when its day was not understood. */

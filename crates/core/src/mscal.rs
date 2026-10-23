@@ -274,6 +274,8 @@ pub async fn rebuild_series(
     repeat: Option<&crate::repeat::Repeat>,
 ) -> Result<()> {
     let mut body = body(&EventChanges { times: None, ..changes.clone() })?;
+    // As in `update_series`: rooms kept, optional guests left optional.
+    merge_guests(token, series_id, changes, &mut body).await?;
     series_body(&mut body, first, repeat, changes.zone.as_deref())?;
     write(client()?.patch(url(&["me", "events", series_id])?).header("Content-Type", "application/json").body(serde_json::to_vec(&body)?), token).await?;
     Ok(())

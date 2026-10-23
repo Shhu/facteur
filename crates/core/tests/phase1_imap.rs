@@ -67,7 +67,7 @@ async fn drafts_history_and_server_search() {
             ..Default::default()
         };
         let raw = smtp::build(&account, &draft, None, &[], true).unwrap().formatted();
-        let op = ops::Op::SaveDraft { mailbox: "Brouillons-test".into(), message_id: "brouillon-1@localhost".into(), raw: B64.encode(raw) };
+        let op = ops::Op::SaveDraft { mailbox: "Brouillons-test".into(), message_id: "brouillon-1@localhost".into(), raw: B64.encode(raw), source: None };
         serde_json::to_string(&op).unwrap()
     };
     store.push_op(acc, &save("Version 1"), "", None).unwrap();

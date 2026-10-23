@@ -191,8 +191,10 @@ export function useCalendarEvents(range: () => { from: number, to: number } | nu
     try {
       const list = await api.calendarEvents(r.from, r.to)
       if (mine !== request) return
-      events.value = list
-      loadedRange.value = `${r.from}-${r.to}`
+      // The same events: not assigned, or every day of the view is laid out again.
+      const loaded = `${r.from}-${r.to}`
+      if (loadedRange.value !== loaded || !events.value || JSON.stringify(list) !== JSON.stringify(events.value)) events.value = list
+      loadedRange.value = loaded
     } catch {
       if (mine === request) events.value ??= []
     }

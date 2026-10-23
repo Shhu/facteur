@@ -24,8 +24,10 @@ pub enum Op {
     Delete { mailbox: String, uid: u32, #[serde(default)] uidvalidity: Option<u32> },
     Append { mailbox: String, flags: String, raw: String },
     Create { mailbox: String },
-    /// Appends the draft, then removes its previous versions (same Message-ID).
-    SaveDraft { mailbox: String, message_id: String, raw: String },
+    /// Appends the draft, then removes its previous versions (same Message-ID), and `source`
+    /// (UID, UIDVALIDITY): the copy without a Message-ID it was reopened from, only once the new
+    /// version is in.
+    SaveDraft { mailbox: String, message_id: String, raw: String, #[serde(default)] source: Option<(u32, Option<u32>)> },
     DeleteDraft { mailbox: String, message_id: String },
     /// Covers the whole folder on the server, beyond the synced window, but only what had arrived
     /// when asked (UID < `below`).
@@ -453,9 +455,15 @@ async fn apply(session: &mut Session, caps: &Caps, op: &Op, retry: bool, protect
             select(session, mailbox, *uidvalidity).await?;
             expunge_uid(session, caps, *uid).await?;
         }
-        Op::SaveDraft { mailbox, message_id, raw } => {
-            session.select(mailbox).await?;
-            let previous = draft_uids(session, message_id).await?;
+        Op::SaveDraft { mailbox, message_id, raw, source } => {
+            let mb = session.select(mailbox).await?;
+            let mut previous = draft_uids(session, message_id).await?;
+            // The folder recreated since: that UID is another message now.
+            if let Some((uid, validity)) = source
+                && (validity.is_none() || *validity == mb.uid_validity)
+            {
+                previous.push(*uid);
+            }
             let raw = B64.decode(raw).map_err(|e| Error::Other(e.to_string()))?;
             // New version first: a cut in between leaves a duplicate, never nothing.
             append(session, mailbox, Some("(\\Draft \\Seen)"), raw).await?;

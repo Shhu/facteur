@@ -1,5 +1,8 @@
 /** Dictation: the microphone recorded at 16 kHz, then turned into text by the local model (the
  *  sound never leaves the computer). Five minutes at most per recording. */
+/** "fr" or "en"; anything else: found by the model. */
+export const DICTATION_LANGUAGE = 'dictation_language'
+
 export function useDictation() {
   const recording = ref(false)
   const transcribing = ref(false)
@@ -32,9 +35,16 @@ export function useDictation() {
       return
     }
     stream = media
-    context = new AudioContext({ sampleRate: 16000 })
-    const source = context.createMediaStreamSource(stream)
-    node = context.createScriptProcessor(4096, 1, 1)
+    let source: MediaStreamAudioSourceNode
+    try {
+      context = new AudioContext({ sampleRate: 16000 })
+      source = context.createMediaStreamSource(stream)
+      node = context.createScriptProcessor(4096, 1, 1)
+    } catch (e) {
+      // The microphone is not left open behind an idle button.
+      release()
+      throw e
+    }
     // Its own buffer: a processor left over could not add to the next recording.
     const own: Float32Array[] = []
     chunks = own
@@ -65,7 +75,7 @@ export function useDictation() {
   }
 
   /** The text said since `start`; empty when nothing was heard. */
-  async function stop(language: string): Promise<string> {
+  async function stop(): Promise<string> {
     if (!recording.value) return ''
     release()
     // 16-bit little-endian, as the engine reads it.
@@ -82,7 +92,9 @@ export function useDictation() {
     if (length < 16000 / 2) return ''
     transcribing.value = true
     try {
-      return await api.aiTranscribe(pcm, language)
+      // The language spoken, not the interface's: forced to another one, the model translates.
+      const language = await api.getSetting(DICTATION_LANGUAGE).catch(() => null)
+      return await api.aiTranscribe(pcm, language === 'fr' || language === 'en' ? language : '')
     } finally {
       transcribing.value = false
     }

@@ -104,7 +104,7 @@ async function sendNow(accountId: number) {
 async function drop(o: OpView) {
   // A pending action is still meant to happen: ask before giving it up.
   if (!o.failed && !(await confirm(t('app.ops.discardConfirm'), { title: t('app.ops.discard'), kind: 'warning' }))) return
-  await discard(o.id)
+  await discard(o.id, o.created_at)
   await loadDetails()
 }
 

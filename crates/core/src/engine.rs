@@ -28,11 +28,13 @@ pub use diagnostics::{
 pub fn subject_core(subject: &str) -> String {
     let mut s = subject.trim();
     loop {
-        let lower = s.to_lowercase();
-        let Some(p) = ["re:", "re :", "fwd:", "fw:", "tr:", "tr :", "réf:", "aw:", "wg:"].iter().find(|p| lower.starts_with(**p)) else {
+        // Only the head: a crafted subject of thousands of prefixes is not lowercased at each one.
+        let head = s.chars().take(5).collect::<String>().to_lowercase();
+        let Some(p) = ["re:", "re :", "fwd:", "fw:", "tr:", "tr :", "réf:", "aw:", "wg:"].iter().find(|p| head.starts_with(**p)) else {
             break;
         };
-        s = s[p.len()..].trim_start();
+        let cut = s.char_indices().nth(p.chars().count()).map_or(s.len(), |(i, _)| i);
+        s = s[cut..].trim_start();
     }
     s.to_string()
 }
@@ -109,6 +111,8 @@ pub enum Event {
 pub struct AiStatus {
     /// This build carries the local AI.
     pub available: bool,
+    /// Built with the local AI, but the processor cannot run it (see `ai::processor_supported`).
+    pub processor_unsupported: bool,
     pub model: Option<String>,
     pub file: Option<String>,
     /// The model's file is there.
@@ -127,6 +131,8 @@ pub struct AiStatus {
     /// The graphics card may be used, and the one the model last ran on.
     pub graphics: bool,
     pub card: Option<String>,
+    /// The card failed the AI (now or at an earlier launch): the processor until tried again.
+    pub graphics_failed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -257,18 +263,19 @@ impl backup::Lease for Dedicated<'_> {
         }
     }
 
-    async fn give_way(&mut self) -> Result<()> {
+    async fn give_way(&mut self) -> Result<bool> {
         let shared = matches!(self.held, Some(Held::Shared(_)));
-        if !shared || self.engine.waiting_on(self.account_id).load(std::sync::atomic::Ordering::Relaxed) == 0 {
-            return Ok(());
+        let waiting = |count: Arc<std::sync::atomic::AtomicUsize>| count.load(std::sync::atomic::Ordering::Relaxed);
+        if !shared || waiting(self.engine.waiting_on(self.account_id)) + waiting(self.engine.syncs_waiting_on(self.account_id)) == 0 {
+            return Ok(false);
         }
         // Given back whole: the one waiting takes it (the lock is fair), this job queues after.
         if let Some(Held::Shared(conn)) = self.held.take() {
             drop(conn);
         }
         tokio::task::yield_now().await;
-        self.held = Some(Held::Shared(self.engine.session(self.account_id, Purpose::Background).await?));
-        Ok(())
+        self.held = Some(Held::Shared(self.engine.session_after(self.account_id, Purpose::Background, false).await?));
+        Ok(true)
     }
 }
 
@@ -336,6 +343,8 @@ const AI_MODEL: &str = "ai_model";
 const AI_FILE: &str = "ai_file";
 /// `off`: the local AI on the processor only.
 const AI_GRAPHICS: &str = "ai_graphics";
+/// The graphics card failed the local AI: kept across launches.
+const AI_GRAPHICS_FAILED: &str = "ai_graphics_failed";
 /// Dictation, apart from the rest: its model downloaded (`whisper-turbo`), or none.
 const DICTATION_MODEL: &str = "dictation_model";
 
@@ -359,6 +368,10 @@ pub struct Engine {
     slots: Mutex<HashMap<(i64, Purpose), Slot>>,
     /// One connection for everything: requests other than the sync waiting for it, per account.
     waiting: Mutex<HashMap<i64, Arc<std::sync::atomic::AtomicUsize>>>,
+    /// Accounts signed in to since launch (see `idle_session`).
+    signed_in: Mutex<HashSet<i64>>,
+    /// The syncs among them (see [`Engine::session`]).
+    syncs_waiting: Mutex<HashMap<i64, Arc<std::sync::atomic::AtomicUsize>>>,
     flush_locks: Mutex<HashMap<i64, Arc<AsyncMutex<()>>>>,
     /// In memory only. The expiry is wall-clock time (see [`oauth::Tokens::expires_at`]).
     tokens: Mutex<HashMap<i64, (String, SystemTime)>>,
@@ -392,6 +405,11 @@ pub struct Engine {
     ai_dir: PathBuf,
     ai_download: Mutex<Option<AiDownload>>,
     ai_busy: tokio::sync::Mutex<()>,
+    /// The latest request of each kind (summary, event): an older one still waiting was left by
+    /// the interface and is not run.
+    ai_asked: [std::sync::atomic::AtomicU64; 2],
+    /// Recordings waiting to be transcribed: they go before the text requests waiting.
+    ai_dictations: std::sync::atomic::AtomicUsize,
     /// Forgotten after a quarter of an hour.
     pending_oauth: Mutex<HashMap<String, (oauth::Tokens, Instant)>>,
     idling: Mutex<HashSet<i64>>,
@@ -440,10 +458,12 @@ pub struct Engine {
     diag: diagnostics::Tracker,
 }
 
-/// A saved draft above this size is uploaded [`DRAFT_APPEND_DELAY`] later, so that saves in a
-/// row upload only the last version.
+/// A saved draft is uploaded [`DRAFT_APPEND_DELAY`] later ([`LARGE_DRAFT_APPEND_DELAY`] above
+/// [`LARGE_DRAFT`]), so that saves in a row (an autosave at every pause while typing or dictating)
+/// upload only the last version, and Drafts (all of All Mail on Gmail) is read again once.
 const LARGE_DRAFT: usize = 1 << 20;
-const DRAFT_APPEND_DELAY: Duration = Duration::from_secs(30);
+const DRAFT_APPEND_DELAY: Duration = Duration::from_secs(10);
+const LARGE_DRAFT_APPEND_DELAY: Duration = Duration::from_secs(30);
 
 /// The Message-ID is left out: the first save gives it.
 fn draft_print(draft: &mut Draft) -> Result<u64> {
@@ -617,7 +637,7 @@ fn checked_draft(mut d: EventDraft) -> Result<EventDraft> {
 /// The first date of a series rebuilt from the occurrence `e` became `draft` (see
 /// [`crate::calendar::series_first`]): start, end, whole day, first day.
 fn rebuilt_first(first: chrono::NaiveDate, e: &CalendarEvent, draft: &EventDraft) -> Result<(i64, i64, bool, chrono::NaiveDate)> {
-    crate::calendar::series_first(first, e.start, draft)
+    crate::calendar::series_first(first, e.start, e.zone.as_deref(), draft)
         .map(|(start, end, day)| (start, end, draft.all_day, day))
         .ok_or_else(|| Error::Other(crate::tr!("date de la série hors calendrier", "the series' date is out of range")))
 }
@@ -642,6 +662,18 @@ fn series_repeat(rule: Option<crate::repeat::Repeat>) -> SeriesRepeat {
 /// What a change to a whole series does: `None` moves its times (and changes its texts) and keeps
 /// its rule; `Some(repeat)` rebuilds it from a new first date, repeating as `repeat`. A rule
 /// facteur cannot write back keeps the series' days.
+#[derive(Clone, Copy)]
+enum AiKind {
+    Summary,
+    Event,
+}
+
+/// The organizer's own reminders are no news for the guests (RFC 5546); a series written again
+/// with another rule or first day is, whatever else changed.
+fn tells_guests(changes: &crate::calendar::EventChanges, rebuilt: bool) -> bool {
+    rebuilt || !changes.only_reminders()
+}
+
 fn series_plan(e: &CalendarEvent, draft: &EventDraft, changes: &crate::calendar::EventChanges, now: &SeriesRepeat, first: chrono::NaiveDate) -> Result<Option<Option<crate::repeat::Repeat>>> {
     // Another zone: the series is written again in it.
     // Days compared in the event's zone: a time change across the computer's midnight is no move.
@@ -814,12 +846,17 @@ impl Engine {
             crate::i18n::set(&language);
         }
         crate::ai::set_graphics(store.setting(AI_GRAPHICS).ok().flatten().as_deref() != Some("off"));
+        if store.setting(AI_GRAPHICS_FAILED).ok().flatten().is_some() {
+            crate::ai::graphics_failed_before();
+        }
         Ok(Arc::new(Engine {
             store,
             secrets: Secrets::new(),
             events: broadcast::channel(256).0,
             slots: Mutex::default(),
             waiting: Mutex::default(),
+            syncs_waiting: Mutex::default(),
+            signed_in: Mutex::default(),
             flush_locks: Mutex::default(),
             tokens: Mutex::default(),
             refused_since: Mutex::default(),
@@ -837,6 +874,8 @@ impl Engine {
             ai_dir: data_dir.join("models"),
             ai_download: Mutex::default(),
             ai_busy: tokio::sync::Mutex::new(()),
+            ai_asked: Default::default(),
+            ai_dictations: Default::default(),
             pending_oauth: Mutex::default(),
             idling: Mutex::default(),
             logo_tried: Mutex::default(),
@@ -949,15 +988,24 @@ impl Engine {
     async fn login(&self, account: &Account) -> Result<Session> {
         let credential = self.credential(account).await?;
         let res = imap::connect(&account.imap, &account.username, &credential).await;
+        // A token the provider has just issued, refused all the same.
+        let mut fresh_refused = false;
         let res = match (res, &credential) {
-            (Err(Error::Auth(_) | Error::Refused(_)), Credential::Token(used)) => {
+            // Only a refusal a new token can cure: signing in again at once while Gmail says too
+            // many connections, or throttles, would only make it worse.
+            (Err(e), Credential::Token(used)) if new_token_cures(&e) => {
                 self.forget_token(account.id, Some(used.as_str()));
                 let credential = self.credential(account).await?;
                 match imap::connect(&account.imap, &account.username, &credential).await {
                     // The provider has just issued that token: the grant holds, the server is the
                     // one failing (an Outlook backend issue). Signing in again would give the same
                     // token: it is a passing refusal.
-                    Err(Error::Auth(why)) => Err(Error::Refused(why)),
+                    // Lasting, it is no passing refusal (IMAP turned off for the mailbox): the user
+                    // is asked as for one that signing in cures.
+                    Err(Error::Auth(why)) => {
+                        fresh_refused = true;
+                        Err(Error::Refused(why))
+                    }
                     // Outlook turns sign-ins down this way for about a minute after a launch (its
                     // new token or the last session's end not taken in yet): tried again a few
                     // times over that minute before telling.
@@ -979,9 +1027,10 @@ impl Engine {
         };
         match &res {
             Err(Error::Auth(why)) => self.refuse(account.id, why),
-            Err(Error::Refused(why)) => self.refused_for_now(account.id, why, SystemTime::now()),
+            Err(Error::Refused(why)) => self.refused_for_now(account.id, why, fresh_refused, SystemTime::now()),
             Ok(_) => {
                 self.refused_since.lock().unwrap().remove(&account.id);
+                self.signed_in.lock().unwrap().insert(account.id);
             }
             Err(_) => {}
         }
@@ -990,9 +1039,10 @@ impl Engine {
 
     /// A sign-in turned down "for now" at `now`: refused again and again for
     /// [`REFUSED_FOR_NOW_LIMIT`] (none more than [`REFUSED_FOR_NOW_GAP`] apart, at least
-    /// [`REFUSED_FOR_NOW_COUNT`] times), the account waits for the user.
-    fn refused_for_now(&self, account_id: i64, why: &str, now: SystemTime) {
-        if !imap::cured_by_signing_in(why) {
+    /// [`REFUSED_FOR_NOW_COUNT`] times), the account waits for the user. Only for a refusal that
+    /// signing in cures, or a fresh token refused (`fresh`): waiting cures the others.
+    fn refused_for_now(&self, account_id: i64, why: &str, fresh: bool, now: SystemTime) {
+        if !fresh && !imap::cured_by_signing_in(why) {
             return;
         }
         let (since, count) = {
@@ -1215,15 +1265,26 @@ impl Engine {
     }
 
     async fn session(&self, account_id: i64, purpose: Purpose) -> Result<Conn> {
+        self.session_after(account_id, purpose, true).await
+    }
+
+    /// `counted`: among those a sync gives way to. A long job taking the one connection back after
+    /// giving it over is not: the sync would hand it back after each folder, and the two take
+    /// turns folder by folder.
+    async fn session_after(&self, account_id: i64, purpose: Purpose, counted: bool) -> Result<Conn> {
         let single = self.single_connection(account_id);
         // Waiting behind a sync on the one connection: it gives way between two folders.
-        let _waiting = (single && purpose != Purpose::Sync).then(|| Waiting::new(self.waiting_on(account_id)));
+        let _waiting = (single && counted && purpose != Purpose::Sync).then(|| Waiting::new(self.waiting_on(account_id)));
+        // A sync waiting is counted apart: a long job gives way to it, a sync does not (two syncs
+        // would hand the connection to each other after every folder).
+        let _sync_waiting = (single && purpose == Purpose::Sync).then(|| Waiting::new(self.syncs_waiting_on(account_id)));
         let purpose = if single { Purpose::Sync } else { purpose };
         let slot = self.slots.lock().unwrap().entry((account_id, purpose)).or_default().clone();
         let mut guard = tokio::time::timeout(SLOT_WAIT, slot.lock_owned()).await.map_err(|_| {
             Error::Other(crate::tr!("connexion au serveur occupée depuis trop longtemps", "server connection busy for too long"))
         })?;
         drop(_waiting);
+        drop(_sync_waiting);
         // Used a moment ago: still alive (TCP keepalive notices a dead one). After a while, a quick
         // NOOP; a server that takes more than 3 s to answer it is not worth waiting for.
         if let Some(conn) = guard.as_mut()
@@ -1247,6 +1308,10 @@ impl Engine {
         self.waiting.lock().unwrap().entry(account_id).or_default().clone()
     }
 
+    fn syncs_waiting_on(&self, account_id: i64) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.syncs_waiting.lock().unwrap().entry(account_id).or_default().clone()
+    }
+
     /// At quit: every connection is closed with a LOGOUT, the listening ones stopped first, so
     /// that a server counting sessions (Outlook) does not turn down the next launch's sign-ins for
     /// the ones it still believes open. Bounded: quitting must not wait for a slow server.
@@ -1264,7 +1329,13 @@ impl Engine {
             }
         }
         let out = futures::future::join_all(sessions.iter_mut().map(logout));
-        let _ = tokio::time::timeout(Duration::from_secs(2), out).await;
+        // The listeners log out on their own: waited for, the process would end before.
+        let listeners = async {
+            while !self.idling.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(2), futures::future::join(out, listeners)).await;
     }
 
     async fn close_idle_connections(&self) {
@@ -2323,6 +2394,23 @@ impl Engine {
         Some(token)
     }
 
+    /// An action over several accounts failing on a later one: the moves already made are taken
+    /// back, so that nothing moves, as when a destination is missing. Kept without an undo, they
+    /// would stay held and done, the user unable to take them back.
+    fn undo_or_back(self: &Arc<Self>, undo: Undo, res: Result<()>) -> Result<Option<u64>> {
+        let token = self.keep_undo(undo);
+        let Err(e) = res else { return Ok(token) };
+        if let Some(token) = token {
+            let this = self.clone();
+            self.spawn(async move {
+                if let Err(e) = this.undo(token).await {
+                    tracing::warn!("moves made before a failure not taken back: {e}");
+                }
+            });
+        }
+        Err(e)
+    }
+
     /// Possible while the action's operations have not left the queue.
     pub async fn undo(self: &Arc<Self>, token: u64) -> Result<()> {
         let too_late = || Error::Other(crate::tr!("trop tard : l'action est déjà faite sur le serveur", "too late: the action has already been done on the server"));
@@ -2445,10 +2533,16 @@ impl Engine {
     }
 
     /// The next sync realigns the cache with the server.
-    pub fn discard_op(&self, id: i64) -> Result<()> {
-        let row = self.store.op_row(id)?;
-        let op = self.store.op_payload(id)?.and_then(|p| serde_json::from_str::<Op>(&p).ok());
-        self.store.finish_op(id)?;
+    /// `created_at`: the operation shown, not one queued since under its id (SQLite reuses the
+    /// last id once its row goes).
+    pub fn discard_op(&self, id: i64, created_at: i64) -> Result<()> {
+        let row = self.store.op_row(id)?.filter(|r| r.created_at == created_at);
+        let Some(payload) = row.as_ref().map(|_| self.store.op_payload(id)).transpose()?.flatten() else {
+            self.emit(Event::OpsChanged);
+            return Err(Error::Other(crate::tr!("opération déjà partie", "operation already sent")));
+        };
+        let op = serde_json::from_str::<Op>(&payload).ok();
+        self.store.finish_replayed(id, &payload)?;
         // What it hid (moved or deleted locally) shows again at the next sync, in full.
         if let (Some(row), Some(op)) = (row, op) {
             crate::ops::recheck_folders(&self.store, row.account_id, &op);
@@ -2768,8 +2862,8 @@ impl Engine {
     /// With Gmail and most hosts, this move also trains the server's spam filter.
     pub fn report_spam(self: &Arc<Self>, ids: &[i64]) -> Result<Option<u64>> {
         let mut undo = Undo::default();
-        self.report_spam_inner(ids, Some(&mut undo))?;
-        Ok(self.keep_undo(undo))
+        let res = self.report_spam_inner(ids, Some(&mut undo));
+        self.undo_or_back(undo, res)
     }
 
     fn report_spam_inner(self: &Arc<Self>, ids: &[i64], mut undo: Option<&mut Undo>) -> Result<()> {
@@ -2790,11 +2884,15 @@ impl Engine {
 
     pub fn not_spam(self: &Arc<Self>, ids: &[i64]) -> Result<Option<u64>> {
         let mut undo = Undo::default();
-        for (account_id, ids) in self.by_account(ids)? {
-            let inbox = self.role_mailbox(account_id, Role::Inbox)?;
-            self.move_inner(&ids, inbox, Some(&mut undo))?;
-        }
-        Ok(self.keep_undo(undo))
+        let groups = self.by_account(ids)?;
+        let res = (|| {
+            for (account_id, ids) in groups {
+                let inbox = self.role_mailbox(account_id, Role::Inbox)?;
+                self.move_inner(&ids, inbox, Some(&mut undo))?;
+            }
+            Ok(())
+        })();
+        self.undo_or_back(undo, res)
     }
 
     /// Its received and future messages go to Junk.
@@ -2849,7 +2947,7 @@ impl Engine {
             }
         }
         if let Some(mailto) = &unsub.mailto {
-            let (address, subject, body) = parse_mailto(mailto);
+            let (address, subject, _) = parse_mailto(mailto);
             if !confirmed {
                 return Ok(Unsubscribed::Confirm { address, subject: subject.unwrap_or_else(|| "unsubscribe".into()) });
             }
@@ -2857,7 +2955,8 @@ impl Engine {
                 account_id: self.store.location(id)?.account_id,
                 to: vec![address.clone()],
                 subject: subject.unwrap_or_else(|| "unsubscribe".into()),
-                body: body.unwrap_or_else(|| "unsubscribe".into()),
+                // Never the sender's own text: the user confirmed the address and subject only.
+                body: "unsubscribe".into(),
                 ..Default::default()
             };
             // No undo delay: the user already confirmed.
@@ -3386,10 +3485,8 @@ impl Engine {
             .map(|(account_id, ids)| Ok((ids, self.archive_mailbox(account_id)?)))
             .collect::<Result<Vec<_>>>()?;
         let mut undo = Undo::default();
-        for (ids, dest) in plan {
-            self.move_inner(&ids, dest, Some(&mut undo))?;
-        }
-        Ok(self.keep_undo(undo))
+        let res = plan.into_iter().try_for_each(|(ids, dest)| self.move_inner(&ids, dest, Some(&mut undo)));
+        self.undo_or_back(undo, res)
     }
 
     /// One undoable action (used for "Screened out": the refused mail, kept whole here). `None`
@@ -3427,7 +3524,7 @@ impl Engine {
                 "message still on its way to the trash: try again in a few seconds"
             )));
         }
-        for (account_id, list, trash) in plan {
+        let res = plan.into_iter().try_for_each(|(account_id, list, trash)| {
             let (in_trash, elsewhere): (Vec<_>, Vec<_>) = list.into_iter().partition(|(_, l)| l.mailbox_id == trash);
             if purge && !in_trash.is_empty() {
                 let uids: Vec<u32> = in_trash.iter().filter_map(|(_, l)| l.uid).collect();
@@ -3443,8 +3540,9 @@ impl Engine {
                 let ids: Vec<i64> = elsewhere.iter().map(|(id, _)| *id).collect();
                 self.move_inner(&ids, trash, Some(&mut undo))?;
             }
-        }
-        Ok(self.keep_undo(undo))
+            Ok(())
+        });
+        self.undo_or_back(undo, res)
     }
 
     fn after_local_change(self: &Arc<Self>, mut accounts: Vec<i64>) {
@@ -3612,63 +3710,97 @@ impl Engine {
         let (irt, refs) = self.reply_headers(&draft);
         let message = smtp::build(&account, &draft, irt.as_deref(), &refs, true)?;
         let drafts = self.drafts_mailbox(account.id)?;
-        // Only the last version counts: earlier ones still queued are useless.
-        self.store.drop_pending_draft(account.id, &id)?;
-        let op = Op::SaveDraft { mailbox: drafts.name.clone(), message_id: id.clone(), raw: B64.encode(message.formatted()) };
+        // Only the last version counts: earlier ones still queued are useless, but the old copy
+        // one of them was to delete goes on with this one.
+        let carried = self.take_pending_draft(account.id, &id)?;
+        let source = match carried {
+            Some(source) => Some(source),
+            None => self.draft_source(&draft, &drafts.name),
+        };
+        let op = Op::SaveDraft { mailbox: drafts.name.clone(), message_id: id.clone(), raw: B64.encode(message.formatted()), source };
         let large = matches!(&op, Op::SaveDraft { raw, .. } if raw.len() > LARGE_DRAFT);
         self.enqueue(account.id, &op, &crate::i18n::both(|| crate::tr!("Enregistrer le brouillon · {}", "Save draft · {}", draft.subject)))?;
-        self.drop_draft_source(&draft);
-        if large {
-            self.flush_draft_later(account.id, drafts.id);
-        } else {
-            self.flush_then_refresh(account.id, vec![drafts.id]);
-        }
+        self.flush_draft_later(account.id, drafts.id, if large { LARGE_DRAFT_APPEND_DELAY } else { DRAFT_APPEND_DELAY });
         Ok(id)
     }
 
     /// Each save replaces the one still queued, so saves in a row upload the whole message once.
     /// The save is queued on disk meanwhile, and any other replay of the account sends it too.
-    fn flush_draft_later(self: &Arc<Self>, account_id: i64, drafts: i64) {
+    fn flush_draft_later(self: &Arc<Self>, account_id: i64, drafts: i64, delay: Duration) {
         if !self.draft_flushes.lock().unwrap().insert(account_id) {
             return;
         }
         let this = self.clone();
         self.spawn(async move {
-            tokio::time::sleep(DRAFT_APPEND_DELAY).await;
+            tokio::time::sleep(delay).await;
             this.draft_flushes.lock().unwrap().remove(&account_id);
             this.request_flush(account_id, &[drafts]);
         });
     }
 
-    /// Deletes the Drafts copy a draft was reopened from when it had no Message-ID (written by
-    /// another client): the saved version, under a Message-ID of its own, would not replace it.
-    /// Does nothing once it is gone, so every save and the send may call it.
-    fn drop_draft_source(&self, draft: &Draft) {
-        let Some(source) = draft.source else { return };
-        let res = (|| -> Result<()> {
-            let Ok(loc) = self.store.location(source) else { return Ok(()) };
+    /// The Drafts copy a draft was reopened from when it had no Message-ID (written by another
+    /// client): the saved version, under a Message-ID of its own, would not replace it. Taken out
+    /// of the cache; on the server it goes with the save into `drafts` (only once that is in),
+    /// or alone when it lies in another folder. Nothing once it is gone, so every save and the
+    /// send may ask.
+    fn draft_source(&self, draft: &Draft, drafts: &str) -> Option<(u32, Option<u32>)> {
+        let source = draft.source?;
+        let res = (|| -> Result<Option<(u32, Option<u32>)>> {
+            let Ok(loc) = self.store.location(source) else { return Ok(None) };
             let in_drafts = self.store.mailbox_state(loc.mailbox_id)?.role == Some(Role::Drafts);
             // Still a Drafts copy without a Message-ID: a local id can be reused once its message is gone,
             // and nothing else must ever be deleted through this.
             if loc.account_id != draft.account_id || !in_drafts || self.store.message_ids(source)?.0.is_some() {
-                return Ok(());
+                return Ok(None);
             }
-            let Some(uid) = loc.uid else { return Ok(()) };
+            let Some(uid) = loc.uid else { return Ok(None) };
+            let uidvalidity = self.uidvalidity(loc.mailbox_id);
             self.store.delete_uids(loc.mailbox_id, &[uid])?;
-            let op = Op::Delete { mailbox: loc.mailbox, uid, uidvalidity: self.uidvalidity(loc.mailbox_id) };
-            self.enqueue(loc.account_id, &op, &crate::i18n::both(|| crate::tr!("Supprimer l'ancien brouillon", "Delete the old draft")))?;
             self.emit(Event::Changed { account_id: loc.account_id });
-            Ok(())
+            if loc.mailbox == drafts {
+                return Ok(Some((uid, uidvalidity)));
+            }
+            self.delete_old_draft(loc.account_id, &loc.mailbox, uid, uidvalidity)?;
+            Ok(None)
         })();
-        if let Err(e) = res {
+        res.unwrap_or_else(|e| {
             tracing::warn!("old copy of the draft left in Drafts: {e}");
-        }
+            None
+        })
+    }
+
+    fn delete_old_draft(&self, account_id: i64, mailbox: &str, uid: u32, uidvalidity: Option<u32>) -> Result<()> {
+        let op = Op::Delete { mailbox: mailbox.to_string(), uid, uidvalidity };
+        self.enqueue(account_id, &op, &crate::i18n::both(|| crate::tr!("Supprimer l'ancien brouillon", "Delete the old draft")))?;
+        Ok(())
+    }
+
+    /// Drops the draft's queued saves, returning the old copy one of them was to delete.
+    fn take_pending_draft(&self, account_id: i64, id: &str) -> Result<Option<(u32, Option<u32>)>> {
+        let source = self.store.pending_draft_saves(account_id, id)?.into_iter().find_map(|(payload, _)| match serde_json::from_str(&payload) {
+            Ok(Op::SaveDraft { source, .. }) => source,
+            _ => None,
+        });
+        self.store.drop_pending_draft(account_id, id)?;
+        Ok(source)
+    }
+
+    /// The version a queued save (not yet on the server) holds, newer than the cached copy.
+    fn queued_draft(&self, account_id: i64, id: &str) -> Result<Option<Vec<u8>>> {
+        let saves = self.store.pending_draft_saves(account_id, id)?;
+        Ok(saves.into_iter().rev().find(|(_, failed)| !failed).and_then(|(payload, _)| match serde_json::from_str(&payload) {
+            Ok(Op::SaveDraft { raw, .. }) => B64.decode(raw).ok(),
+            _ => None,
+        }))
     }
 
     pub fn discard_draft(self: &Arc<Self>, account_id: i64, draft_id: &str) -> Result<()> {
         self.draft_prints.lock().unwrap().remove(&(account_id, draft_id.to_string()));
         let Some(drafts) = self.store.mailbox_by_role(account_id, Role::Drafts)? else { return Ok(()) };
-        self.store.drop_pending_draft(account_id, draft_id)?;
+        // A save still queued was to delete the copy it came from: that copy goes all the same.
+        if let Some((uid, uidvalidity)) = self.take_pending_draft(account_id, draft_id)? {
+            self.delete_old_draft(account_id, &drafts.name, uid, uidvalidity)?;
+        }
         self.store.delete_by_message_id(drafts.id, draft_id)?;
         let op = Op::DeleteDraft { mailbox: drafts.name.clone(), message_id: draft_id.to_string() };
         self.enqueue(account_id, &op, &crate::i18n::both(|| crate::tr!("Supprimer le brouillon", "Delete draft")))?;
@@ -3679,7 +3811,14 @@ impl Engine {
 
     pub async fn open_draft(&self, id: i64) -> Result<Draft> {
         let account_id = self.store.location(id)?.account_id;
-        let parts = parse_draft(self.raw(id).await?).await?;
+        let mut parts = parse_draft(self.raw(id).await?).await?;
+        // Saved since and still on its way (uploaded a few seconds later, or offline): that
+        // version, or the next save would replace it with the older one shown here.
+        if let Some(mid) = parts.message_id.clone()
+            && let Some(raw) = self.queued_draft(account_id, &mid)?
+        {
+            parts = parse_draft(raw).await?;
+        }
         let in_reply_to = match &parts.in_reply_to {
             Some(mid) => self.store.find_by_message_id(account_id, mid)?,
             None => None,
@@ -3731,7 +3870,14 @@ impl Engine {
             // A Gmail label (Drafts and Sent too) is synced through All Mail: what it brings is
             // every new message, and those labelled inbox are arrivals, whichever label asked.
             let label = state.is_label;
+            // A first pass (one cut before it ended, taken up here) brings old mail, no arrivals.
+            let first_pass = if label {
+                self.store.mailbox_by_role(account_id, Role::All)?.is_none_or(|all| all.uidvalidity.is_none())
+            } else {
+                state.uidvalidity.is_none()
+            };
             match bounded(300, &crate::tr!("synchronisation du dossier", "folder sync"), sync::sync_mailbox(&self.store, account_id, &mut conn.session, &caps, state, &mut |_| {})).await {
+                Ok(_) if first_pass => {}
                 Ok((ids, _)) if label => fresh_inbox.extend(self.store.with_label_role(&ids, &[Role::Inbox])?),
                 Ok((ids, _)) if inbox => fresh_inbox.extend(ids),
                 Ok(_) => {}
@@ -3893,7 +4039,8 @@ impl Engine {
                         Err(e) => return (group, Err(e)),
                     };
                     let res = sync::search_server(&self.store, &mut session, &group, criteria, 200).await;
-                    let _ = session.logout().await;
+                    // Bounded: a silent LOGOUT would hold back the whole search.
+                    logout(&mut session).await;
                     (group, res)
                 }
             }));
@@ -3985,7 +4132,12 @@ impl Engine {
         {
             tracing::warn!("draft left in Drafts: {e}");
         }
-        self.drop_draft_source(&draft);
+        if let Ok(drafts) = self.drafts_mailbox(account.id)
+            && let Some((uid, uidvalidity)) = self.draft_source(&draft, &drafts.name)
+            && let Err(e) = self.delete_old_draft(account.id, &drafts.name, uid, uidvalidity)
+        {
+            tracing::warn!("old copy of the draft left in Drafts: {e}");
+        }
         self.scheduler.notify_one();
         self.emit(Event::OutboxChanged);
         Ok((scheduled || delay > 0).then_some(id))
@@ -4505,7 +4657,7 @@ impl Engine {
                 Ok((account_id, ids, self.special_mailbox(account_id, &[Role::Snoozed], Role::Snoozed, SNOOZE_FOLDER)?))
             })
             .collect::<Result<Vec<_>>>()?;
-        for (account_id, ids, dest) in plan {
+        let res = plan.into_iter().try_for_each(|(account_id, ids, dest)| {
             let mut threads: HashMap<i64, Vec<String>> = HashMap::new();
             for &id in &ids {
                 let thread_id = self.store.summary(id)?.thread_id;
@@ -4517,9 +4669,10 @@ impl Engine {
                 self.store.snooze(account_id, thread_id, &mids, until)?;
                 undo.snoozes.push((account_id, thread_id));
             }
-        }
+            Ok(())
+        });
         self.scheduler.notify_one();
-        Ok(self.keep_undo(undo))
+        self.undo_or_back(undo, res)
     }
 
     pub fn unsnooze(self: &Arc<Self>, account_id: i64, thread_id: i64) -> Result<()> {
@@ -4589,6 +4742,15 @@ impl Engine {
         let this = self.clone();
         self.spawn(async move {
             tokio::time::sleep(Duration::from_secs(120)).await;
+            // The writer is held throughout (a rebuild, VACUUM): not while syncs need it, ten
+            // minutes at most.
+            let waited = Instant::now();
+            while this.diag.any_sync() && waited.elapsed() < Duration::from_secs(600) {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            if let Err(e) = crate::rt::offload(|| this.store.check_search_index()) {
+                tracing::error!("search index check: {e}");
+            }
             let failed_at: Option<i64> = this.store.setting(FAILED_AT).ok().flatten().and_then(|t| t.parse().ok());
             if failed_at.is_some_and(|t| crate::store::now() - t < 7 * 86400) {
                 return;
@@ -5043,7 +5205,10 @@ impl Engine {
                     self.emit(Event::BackupProgress { account_id, mailbox: p.mailbox, done: p.done, total: p.total });
                 })
                 .await;
-                session.finish().await;
+                // Failed, maybe mid-command: the connection is dropped (see Dedicated's Drop).
+                if stats.is_ok() {
+                    session.finish().await;
+                }
                 stats
             })
             .await;
@@ -5144,7 +5309,10 @@ impl Engine {
                     self.emit(Event::RestoreProgress { account_id, mailbox: p.mailbox, done: p.done, total: p.total });
                 })
                 .await;
-                session.finish().await;
+                // Failed, maybe mid-command: the connection is dropped (see Dedicated's Drop).
+                if stats.is_ok() {
+                    session.finish().await;
+                }
                 stats
             })
             .await?;
@@ -5695,7 +5863,11 @@ impl Engine {
     /// `ics` (as written) to those invited now, its cancellation to those `before` and no longer.
     async fn tell_guests(self: &Arc<Self>, account: &Account, client: &crate::caldav::Client, calendar: &reqwest::Url, ics: &str, before: &[EventAttendee], now: &[EventAttendee]) -> Result<()> {
         let gone: Vec<EventAttendee> = before.iter().filter(|b| !b.organizer && !now.iter().any(|n| n.email.eq_ignore_ascii_case(&b.email))).cloned().collect();
-        let invited: Vec<EventAttendee> = now.iter().filter(|a| !a.organizer).cloned().collect();
+        let mut invited: Vec<EventAttendee> = now.iter().filter(|a| !a.organizer).cloned().collect();
+        // Those past the guests shown: invited all the same.
+        if !invited.is_empty() {
+            invited.extend(crate::calendar::unshown_guests_of(ics).into_iter().filter(|u| !now.iter().any(|n| n.email.eq_ignore_ascii_case(&u.email))));
+        }
         if (gone.is_empty() && invited.is_empty()) || client.auto_schedules(calendar).await {
             return Ok(());
         }
@@ -5865,7 +6037,7 @@ impl Engine {
                 let (client, url) = self.caldav_target(&account, &target).await?;
                 let now = crate::store::now();
                 let original = e.instance.parse::<i64>().ok();
-                let (mut refused, mut unchanged) = (None, false);
+                let (mut refused, mut unchanged, mut rebuilt) = (None, false, false);
                 let ics = bounded(EVENT_TIMEOUT, &what, client.rewrite(&url, |ics| match (series, e.recurring, original) {
                     (true, _, _) => {
                         let (rule, first) = crate::calendar::series_rule(ics)?;
@@ -5877,6 +6049,7 @@ impl Engine {
                             }
                             Ok(Some(repeat)) => {
                                 let (start, end, all_day, _) = rebuilt_first(first, e, &draft).ok()?;
+                                rebuilt = true;
                                 crate::calendar::rebuild_series(ics, &changes, (start, end, all_day), repeat.as_ref(), now)
                             }
                             Ok(None) if changes.is_empty() => {
@@ -5898,7 +6071,9 @@ impl Engine {
                 }
                 let ics = ics.ok_or_else(not_editable)?;
                 let calendar = reqwest::Url::parse(&target.calendar_remote_id).map_err(|e| Error::Other(e.to_string()))?;
-                told = self.tell_guests(&account, &client, &calendar, &ics, &e.attendees, &guests_after).await;
+                if tells_guests(&changes, rebuilt) {
+                    told = self.tell_guests(&account, &client, &calendar, &ics, &e.attendees, &guests_after).await;
+                }
                 (!e.recurring).then(|| written_instance(&ics, url.as_str(), &draft)).transpose()?
             }
         };
@@ -6207,6 +6382,8 @@ impl Engine {
         me: &[String],
     ) -> Result<Option<(Vec<(String, String)>, HashSet<String>, Vec<crate::calendar::Instance>)>> {
         let listed = match client.etags(url, from, to).await {
+            // Nothing listed: an empty calendar, or a server that lists no ETags; the whole read tells.
+            Ok(listed) if listed.is_empty() => return Ok(None),
             Ok(listed) => listed,
             Err(e @ Error::Auth(_)) => return Err(e),
             Err(_) => return Ok(None),
@@ -6459,6 +6636,7 @@ impl Engine {
         let memory = crate::ai::total_memory();
         AiStatus {
             available: crate::ai::available(),
+            processor_unsupported: !crate::ai::processor_supported(),
             ready: self.ai_path().is_ok(),
             model,
             file,
@@ -6472,16 +6650,20 @@ impl Engine {
             dictation_model: crate::ai::DICTATION,
             graphics: self.setting(AI_GRAPHICS).ok().flatten().as_deref() != Some("off"),
             card: crate::ai::graphics_card(),
+            graphics_failed: crate::ai::graphics_failed(),
         }
     }
 
     /// The graphics card for the local AI, or the processor only (`false`).
+    /// Turned on again, a card that failed is tried again.
     pub fn set_ai_graphics(&self, on: bool) -> Result<()> {
         if on {
             self.store.delete_setting(AI_GRAPHICS)?;
         } else {
             self.store.set_setting(AI_GRAPHICS, "off")?;
         }
+        self.store.delete_setting(AI_GRAPHICS_FAILED)?;
+        crate::ai::retry_graphics();
         crate::ai::set_graphics(on);
         self.emit(Event::AiChanged);
         Ok(())
@@ -6511,12 +6693,29 @@ impl Engine {
 
     /// What was said, recorded by the interface (16 kHz mono, 16-bit), by the local model.
     pub async fn ai_transcribe(&self, pcm: Vec<u8>, language: Option<String>) -> Result<String> {
-        let path = self.dictation_path()?;
         let language = language.filter(|l| l.len() == 2 && l.chars().all(|c| c.is_ascii_lowercase()));
-        let _one = self.ai_busy.lock().await;
-        tokio::task::spawn_blocking(move || crate::ai::transcribe(&path, &crate::ai::samples(&pcm), language.as_deref()))
+        let _one = {
+            use std::sync::atomic::Ordering;
+            self.ai_dictations.fetch_add(1, Ordering::SeqCst);
+            let one = self.ai_busy.lock().await;
+            self.ai_dictations.fetch_sub(1, Ordering::SeqCst);
+            one
+        };
+        // Read once its turn came: dictation turned off meanwhile is not started again.
+        let path = self.dictation_path()?;
+        let heard = tokio::task::spawn_blocking(move || crate::ai::transcribe(&path, &crate::ai::samples(&pcm), language.as_deref()))
             .await
-            .map_err(|e| Error::Other(e.to_string()))?
+            .map_err(|e| Error::Other(e.to_string()))?;
+        self.keep_graphics_failure();
+        heard
+    }
+
+    /// A failure of the graphics card noted for the next launches.
+    fn keep_graphics_failure(&self) {
+        if crate::ai::graphics_failed() && self.setting(AI_GRAPHICS_FAILED).ok().flatten().is_none() {
+            let _ = self.store.set_setting(AI_GRAPHICS_FAILED, "1");
+            self.emit(Event::AiChanged);
+        }
     }
 
     /// The model file in use; an error when the local AI is off or its file gone.
@@ -6635,7 +6834,8 @@ impl Engine {
             .filter_map(|id| crate::ai::model(&id))
             .map(|m| m.file)
             .collect();
-        let downloading = self.ai_download.lock().unwrap().as_ref().filter(|d| d.running).and_then(|d| crate::ai::model(&d.model)).map(|m| m.file);
+        // Under way, or cut by the network: its part is taken up at the next try.
+        let downloading = self.ai_download.lock().unwrap().as_ref().and_then(|d| crate::ai::model(&d.model)).map(|m| m.file);
         let Ok(entries) = std::fs::read_dir(&self.ai_dir) else { return };
         let part_of = |file: &str| Path::new(file).with_extension("part").to_string_lossy().into_owned();
         // Only what facteur downloads (and its unfinished downloads): a file of the user's own put
@@ -6658,16 +6858,38 @@ impl Engine {
     }
 
     /// The model's answer, one at a time, off the async threads.
-    async fn ai_answer(&self, turns: Vec<(String, String)>, max_tokens: usize, grammar: Option<&'static str>) -> Result<String> {
+    async fn ai_answer(&self, kind: AiKind, turns: Vec<(String, String)>, max_tokens: usize, grammar: Option<&'static str>) -> Result<String> {
+        let _one = self.ai_turn(kind).await?;
+        // Read once its turn came: the AI turned off or switched meanwhile is not started again.
         let path = self.ai_path()?;
-        let _one = self.ai_busy.lock().await;
-        tokio::task::spawn_blocking(move || {
+        let answer = tokio::task::spawn_blocking(move || {
             let turns: Vec<crate::ai::Turn> = turns.iter().map(|(role, content)| crate::ai::Turn { role, content }).collect();
             crate::ai::generate(&path, &turns, max_tokens, grammar)
         })
         .await
-        .map_err(|e| Error::Other(e.to_string()))?
-        .map(|answer| crate::ai::without_thinking(&answer))
+        .map_err(|e| Error::Other(e.to_string()))?;
+        self.keep_graphics_failure();
+        answer.map(|answer| crate::ai::without_thinking(&answer))
+    }
+
+    /// The model for a text request, once its turn comes: after the dictations waiting (someone
+    /// is waiting for their words), and not at all when a newer request of its kind came since.
+    async fn ai_turn(&self, kind: AiKind) -> Result<tokio::sync::MutexGuard<'_, ()>> {
+        use std::sync::atomic::Ordering;
+        let asked = &self.ai_asked[kind as usize];
+        let mine = asked.fetch_add(1, Ordering::SeqCst) + 1;
+        loop {
+            let one = self.ai_busy.lock().await;
+            if asked.load(Ordering::SeqCst) != mine {
+                return Err(Error::Other(crate::tr!("demande remplacée par une plus récente", "request replaced by a newer one")));
+            }
+            if self.ai_dictations.load(Ordering::SeqCst) == 0 {
+                return Ok(one);
+            }
+            // Back in the queue, behind the recordings.
+            drop(one);
+            tokio::task::yield_now().await;
+        }
     }
 
     /// A thread summed up in a few points, by the local model.
@@ -6705,7 +6927,7 @@ impl Engine {
         let french = !crate::i18n::english();
         let instructions = crate::ai::summary_instructions(french);
         let text = crate::ai::summary_request(&text, french);
-        self.ai_answer(vec![("system".into(), instructions), ("user".into(), text)], 400, Some(crate::ai::SUMMARY_GRAMMAR)).await
+        self.ai_answer(AiKind::Summary, vec![("system".into(), instructions), ("user".into(), text)], 400, Some(crate::ai::SUMMARY_GRAMMAR)).await
     }
 
     /// The appointment a message proposes or confirms, found by the local model, its day and
@@ -6723,7 +6945,7 @@ Subject: {}
 
 {fresh}", sent.format("%A %Y-%m-%d %H:%M"), m.subject);
         let answer = self
-            .ai_answer(vec![("system".into(), crate::ai::EVENT_INSTRUCTIONS.into()), ("user".into(), text)], 200, Some(crate::ai::EVENT_GRAMMAR))
+            .ai_answer(AiKind::Event, vec![("system".into(), crate::ai::EVENT_INSTRUCTIONS.into()), ("user".into(), text)], 200, Some(crate::ai::EVENT_GRAMMAR))
             .await?;
         Ok(crate::ai::found_event(&answer, sent.date_naive()))
     }
@@ -6751,17 +6973,16 @@ Subject: {}
     async fn idle_loop(self: Arc<Self>, account_id: i64, mut stop: tokio::sync::watch::Receiver<bool>) {
         const MAX_WAIT: u64 = 30 * 60;
         let mut wait = 60;
-        async fn stopped(stop: &mut tokio::sync::watch::Receiver<bool>) {
-            let _ = stop.wait_for(|s| *s).await;
-        }
         while !*stop.borrow() && self.store.account(account_id).is_ok() {
             let started = Instant::now();
             let mut listening = Listening::default();
             self.diag.listener(account_id, |l| l.connecting());
-            let res = tokio::select! {
-                res = self.idle_session(account_id, &mut listening) => res,
-                _ = stopped(&mut stop) => return,
-            };
+            // Stopped by the session itself, between two commands: a sync under way is not cut in
+            // the middle of one, and the listening connection is logged out of.
+            let res = self.idle_session(account_id, &mut listening, &mut stop).await;
+            if *stop.borrow() {
+                return;
+            }
             if let Some(held) = listening.cut {
                 self.learn_idle_cut(account_id, held);
             }
@@ -6811,16 +7032,34 @@ Subject: {}
     /// Kept as long as it holds: after each signal or timeout, IDLE starts again on the same
     /// connection. With NOTIFY (RFC 5465) changes in every folder are reported here and only those
     /// folders are synced; otherwise only the inbox is watched. `Ok`: closed cleanly (to reopen).
-    async fn idle_session(self: &Arc<Self>, account_id: i64, listening: &mut Listening) -> Result<()> {
+    async fn idle_session(self: &Arc<Self>, account_id: i64, listening: &mut Listening, stop: &mut tokio::sync::watch::Receiver<bool>) -> Result<()> {
         use async_imap::extensions::idle::IdleResponse;
         let account = self.store.account(account_id)?;
-        let mut session = self.login(&account).await?;
+        // Outlook turns down two sign-ins made at once with a fresh token ("authenticated but not
+        // connected", for up to a minute): the listener waits for the launch's first one, the
+        // sync's, to go through.
+        if matches!(account.auth, AuthMethod::OAuth2 { provider: OAuthProvider::Microsoft }) {
+            let started = Instant::now();
+            while !self.signed_in.lock().unwrap().contains(&account_id) && started.elapsed() < Duration::from_secs(120) {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    _ = stopped(stop) => return Ok(()),
+                }
+            }
+        }
+        let mut session = tokio::select! {
+            session = self.login(&account) => session?,
+            _ = stopped(stop) => return Ok(()),
+        };
         let caps = bounded(30, &crate::tr!("capacités du serveur", "server capabilities"), sync::capabilities(&mut session)).await?;
         if !caps.idle {
             // No IDLE: the periodic sync will do.
             self.diag.listener(account_id, |l| l.set("unsupported"));
             logout(&mut session).await;
-            tokio::time::sleep(Duration::from_secs(3600)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(3600)) => {}
+                _ = stopped(stop) => {}
+            }
             return Ok(());
         }
         bounded(60, &crate::tr!("ouverture de la boîte de réception", "opening the inbox"), async { Ok(session.select("INBOX").await?) }).await?;
@@ -6842,7 +7081,7 @@ Subject: {}
         }
         let mut changes = IdleChanges::default();
         loop {
-            if self.store.account(account_id).is_err() {
+            if self.store.account(account_id).is_err() || *stop.borrow() {
                 logout(&mut session).await;
                 return Ok(());
             }
@@ -6893,10 +7132,22 @@ Subject: {}
                 l.notify.get_or_insert(false);
             });
             let (wait, _stop) = handle.wait_with_timeout(self.idle_renew_of(account_id));
+            let mut quitting = false;
             let woken = tokio::select! {
                 res = wait => Some(res),
                 _ = self.resume.notified() => None,
+                _ = stopped(stop) => {
+                    quitting = true;
+                    None
+                }
             };
+            if quitting {
+                // Logged out of: Outlook counts the sessions still open at the next launch.
+                if let Ok(Ok(mut session)) = tokio::time::timeout(Duration::from_secs(1), handle.done()).await {
+                    let _ = tokio::time::timeout(Duration::from_secs(1), logout(&mut session)).await;
+                }
+                return Ok(());
+            }
             // The connection dropped during IDLE: async-imap reports a stream that ended or failed as
             // `ManualInterrupt`, which is never asked for here.
             if matches!(woken, Some(Err(_) | Ok(IdleResponse::ManualInterrupt))) {
@@ -7014,6 +7265,19 @@ async fn parse_body(raw: Vec<u8>) -> Result<mime::ParsedBody> {
 
 async fn parse_draft(raw: Vec<u8>) -> Result<mime::DraftParts> {
     blocking(move || mime::parse_draft(&raw)).await
+}
+
+/// A sign-in refusal a fresh access token may cure.
+fn new_token_cures(e: &Error) -> bool {
+    match e {
+        Error::Auth(_) => true,
+        Error::Refused(why) => imap::cured_by_signing_in(why),
+        _ => false,
+    }
+}
+
+async fn stopped(stop: &mut tokio::sync::watch::Receiver<bool>) {
+    let _ = stop.wait_for(|s| *s).await;
 }
 
 /// Bounded: a server that does not answer must not keep the account marked busy (history,
@@ -7234,10 +7498,24 @@ mod tests {
     }
 
     #[test]
+    fn a_series_rebuilt_is_news_for_its_guests_even_with_new_reminders() {
+        let reminders = crate::calendar::EventChanges { reminders: Some(vec![15]), ..Default::default() };
+        assert!(!tells_guests(&reminders, false), "the organizer's own reminders only");
+        assert!(tells_guests(&reminders, true), "another rule, written again: the guests' copies follow");
+        let moved = crate::calendar::EventChanges { summary: Some("Point".into()), ..reminders };
+        assert!(tells_guests(&moved, false));
+    }
+
+    #[test]
     fn subject_core_drops_reply_prefixes() {
         assert_eq!(subject_core("Re: TR: Fwd: Réunion lundi"), "Réunion lundi");
         assert_eq!(subject_core("RE : Facture"), "Facture");
         assert_eq!(subject_core("Rendez-vous"), "Rendez-vous", "\"Re\" at the start of a word stays");
+        assert_eq!(subject_core("RÉF: Devis"), "Devis");
+        let crafted = format!("{}fin", "Re: ".repeat(250_000));
+        let started = std::time::Instant::now();
+        assert_eq!(subject_core(&crafted), "fin");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
     }
 
     #[test]
@@ -7503,6 +7781,58 @@ mod tests {
         assert_eq!((labels(id), store.location(id).unwrap().mailbox_id), (vec![], trash));
         let listed = |b: i64| store.list_threads(&[b], &[], ThreadFilter::All, false, None, 50, 0).unwrap().len();
         assert_eq!((listed(all), listed(trash)), (0, 1), "gone from All Mail, shown in the bin");
+    }
+
+    #[tokio::test]
+    async fn discarding_an_operation_never_drops_the_one_that_took_its_id() {
+        let (_dir, engine, acc) = test_engine();
+        let store = engine.store();
+        let first = store.push_op(acc, r#"{"kind":"save_draft","raw":"D1"}"#, "", None).unwrap();
+        let shown = store.op_row(first).unwrap().unwrap().created_at;
+        // Replayed while the confirmation was open, its id given to the next one queued.
+        store.finish_op(first).unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let next = store.push_op(acc, r#"{"kind":"save_draft","raw":"D2"}"#, "", None).unwrap();
+        assert_eq!(next, first);
+        assert!(engine.discard_op(first, shown).is_err());
+        assert_eq!(store.pending_ops(acc).unwrap().len(), 1, "the new one stays queued");
+        let now_shown = store.op_row(next).unwrap().unwrap().created_at;
+        engine.discard_op(next, now_shown).unwrap();
+        assert!(store.pending_ops(acc).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_action_failing_on_a_later_account_moves_nothing() {
+        let (_dir, engine, a) = test_engine();
+        let store = engine.store();
+        let srv = ServerConfig { host: "localhost".into(), port: 143, security: Security::None };
+        let b = store
+            .insert_account(&NewAccount {
+                name: "Z".into(), email: "z@example.org".into(), username: "z".into(), password: String::new(),
+                imap: srv.clone(), smtp: srv, auth: NewAuth::Password,
+            })
+            .unwrap();
+        let flags = ServerFlags { seen: false, flagged: false, answered: false, draft: false };
+        let header = HeaderInfo { message_id: Some("m@x".into()), subject: "Avis".into(), date: 1, ..Default::default() };
+        let a_inbox = store.upsert_mailbox(a, "INBOX", Some("/"), Some(Role::Inbox), true).unwrap();
+        store.upsert_mailbox(a, "Archive", Some("/"), Some(Role::Archive), true).unwrap();
+        let b_inbox = store.upsert_mailbox(b, "INBOX", Some("/"), Some(Role::Inbox), true).unwrap();
+        let b_archive = store.upsert_mailbox(b, "Archive", Some("/"), Some(Role::Archive), true).unwrap();
+        let first = store.insert_header(a, a_inbox, 7, &header, flags, 10).unwrap();
+        // Still on its way to the inbox (no UID yet): it cannot move again.
+        let moving = store.insert_header(b, b_archive, 3, &header, flags, 10).unwrap();
+        store.move_local(moving, b_inbox).unwrap();
+        assert!(store.location(moving).unwrap().uid.is_none());
+
+        assert!(engine.archive(&[first, moving]).is_err());
+        for _ in 0..100 {
+            if store.location(first).unwrap().mailbox_id == a_inbox {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(store.location(first).unwrap().mailbox_id, a_inbox, "the first account's move taken back");
+        assert!(store.pending_ops(a).unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -7831,6 +8161,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ai_requests_left_by_the_interface_are_not_run_and_dictation_goes_first() {
+        use std::sync::atomic::Ordering;
+        let (_dir, engine, _) = test_engine();
+        let busy = engine.ai_busy.lock().await;
+        // Thread A summed up, then thread B, while the model is busy.
+        let (a, b) = (engine.clone(), engine.clone());
+        let first = tokio::spawn(async move { a.ai_turn(AiKind::Summary).await.map(drop) });
+        tokio::task::yield_now().await;
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let summed = order.clone();
+        let second = tokio::spawn(async move {
+            let turn = b.ai_turn(AiKind::Summary).await;
+            summed.lock().unwrap().push("summary");
+            turn.map(drop)
+        });
+        tokio::task::yield_now().await;
+        // A recording comes in behind them.
+        engine.ai_dictations.fetch_add(1, Ordering::SeqCst);
+        let heard = {
+            let (engine, order) = (engine.clone(), order.clone());
+            tokio::spawn(async move {
+                let one = engine.ai_busy.lock().await;
+                engine.ai_dictations.fetch_sub(1, Ordering::SeqCst);
+                order.lock().unwrap().push("dictation");
+                drop(one);
+            })
+        };
+        tokio::task::yield_now().await;
+        drop(busy);
+        assert!(first.await.unwrap().is_err(), "thread A's summary was replaced");
+        heard.await.unwrap();
+        assert!(second.await.unwrap().is_ok());
+        assert_eq!(*order.lock().unwrap(), ["dictation", "summary"], "the words first");
+        assert!(engine.ai_turn(AiKind::Event).await.is_ok(), "another kind is not replaced by a summary");
+    }
+
+    #[tokio::test]
+    async fn saves_in_a_row_wait_to_be_uploaded_once() {
+        let (_dir, engine, acc) = test_engine();
+        engine.store().upsert_mailbox(acc, "Drafts", Some("/"), Some(Role::Drafts), true).unwrap();
+        let draft = Draft { account_id: acc, subject: "Dictée".into(), body: "a".into(), ..Default::default() };
+        let id = engine.save_draft(draft.clone()).await.unwrap();
+        assert!(engine.draft_flushes.lock().unwrap().contains(&acc), "uploaded later, not at once");
+        assert!(engine.flush_requests.lock().unwrap().is_empty(), "no replay nor Drafts sync yet");
+        engine.save_draft(Draft { draft_id: Some(id), body: "ab".into(), ..draft }).await.unwrap();
+        assert!(engine.flush_requests.lock().unwrap().is_empty(), "the second save joins the first's upload");
+        assert_eq!(engine.store().op_rows().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn queued_send_leaves_drafts_and_cancelling_puts_it_back() {
         let (_dir, engine, acc) = test_engine();
         let store = engine.store();
@@ -7888,11 +8268,44 @@ In-Reply-To: <parent@x>\r\nReferences: <root@x> <parent@x>\r\n\r\nBrouillon\r\n"
         assert_eq!(draft.source, Some(id));
         assert!(draft.draft_id.is_none());
 
-        engine.save_draft(draft.clone()).await.unwrap();
+        let saved = engine.save_draft(draft.clone()).await.unwrap();
         assert!(store.location(id).is_err(), "the old copy is gone from the cache");
-        assert_eq!(op_kinds(store, acc), ["save_draft", "delete"]);
-        engine.save_draft(draft).await.unwrap();
-        assert_eq!(op_kinds(store, acc).iter().filter(|k| *k == "delete").count(), 1);
+        // Deleted on the server by the save itself, once its new version is in: a refused save
+        // leaves the old copy where it was.
+        let source = || -> Vec<Option<(u32, Option<u32>)>> {
+            store.op_rows().unwrap().into_iter().filter_map(|r| match serde_json::from_str(&store.op_payload(r.id).unwrap().unwrap()) {
+                Ok(Op::SaveDraft { source, .. }) => Some(source),
+                _ => None,
+            }).collect()
+        };
+        assert_eq!(op_kinds(store, acc), ["save_draft"]);
+        assert_eq!(source(), [Some((7, None))]);
+        // The next save replaces the queued one and takes the old copy over.
+        engine.save_draft(Draft { draft_id: Some(saved.clone()), body: "Brouillon repris".into(), ..draft }).await.unwrap();
+        assert_eq!(op_kinds(store, acc), ["save_draft"]);
+        assert_eq!(source(), [Some((7, None))]);
+        // Discarded before it went: the old copy still goes.
+        engine.discard_draft(acc, &saved).unwrap();
+        assert_eq!(op_kinds(store, acc), ["delete", "delete_draft"]);
+    }
+
+    #[tokio::test]
+    async fn a_draft_reopened_before_its_upload_shows_the_version_saved() {
+        let (_dir, engine, acc) = test_engine();
+        let store = engine.store();
+        let drafts = store.upsert_mailbox(acc, "Drafts", Some("/"), Some(Role::Drafts), true).unwrap();
+        let flags = ServerFlags { seen: true, flagged: false, answered: false, draft: true };
+        let raw = b"Message-ID: <v@example.org>\r\nFrom: y@example.org\r\nSubject: Devis\r\n\r\nPremier jet\r\n";
+        let h = HeaderInfo { message_id: Some("v@example.org".into()), subject: "Devis".into(), date: 1, ..Default::default() };
+        let id = store.insert_header(acc, drafts, 3, &h, flags, raw.len() as u32).unwrap();
+        store.store_body(id, raw, &crate::mime::body_info(raw)).unwrap();
+        // Edited and closed: the new version waits a few seconds before going up.
+        let first = engine.open_draft(id).await.unwrap();
+        assert_eq!(first.draft_id.as_deref(), Some("v@example.org"));
+        engine.save_draft(Draft { body: "Premier jet, et un paragraphe".into(), ..first }).await.unwrap();
+        let again = engine.open_draft(id).await.unwrap();
+        assert!(again.body.contains("et un paragraphe"), "{:?}", again.body);
+        assert_eq!(again.draft_id.as_deref(), Some("v@example.org"));
     }
 
     #[tokio::test]
@@ -8158,6 +8571,14 @@ In-Reply-To: <parent@x>\r\nReferences: <root@x> <parent@x>\r\n\r\nBrouillon\r\n"
         assert!(!downloaded.exists(), "a model facteur downloaded, no longer used, goes");
     }
 
+    #[test]
+    fn only_refusals_a_token_cures_get_a_new_one() {
+        assert!(new_token_cures(&Error::Auth("AUTHENTICATE failed".into())));
+        assert!(new_token_cures(&Error::Refused("User is authenticated but not connected".into())));
+        assert!(!new_token_cures(&Error::Refused("[ALERT] Too many simultaneous connections".into())), "signing in again would make it worse");
+        assert!(!new_token_cures(&Error::Refused("[THROTTLED] slow down".into())));
+    }
+
     #[tokio::test]
     async fn a_sign_in_refused_for_now_too_long_asks_the_user() {
         let (_dir, engine, acc) = test_engine();
@@ -8165,18 +8586,31 @@ In-Reply-To: <parent@x>\r\nReferences: <root@x> <parent@x>\r\n\r\nBrouillon\r\n"
         let why = "User is authenticated but not connected";
         let at = |minutes: u64| start + Duration::from_secs(minutes * 60);
         // Once before a night's sleep, once on waking: no run, nothing asked.
-        engine.refused_for_now(acc, why, at(0));
-        engine.refused_for_now(acc, why, at(600));
+        engine.refused_for_now(acc, why, false, at(0));
+        engine.refused_for_now(acc, why, false, at(600));
         assert!(!engine.auth_refused.lock().unwrap().contains_key(&acc), "two isolated refusals");
         // Refused every few minutes from then on, for half an hour: the user is asked.
         for minutes in [605, 612, 619, 626] {
-            engine.refused_for_now(acc, why, at(minutes));
+            engine.refused_for_now(acc, why, false, at(minutes));
         }
         assert!(!engine.auth_refused.lock().unwrap().contains_key(&acc), "still passing");
-        engine.refused_for_now(acc, why, at(630));
+        engine.refused_for_now(acc, why, false, at(630));
         let why = engine.auth_refused.lock().unwrap().get(&acc).cloned().expect("waits for the user");
         assert!(why.contains("authenticated but not connected"), "{why}");
         assert!(!engine.refused_since.lock().unwrap().contains_key(&acc));
+
+        // A fresh token refused for half an hour (IMAP turned off for the mailbox): asked too.
+        let other = acc + 100;
+        for minutes in [0, 7, 14, 21, 28, 35] {
+            engine.refused_for_now(other, "AUTHENTICATE failed", true, at(minutes));
+        }
+        assert!(engine.auth_refused.lock().unwrap().contains_key(&other));
+        // A refusal waiting cures is never escalated.
+        let third = acc + 200;
+        for minutes in [0, 7, 14, 21, 28, 35] {
+            engine.refused_for_now(third, "[UNAVAILABLE] try later", false, at(minutes));
+        }
+        assert!(!engine.auth_refused.lock().unwrap().contains_key(&third));
     }
 
     #[tokio::test]

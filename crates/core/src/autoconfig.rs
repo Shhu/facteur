@@ -10,7 +10,6 @@ use hickory_resolver::TokioResolver;
 use hickory_resolver::proto::rr::RData;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tracing::debug;
 
 use crate::error::{Error, Result};
@@ -413,7 +412,7 @@ impl std::fmt::Debug for Proto {
 }
 
 async fn probe_inner(proto: Proto, server: &ServerConfig) -> bool {
-    let Ok(tcp) = TcpStream::connect((server.host.as_str(), server.port)).await else { return false };
+    let Ok(tcp) = crate::imap::tcp_connect(&server.host, server.port).await else { return false };
     match server.security {
         Security::Tls => match tls(&server.host, tcp).await {
             Ok(mut s) => greeting(&mut s, proto).await.is_some(),

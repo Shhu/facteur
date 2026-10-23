@@ -293,11 +293,21 @@ async fn send_with(account: &Account, credential: &Credential, message: &Message
     let connect = async {
         let tls = |host: &str| TlsParameters::new(host.to_string()).map_err(smtp_err);
         let hello = ClientId::default();
-        let timeout = Some(Duration::from_secs(30));
-        let mut conn = match s.security {
-            Security::Tls => AsyncSmtpConnection::connect_tokio1((s.host.as_str(), s.port), timeout, &hello, Some(tls(&s.host)?), None).await,
-            _ => AsyncSmtpConnection::connect_tokio1((s.host.as_str(), s.port), timeout, &hello, None, None).await,
-        }
+        // The address that answers first (one dropped by the network, IPv6 on some, would take
+        // the whole time), handed to lettre: one connection for the whole exchange.
+        let tcp = match tokio::time::timeout(Duration::from_secs(30), crate::imap::tcp_connect(&s.host, s.port)).await {
+            Ok(Ok(tcp)) => tcp,
+            Ok(Err(e)) => return Err(Error::Unreachable(format!("{}: {e}", s.host))),
+            Err(_) => return Err(Error::Unreachable(stopped())),
+        };
+        let stream = match s.security {
+            // A network intercepting port 465 (a captive portal, a firewall) fails the handshake:
+            // waiting for a working one, as an unreachable server, not a spent attempt.
+            Security::Tls => crate::imap::tls(&s.host, tcp).await.map_err(|e| handshake_error(&s.host, e))?,
+            _ => crate::imap::Stream::Plain(tcp),
+        };
+        let mut conn = AsyncSmtpConnection::connect_with_transport(Box::new(stream), &hello)
+            .await
         // Not even connected (no network, name not found, nothing answering): nothing was sent.
         .map_err(|e| if e.is_permanent() || e.is_client() { connection_error(&e) } else { Error::Unreachable(e.to_string()) })?;
         if matches!(s.security, Security::StartTls) {
@@ -369,7 +379,7 @@ async fn send_with(account: &Account, credential: &Credential, message: &Message
         Ok(res) => res,
     };
     if let Err(e) = prepared {
-        conn.abort().await;
+        abort(&mut conn).await;
         return Err(e);
     }
     // Set once the whole body has been written, just before the final dot: until then the server
@@ -391,9 +401,14 @@ async fn send_with(account: &Account, credential: &Credential, message: &Message
         Ok(()) => {
             let _ = tokio::time::timeout(Duration::from_secs(5), conn.quit()).await;
         }
-        Err(_) => conn.abort().await,
+        Err(_) => abort(&mut conn).await,
     }
     res
+}
+
+/// lettre's abort sends QUIT and waits for its answer, which a stalled server never gives.
+async fn abort(conn: &mut lettre::transport::smtp::client::AsyncSmtpConnection) {
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.abort()).await;
 }
 
 /// The message for lettre's `message_iter`: flags `written` when asked for more after the last
@@ -424,6 +439,18 @@ fn size_limit<'a>(lines: impl Iterator<Item = &'a str>) -> Option<usize> {
             words.next()?.parse::<usize>().ok()
         })
         .find(|n| *n > 0)
+}
+
+/// A handshake on port 465 that fails: a network intercepting it (a captive portal, a firewall)
+/// is waited out as an unreachable server; a certificate refused (expired, another name) is the
+/// server's to fix, told as such and not retried as if offline.
+fn handshake_error(host: &str, e: Error) -> Error {
+    match e {
+        Error::Tls(why) if why.contains("invalid peer certificate") => Error::Tls(why),
+        Error::Tls(why) => Error::Unreachable(format!("{host}: {why}")),
+        Error::Io(why) => Error::Unreachable(format!("{host}: {why}")),
+        e => e,
+    }
 }
 
 /// A failure before the message data was handed over: certainly not sent. Refused credentials
@@ -473,7 +500,18 @@ pub fn maybe_sent_advice(smtp_host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::model::{AuthMethod, Security, ServerConfig};
+
+    #[test]
+    fn a_refused_certificate_on_port_465_is_not_waited_out_as_offline() {
+        let refused = handshake_error("smtp.example.org", Error::Tls("invalid peer certificate: Expired".into()));
+        assert!(matches!(refused, Error::Tls(_)), "{refused:?}");
+        let portal = handshake_error("smtp.example.org", Error::Tls("received corrupt message of type InvalidContentType".into()));
+        assert!(matches!(portal, Error::Unreachable(_)), "{portal:?}");
+        let cut = handshake_error("smtp.example.org", Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)));
+        assert!(matches!(cut, Error::Unreachable(_)));
+    }
 
     #[test]
     fn the_body_counts_as_written_only_once_fully_handed_over() {
@@ -659,6 +697,25 @@ mod tests {
         let draft = Draft { account_id: 1, to: vec!["bob@example.org".into()], subject: "Test".into(), body: "Salut".into(), ..Default::default() };
         let (message, _) = build_outgoing(&account, &draft, None, &[]).unwrap();
         send_with(&account, &Credential::Password(String::new()), &message, 10, 2).await
+    }
+
+    #[tokio::test]
+    async fn an_intercepted_tls_port_waits_for_another_network() {
+        use tokio::io::AsyncWriteExt;
+        // A captive portal answering port 465 with plain text: no TLS handshake possible.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let _ = sock.write_all(b"HTTP/1.1 302 Found\r\nLocation: http://portal\r\n\r\n").await;
+            }
+        });
+        let mut account = account();
+        account.smtp = ServerConfig { host: "127.0.0.1".into(), port, security: Security::Tls };
+        let draft = Draft { account_id: 1, to: vec!["bob@example.org".into()], subject: "Test".into(), body: "Salut".into(), ..Default::default() };
+        let (message, _) = build_outgoing(&account, &draft, None, &[]).unwrap();
+        let sent = send_with(&account, &Credential::Password(String::new()), &message, 10, 2).await;
+        assert!(matches!(sent, Err(Error::Unreachable(_))), "{sent:?}");
     }
 
     #[tokio::test]

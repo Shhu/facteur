@@ -264,21 +264,44 @@ pub async fn create(token: &str, calendar_id: &str, key: &str, changes: &EventCh
 
 pub async fn update(token: &str, calendar_id: &str, event_id: &str, changes: &EventChanges) -> Result<Instance> {
     let mut body = body(changes)?;
-    merge_guests(token, calendar_id, event_id, changes, &mut body).await?;
+    merge_current(token, calendar_id, event_id, changes, &mut body).await?;
     let req = client()?.patch(write_url(calendar_id, Some(event_id))?).header("Content-Type", "application/json").body(serde_json::to_vec(&body)?);
     written(&send(req, token).await?)
 }
 
-/// A PATCH replaces the whole guest list: the list asked for is merged into the one Google holds
-/// now, so rooms, optional guests and answers given since the last sync are kept.
-async fn merge_guests(token: &str, calendar_id: &str, event_id: &str, changes: &EventChanges, body: &mut serde_json::Value) -> Result<()> {
-    if changes.attendees.is_none() {
+/// A PATCH replaces the whole guest list and the whole reminder list: the ones asked for are
+/// merged into those Google holds now, so rooms, optional guests and answers given since the
+/// last sync are kept, and so are mail reminders (facteur shows the pop-ups only).
+async fn merge_current(token: &str, calendar_id: &str, event_id: &str, changes: &EventChanges, body: &mut serde_json::Value) -> Result<()> {
+    if changes.attendees.is_none() && changes.reminders.is_none() {
         return Ok(());
     }
     let current = get(&client()?, token, events_url(calendar_id, Some(event_id))?).await?;
-    let wanted: Vec<serde_json::Value> = body["attendees"].as_array().cloned().unwrap_or_default();
-    body["attendees"] = merged_guests(current["attendees"].as_array().map(Vec::as_slice).unwrap_or_default(), &wanted).into();
+    if changes.attendees.is_some() {
+        let wanted: Vec<serde_json::Value> = body["attendees"].as_array().cloned().unwrap_or_default();
+        body["attendees"] = merged_guests(current["attendees"].as_array().map(Vec::as_slice).unwrap_or_default(), &wanted).into();
+    }
+    if changes.reminders.is_some() {
+        let wanted: Vec<serde_json::Value> = body["reminders"]["overrides"].as_array().cloned().unwrap_or_default();
+        // On the calendar's defaults until now: its mail reminders are kept as the event's own.
+        let held = if current["reminders"]["useDefault"].as_bool() == Some(true) {
+            let mut url = reqwest::Url::parse(&format!("{API}/users/me/calendarList")).map_err(|e| Error::Other(e.to_string()))?;
+            url.path_segments_mut().map_err(|_| Error::Other("URL".into()))?.push(calendar_id);
+            get(&client()?, token, url).await?["defaultReminders"].clone()
+        } else {
+            current["reminders"]["overrides"].clone()
+        };
+        body["reminders"]["overrides"] = merged_reminders(&held, wanted).into();
+    }
     Ok(())
+}
+
+/// The mail reminders Google holds, then the pop-ups wanted, within Google's five.
+fn merged_reminders(current: &serde_json::Value, wanted: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = current.as_array().into_iter().flatten().filter(|r| r["method"] != "popup").cloned().collect();
+    out.extend(wanted);
+    out.truncate(5);
+    out
 }
 
 /// `current` entries that stay as they are (the organizer, rooms and resources, guests still
@@ -303,7 +326,7 @@ pub async fn update_series(token: &str, calendar_id: &str, series_id: &str, chan
     let http = client()?;
     let url = events_url(calendar_id, Some(series_id))?;
     let mut body = body(&EventChanges { times: None, ..changes.clone() })?;
-    merge_guests(token, calendar_id, series_id, changes, &mut body).await?;
+    merge_current(token, calendar_id, series_id, changes, &mut body).await?;
     if let Some((at, length)) = times {
         let master = get(&http, token, url.clone()).await?;
         let (start, end) = moved(&master["start"], at, length).ok_or_else(|| Error::Other(crate::tr!("Google Agenda : série illisible", "Google Calendar: unreadable series")))?;
@@ -365,6 +388,8 @@ pub async fn rebuild_series(
     repeat: Option<&crate::repeat::Repeat>,
 ) -> Result<()> {
     let mut body = body(&EventChanges { times: None, ..changes.clone() })?;
+    // As in `update_series`: rooms, guests' answers and mail reminders kept.
+    merge_current(token, calendar_id, series_id, changes, &mut body).await?;
     series_body(&mut body, first, repeat, changes.zone.as_deref())?;
     let http = client()?;
     send(http.patch(write_url(calendar_id, Some(series_id))?).header("Content-Type", "application/json").body(serde_json::to_vec(&body)?), token).await?;
@@ -470,9 +495,10 @@ fn time(v: &serde_json::Value) -> Option<(i64, bool)> {
     Some((d.and_hms_opt(0, 0, 0)?.and_utc().timestamp(), true))
 }
 
-/// Minutes of a list of reminders (popups and mails alike: both are meant to remind).
+/// Minutes of the pop-up reminders (a mail reminder is no notification on the computer, and is
+/// kept as it is when the list changes).
 fn minutes(list: &serde_json::Value) -> Vec<i64> {
-    let mut out: Vec<i64> = list.as_array().into_iter().flatten().filter_map(|r| r["minutes"].as_i64()).filter(|m| *m >= 0).collect();
+    let mut out: Vec<i64> = list.as_array().into_iter().flatten().filter(|r| r["method"] == "popup").filter_map(|r| r["minutes"].as_i64()).filter(|m| *m >= 0).collect();
     out.sort_unstable();
     out.dedup();
     out
@@ -657,8 +683,11 @@ mod tests {
         let who: Vec<(&str, bool, Option<&str>)> = e.attendees.iter().map(|a| (a.email.as_str(), a.organizer, a.response.as_deref())).collect();
         assert_eq!(who, [("y@example.org", true, Some("accepted")), ("paul@example.org", false, Some("declined"))]);
         assert_eq!(e.meeting.as_deref(), Some("https://meet.google.com/abc-defg-hij"));
-        assert_eq!(e.reminders, [10, 30]);
-        assert_eq!(minutes(&serde_json::json!([{ "method": "popup", "minutes": 15 }])), [15]);
+        assert_eq!(e.reminders, [10, 30], "the pop-ups");
+        assert_eq!(minutes(&serde_json::json!([{ "method": "popup", "minutes": 15 }, { "method": "email", "minutes": 1440 }])), [15]);
+        let current = serde_json::json!([{ "method": "email", "minutes": 1440 }, { "method": "popup", "minutes": 10 }]);
+        assert_eq!(merged_reminders(&current, vec![serde_json::json!({ "method": "popup", "minutes": 30 })]),
+            [serde_json::json!({ "method": "email", "minutes": 1440 }), serde_json::json!({ "method": "popup", "minutes": 30 })], "the mail reminder stays");
 
         let changes = EventChanges { attendees: Some(e.attendees.clone()), ..Default::default() };
         let written = body(&changes).unwrap();

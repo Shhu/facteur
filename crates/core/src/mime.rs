@@ -475,7 +475,8 @@ const MAX_INLINE_COUNT: usize = 500;
 /// into an `<img>`, so an image dropped by the inline budgets stays downloadable.
 fn real_attachments<'a>(msg: &'a mail_parser::Message<'a>, shown: &'a HashSet<String>) -> impl Iterator<Item = (usize, &'a mail_parser::MessagePart<'a>)> {
     msg.attachments().enumerate().filter(move |(_, p)| {
-        let inline = p.content_disposition().is_some_and(|d| d.ctype() == "inline");
+        // No Content-Disposition (Python's add_related, .NET's LinkedResource): inline too.
+        let inline = p.content_disposition().is_none_or(|d| d.ctype().eq_ignore_ascii_case("inline"));
         let shown = p.content_id().is_some_and(|cid| shown.contains(cid.trim_matches(|c| c == '<' || c == '>')));
         !(inline && shown)
     })
@@ -1064,10 +1065,14 @@ pub fn html_to_text(html: &str) -> String {
                     .and_then(|(_, v)| v.split_once('"'))
                     .map(|(v, _)| html_escape::decode_html_entities(v).into_owned());
                 w.flush();
-                links.push(href.map(|h| (h, w.out.len())));
+                // Nested links are no list: past a few levels, crafted, they are not looked at
+                // (each one's end compares its whole text so far).
+                links.push(href.filter(|_| links.len() < MAX_LINK_DEPTH).map(|h| (h, w.out.len())));
             }
             ("a", true) => {
-                if let Some(Some((href, start))) = links.pop() {
+                if let Some(Some((href, start))) = links.pop()
+                    && w.out.len().saturating_sub(start) <= MAX_LINK_TEXT
+                {
                     let shown = w.out.get(start..).unwrap_or_default().trim().to_string();
                     let address = href.strip_prefix("mailto:").unwrap_or(&href);
                     if !shown.is_empty() && !shown.contains(address) && !address.contains(&shown) {
@@ -1109,6 +1114,10 @@ pub fn text_as_utf8<'a>(data: &'a [u8], charset: Option<&str>) -> std::borrow::C
 }
 
 const TEXT_BUDGET: usize = 4 << 20;
+/// Links inside links whose address is still compared with their text (see `html_to_text`).
+const MAX_LINK_DEPTH: usize = 32;
+/// A link's text longer than this is no address hidden behind other words: not compared.
+const MAX_LINK_TEXT: usize = 2000;
 /// Attachments listed for a message.
 const MAX_LISTED_ATTACHMENTS: usize = 300;
 /// Deepest quote or list level shown by [`html_to_text`]: HTML nesting has no limit, and a
@@ -1509,6 +1518,36 @@ Subject: Votre compte\r\n\r\n.\r\n";
         assert!(text.ends_with(&format!("{}- z", "  ".repeat(MAX_DEPTH))));
         // Runs of line breaks are capped too.
         assert_eq!(html_to_text(&format!("a{}b", "<br>".repeat(1000))), "a\n\n\n\nb");
+    }
+
+    #[test]
+    fn nested_links_stay_quick() {
+        let html = format!("{}fin", r#"<a href="https://x.example/00001"><object>"#.repeat(20_000));
+        let started = std::time::Instant::now();
+        let text = html_to_text(&html);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(text.contains("fin"));
+        // A plain link keeps its address after its words.
+        assert_eq!(html_to_text(r#"<a href="https://x.example/a">ici</a>"#), "ici <https://x.example/a>");
+    }
+
+    #[test]
+    fn a_link_after_trailing_spaces_in_pre_does_not_underflow() {
+        // The line break inside the link trims the spaces written before it opened.
+        let text = html_to_text("<pre>a          <a href=\"https://x.example\">\n </a></pre>");
+        assert!(text.starts_with('a'), "{text:?}");
+    }
+
+    #[test]
+    fn an_image_shown_without_a_disposition_is_no_attachment() {
+        let pixel = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let raw = format!(
+            "From: a@example.org\r\nMIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"r\"\r\n\r\n\
+--r\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Logo <img src=\"cid:logo@x\"></p>\r\n\
+--r\r\nContent-Type: image/png\r\nContent-ID: <logo@x>\r\nContent-Transfer-Encoding: base64\r\n\r\n{pixel}\r\n--r--\r\n"
+        );
+        assert!(!body_info(raw.as_bytes()).has_attachments, "Python's add_related writes no disposition");
+        assert!(parse_body(raw.as_bytes()).unwrap().attachments.is_empty());
     }
 
     #[test]

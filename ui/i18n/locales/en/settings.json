@@ -481,6 +481,7 @@
       "title": "AI on this computer",
       "help": "A language model running on your computer, to sum up threads and make an event from a message.",
       "unavailable": "This build of facteur has no local AI.",
+      "oldProcessor": "This processor lacks the AVX2 instructions the local AI needs.",
       "private": "Everything stays on this computer: no message and no text is sent to a server. Only the model's file is downloaded, once.",
       "tier": {
         "light": "Light",
@@ -505,12 +506,17 @@
         "title": "Graphics card",
         "help": "The work goes through the graphics card when the computer has one, faster than on the processor alone. Turn it off if the AI gets slower or unstable.",
         "using": "In use: {card}. Turn it off if the AI gets slower or unstable.",
-        "off": "Off: the AI uses the processor only."
+        "off": "Off: the AI uses the processor only.",
+        "failed": "The graphics card crashed during a request: the AI uses the processor only.",
+        "retry": "Try again"
       },
       "dictation": {
         "title": "Dictation",
         "help": "Dictate your messages: a microphone button in the composer. Your voice is transcribed on this computer ({size} model).",
         "ready": "Ready",
+        "language": "Spoken language",
+        "languageHelp": "The one you speak, whatever facteur's language. Found by the model unless you set it.",
+        "languageAuto": "Detect automatically",
         "offTitle": "Turn dictation off?",
         "offConfirm": "The dictation model is deleted from the computer ({size} freed)."
       }

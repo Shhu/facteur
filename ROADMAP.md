@@ -82,7 +82,11 @@ What remains to be done, by theme. Decisions already made are noted under each i
   "demain soir vers 19h").
 - Done: dictation (Whisper large-v3 turbo, 0.57 GB, turned on apart): a microphone button in
   the composer, the voice transcribed on the computer (whisper.cpp v1.9.5, built against
-  llama.cpp's ggml so that the program holds one ggml).
+  llama.cpp's ggml so that the program holds one ggml). The language spoken is found by the model
+  or set in the settings, never taken from facteur's own language (forced to another one, Whisper
+  translates). Drafts saved while dictating or typing are uploaded once, 10 seconds after the
+  last save, instead of at every pause (each upload made Gmail read all of All Mail again); reading a Gmail draft or sent message
+  again no longer searches All Mail for the inbox's older messages.
 - Done: the graphics card through Vulkan, on Windows and in the Flatpak (the model as far as the card's memory goes,
   the rest on the processor; wholly on the processor without a Vulkan driver, or when the card
   fails a request), dictation included.
@@ -124,6 +128,42 @@ What remains to be done, by theme. Decisions already made are noted under each i
   only (checked against the real model with injected mails), crafted invitations bounded, sends
   made offline kept waiting instead of given up, long jobs giving the one connection over between
   folders, queued operations finished only if still theirs.
+- Done (October 2026): a third audit in the same ten domains, 32 findings, all fixed, with
+  regression tests where a test can reach them. Among them: an account's addresses raced IPv6
+  and IPv4 (Happy Eyeballs) for IMAP and SMTP, a stalled SMTP server no longer holding a send
+  for good, a long backup or history fetch giving the one connection over to the sync, the
+  listening connections logged out of at quit, the local AI stopped at once (turned off, at
+  quit, or hung past 15 minutes) and a crash of the graphics card remembered across launches,
+  CalDAV events read as stored (their zone kept), alarms facteur does not show (by mail, at the
+  end) kept when the reminders change, crafted subjects and invitations bounded, scripts in SVG
+  and Python attachments never opened from facteur, large folders deleted in steps, the
+  database compacted with reads going on, the full-text index checked after the window shows,
+  and an Outlook account's folders checked a few per pass rather than all at each launch.
+- Done (October 2026): a fourth audit, 37 findings, all fixed, with regression tests where a test
+  can reach them. Among them: crafted invitations bounded for good (periods without a day,
+  zones of many observances, occurrences and texts per object), CalDAV series with rules read
+  here in part (BYSETPOS) expanded by the server again, a reminder change no longer mailing the
+  guests, alarms by date kept, Google default mail reminders kept, departures searched strictly
+  and only when cheaper than the whole list, the folders' STATUS asked at once with a fallback
+  for slow servers, a folder's unread count differing from STATUS rereading its flags, failed
+  draft saves superseded, undo refused once a replay was tried, model downloads resumed across
+  tries, the local AI refused on processors without AVX2 (instead of crashing and blaming the
+  card), dictation falling back to the processor, the search index checked without holding the
+  writer, contacts counted again for the people of a removed account, and the list keeping the
+  rows that did not change.
+- Done (October 2026): a fifth and last audit, 21 findings, all fixed, with regression tests where
+  a test can reach them. Among them: a draft reopened before its upload shows the version saved,
+  the old copy of a reopened draft deleted only once its new version is in, a crafted subject of
+  reply prefixes read in linear time, the unread count checked at each sync through indexes only,
+  a removal of an account cut halfway still forgetting its people, a model download kept on a
+  passing server error and its part hashed off the async workers, an SMTP certificate refused
+  told as such, a CalDAV series given another rule telling its guests, Google and Outlook series
+  rebuilt without losing rooms and reminders, guests past the 200 shown kept and told, past
+  overrides no longer hiding a series' current occurrences, restore never expunging other
+  clients' deleted messages, links whose text is hidden by colour, size, position or generated
+  by a style asking first, the message list no longer rebuilt at each sync, the microphone
+  released when audio fails to start, forced flag checks not waiting their turn, AI requests left
+  by the interface not run, dictation going before them, and no AI process started after quit.
 
 ## Distribution
 

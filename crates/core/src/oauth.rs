@@ -345,10 +345,11 @@ async fn token_request(app: &App, body: &[(&str, &str)]) -> Result<Tokens> {
     })
 }
 
-/// A token endpoint answer that means the grant is gone for good (RFC 6749 §5.2), not a
-/// passing failure.
+/// A token endpoint answer that means the grant is gone for good (RFC 6749 §5.2), or needs the
+/// user again (Microsoft: a new sign-in policy, consent to renew), not a passing failure.
 fn revoked(status: u16, error: Option<&str>) -> bool {
-    matches!(status, 400 | 401) && matches!(error, Some("invalid_grant" | "unauthorized_client"))
+    matches!(status, 400 | 401)
+        && matches!(error, Some("invalid_grant" | "unauthorized_client" | "invalid_client" | "interaction_required" | "consent_required"))
 }
 
 /// Returned as a data URL for the local cache: shown offline, without calling the provider on
@@ -468,6 +469,8 @@ mod tests {
         assert!(revoked(400, Some("invalid_grant")));
         assert!(revoked(401, Some("unauthorized_client")));
         assert!(!revoked(400, Some("invalid_request")));
+        assert!(revoked(400, Some("interaction_required")), "a new MFA policy: the user signs in again");
+        assert!(revoked(400, Some("consent_required")));
         assert!(!revoked(503, Some("invalid_grant")));
         assert!(!revoked(400, None));
     }

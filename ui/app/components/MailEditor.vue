@@ -176,7 +176,10 @@ let idle: ReturnType<typeof setTimeout> | undefined
 function flush() {
   clearTimeout(idle)
   const e = editorRef.value?.editor
-  if (!pending || !e) return
+  if (e) flushFrom(e)
+}
+function flushFrom(e: Editor) {
+  if (!pending || e.isDestroyed) return
   pending = false
   written = e.getHTML()
   html.value = written
@@ -207,6 +210,9 @@ watch(() => editorRef.value?.editor, (e, _, onCleanup) => {
   onCleanup(() => {
     e.off('update', onUpdate)
     clearTimeout(idle)
+    // Unmounted within the pause (the window narrowed to the other layout's editor): the last
+    // keys are written out, not lost.
+    flushFrom(e)
     if (current === e) current = null
   })
 }, { immediate: true })

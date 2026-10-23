@@ -105,6 +105,12 @@ fn server(s: &str) -> Result<ServerConfig, String> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The local AI's own process, started by `ai` and `hear` (facteur_core::ai).
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("--ai-worker") {
+        facteur_core::ai::worker_main(args.next().as_deref() != Some("cpu"));
+        return Ok(());
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();

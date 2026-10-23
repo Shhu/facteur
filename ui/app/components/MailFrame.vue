@@ -412,7 +412,10 @@ function prepare(doc: Document) {
     if (!href) return
     e.preventDefault()
     if (/^mailto:/i.test(href)) emit('mailto', href)
-    else if (/^https?:/i.test(href) && link) openLink(href, { text: visibleLinkText(link), cautious: props.cautious && 'message' })
+    else if (/^https?:/i.test(href) && link) {
+      const { text, doubtful } = linkText(link)
+      openLink(href, { text, cautious: (props.cautious || doubtful) && 'message' })
+    }
   })
 
   // Once clicked into, the frame has the focus and its keys never reach the app's window: they are

@@ -8,7 +8,7 @@ const PAGE = 100
 
 const route = useRoute()
 const router = useRouter()
-const { accounts, accountId, accountById, accountColor, mailboxes, tick, syncing, unifiedUnread, ownSet } = useMail()
+const { accounts, accountId, accountById, accountColor, accountNameOf, accountCount, mailboxes, tick, syncing, unifiedUnread, ownSet } = useMail()
 const showError = useErrorToast()
 const { t } = useI18n()
 /** Another screen is open over this list (layouts/default.vue): its shortcuts stand down. */
@@ -89,9 +89,16 @@ let wantMore = false
 let queued: 'full' | 'merge' | null = null
 /** The next refresh rereads the whole list: a pin or unpin moves threads past the first page. */
 let fullNext = false
-// An action elsewhere changed which messages the list holds: every row shown is read again.
-watch(useListStale().tick, () => {
-  fullNext = true
+// An action elsewhere changed which messages the list holds: every row shown is read again, or
+// only the first page once the thread that left is dropped.
+const listStale = useListStale()
+watch(listStale.tick, () => {
+  const left = listStale.gone.value
+  listStale.gone.value = null
+  // Only the row of the folder it left: another of its folders' rows stays. A read in flight,
+  // from before the action, would bring the row back: the next read is a full one.
+  if (left) threads.value = threads.value.filter(t => t.account_id !== left.account_id || t.thread_id !== left.thread_id || t.mailbox_id !== left.mailbox_id)
+  if (!left || inflight) fullNext = true
   refresh()
   // A search shown: its results are read again too (filed elsewhere, a filter may drop them).
   refreshSearch()
@@ -182,7 +189,20 @@ async function merge(request: number, key: string) {
   if (at === -1) return readAll(request, key)
   const fresh = new Set(page.map(id))
   if (old.slice(0, at).filter(t => !fresh.has(id(t))).length > MERGE_MISSING) return readAll(request, key)
-  threads.value = [...page, ...old.slice(at + 1).filter(t => !fresh.has(id(t)))]
+  // Rows unchanged keep their object, and an unchanged list is not assigned: every row, its date
+  // group and its labels would be built again for nothing at each sync tick.
+  const before = new Map(old.map(t => [id(t), t]))
+  const kept = page.map(t => {
+    const was = before.get(id(t))
+    return was && rowSignature(was) === rowSignature(t) ? was : t
+  })
+  const next = [...kept, ...old.slice(at + 1).filter(t => !fresh.has(id(t)))]
+  if (next.length !== old.length || next.some((t, i) => t !== old[i])) threads.value = next
+}
+
+/** What a row shows of its thread. */
+function rowSignature(t: ThreadSummary): string {
+  return [t.latest_id, t.activity, t.unread, t.flagged, t.count, t.snoozed_until, t.woken, t.category, t.has_attachments, t.subject, t.preview, t.labels?.join(), t.message_ids.join()].join('|')
 }
 
 watch(view, () => {
@@ -318,8 +338,7 @@ async function refreshSearch() {
 }
 onBeforeUnmount(() => clearTimeout(timer))
 
-const accountLabel = (id: number) =>
-  unified.value && accounts.value.length > 1 ? (accountById(id) ? accountName(accountById(id)!) : null) : null
+const accountLabel = (id: number) => (unified.value && accountCount.value > 1 ? accountNameOf(id) : null)
 
 const searchList = computed(() => {
   if (!results.value) return null
@@ -381,7 +400,13 @@ const items = computed<ListItem[]>(() => {
 })
 
 /** Label names by folder id, built once per folder list rather than looked up per thread. */
-const labelNames = computed(() => new Map(mailboxes.value.map(m => [m.id, m.role ? roleLabels[m.role] : m.display_name])))
+/** Kept while the names stay the same: the folder list is read again often during a sync. */
+let names = new Map<number, string>()
+const labelNames = computed(() => {
+  const fresh = new Map(mailboxes.value.map(m => [m.id, m.role ? roleLabels[m.role] : m.display_name] as [number, string]))
+  if (fresh.size !== names.size || [...fresh].some(([id, name]) => names.get(id) !== name)) names = fresh
+  return names
+})
 
 const selected = ref(new Set<string>())
 let anchor: string | null = null
@@ -620,9 +645,13 @@ async function act(kind: ListAction, targets: ListItem[]) {
   // Set by `leave`: on failure, the search hits removed up front come back.
   let restore: ((failed?: ListItem[]) => void) | undefined
   // Threads leave the list, maybe from below its first page, which the usual refresh rereads
-  // alone: every row shown is read again (a row further down would otherwise stay).
+  // alone: their rows go at once, then the first page is merged (rereading every row of a long
+  // scrolled list after each action stalls triage). Undone, the list is read again in full.
   const left = () => {
-    fullNext = true
+    const gone = new Set(targets.map(t => `${t.accountId}-${t.threadId}-${t.mailboxId}`))
+    threads.value = threads.value.filter(t => !gone.has(`${t.account_id}-${t.thread_id}-${t.mailbox_id}`))
+    // A read in flight, from before the action, would bring the rows back.
+    if (inflight) fullNext = true
     refresh()
   }
   try {

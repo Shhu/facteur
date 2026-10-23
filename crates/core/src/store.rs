@@ -12,25 +12,6 @@ use crate::mime::HeaderInfo;
 use crate::model::*;
 use crate::utf7;
 
-/// `contacts` counted again from the mail stored, as kept up to date with each message.
-const COUNT_CONTACTS: &str = "
-DELETE FROM contacts;
-INSERT INTO contacts (email, name, written, seen, last)
-SELECT email, MAX(name), SUM(sent), COUNT(*), MAX(date) FROM (
-    SELECT lower(from_addr) AS email, NULLIF(from_name, '') AS name, date, 0 AS sent
-    FROM messages WHERE from_addr IS NOT NULL
-    UNION ALL
-    SELECT lower(json_extract(j.value, '$.email')), NULLIF(json_extract(j.value, '$.name'), ''), m.date, 1
-    FROM messages m JOIN mailboxes b ON b.id = m.mailbox_id, json_each(m.to_list) j
-    WHERE b.role = 'sent'
-    UNION ALL
-    SELECT lower(json_extract(j.value, '$.email')), NULLIF(json_extract(j.value, '$.name'), ''), m.date, 1
-    FROM messages m JOIN mailboxes b ON b.id = m.mailbox_id, json_each(m.cc_list) j
-    WHERE b.role = 'sent'
-)
-WHERE email IS NOT NULL GROUP BY email;
-";
-
 const MIGRATIONS: &[&str] = &[r#"
 CREATE TABLE accounts (
     id            INTEGER PRIMARY KEY,
@@ -687,6 +668,11 @@ CREATE TABLE caldav_etags (
 "#,
 ];
 
+const UID_COUNT: &str = "SELECT COUNT(uid) FROM messages WHERE mailbox_id = ?1";
+/// The unread rows alone, through their partial index: SQLite would otherwise pick the (mailbox_id,
+/// uid) one and read every row for `seen`.
+const UID_UNSEEN: &str = "SELECT COUNT(*) FROM messages INDEXED BY messages_unread WHERE mailbox_id = ?1 AND seen = 0 AND uid IS NOT NULL";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MailboxState {
     pub id: i64,
@@ -1028,24 +1014,39 @@ fn damage_marker(path: &Path) -> std::path::PathBuf {
 
 /// The whole file read: a damaged page reported as a corrupt database, which the start offers to
 /// set aside.
+/// The tables and their indexes, before the window shows: not the full-text index, whose own
+/// check reads every message's text again (minutes on a large base). That one is checked later,
+/// in the background ([`Store::check_search_index`]).
 fn check_integrity(path: &Path) -> Result<()> {
     let conn = Connection::open(path)?;
-    let report: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-    if report.eq_ignore_ascii_case("ok") {
-        tracing::info!("database checked after a damage report: sound");
-        return Ok(());
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND sql NOT LIKE 'CREATE VIRTUAL TABLE%'")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    for table in tables {
+        let report: String = conn.query_row(&format!("PRAGMA quick_check(\"{}\")", table.replace('"', "\"\"")), [], |r| r.get(0))?;
+        if !report.eq_ignore_ascii_case("ok") {
+            tracing::error!("database check failed ({table}): {report}");
+            return Err(Error::Db(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT), Some(report))));
+        }
     }
-    tracing::error!("database check failed: {report}");
-    Err(Error::Db(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT), Some(report))))
+    tracing::info!("database checked after a damage report: sound");
+    Ok(())
 }
+
+/// Rows deleted per transaction when many go (a folder, an account): the writer is free between.
+const STEP_ROWS: usize = 2000;
+
+/// Set after a damage report: the full-text index is checked once facteur has started.
+const SEARCH_INDEX_CHECK: &str = "search_index_check";
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let marker = damage_marker(path);
         crate::error::set_damage_marker(marker.clone());
-        if marker.exists() {
+        let damaged = marker.exists();
+        if damaged {
             check_integrity(path)?;
-            let _ = std::fs::remove_file(&marker);
         }
         // Compacting (VACUUM) is left to the engine, after the start (`Engine::compact_later`): it
         // can take a while on a large base, and the window would wait for it.
@@ -1066,7 +1067,31 @@ impl Store {
             crate::perf::profile(&mut conn);
             store.readers.push(Mutex::new(conn));
         }
+        if damaged {
+            store.set_setting(SEARCH_INDEX_CHECK, "1")?;
+            let _ = std::fs::remove_file(&marker);
+        }
         Ok(store)
+    }
+
+    /// After a damage report, the full-text index checked, and built again from the messages when
+    /// damaged. Whether it was.
+    pub fn check_search_index(&self) -> Result<bool> {
+        if self.setting(SEARCH_INDEX_CHECK)?.is_none() {
+            return Ok(false);
+        }
+        // On a reader: the check reads every message's text again, the writer stays free.
+        let report = self.read().query_row("PRAGMA integrity_check(messages_fts)", [], |r| r.get::<_, String>(0));
+        let rebuilt = match report {
+            Ok(r) if r.eq_ignore_ascii_case("ok") => false,
+            found => {
+                tracing::warn!("search index damaged ({found:?}): built again");
+                self.db().execute("INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')", [])?;
+                true
+            }
+        };
+        self.db().execute("DELETE FROM settings WHERE key = ?1", [SEARCH_INDEX_CHECK])?;
+        Ok(rebuilt)
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -1113,8 +1138,7 @@ impl Store {
     /// Deleted rows leave their pages in the file, on SQLite's free list, until a VACUUM
     /// rewrites it: done when a quarter of the file at least, and 64 MiB, is wasted (free pages,
     /// or a file longer than the base: Windows does not shorten a file other connections have
-    /// mapped). Returns the bytes given back, if it ran. Run at opening, before the readers map
-    /// the file (a second or two on a large base).
+    /// mapped). Returns the bytes given back, if it ran. Reads go on meanwhile, without mapping.
     pub fn compact_if_wasteful(&self) -> Result<Option<u64>> {
         self.compact_above(COMPACT_MIN_FREE)
     }
@@ -1131,24 +1155,28 @@ impl Store {
             return Ok(None);
         }
         // Windows does not shorten a file other connections have mapped: the readers let go of
-        // theirs meanwhile. Never waited for (a reader may be waiting for the writer held here):
-        // busy, the compaction is for another time.
-        let mut readers = Vec::new();
-        for reader in &self.readers {
-            match reader.try_lock() {
-                Ok(r) => readers.push(r),
-                Err(_) => return Ok(None),
+        // theirs, then serve reads unmapped during the VACUUM (held, they would stall every list
+        // and search for its whole length). Never waited for (a reader may be waiting for the
+        // writer held here): busy, the compaction is for another time.
+        {
+            let mut readers = Vec::new();
+            for reader in &self.readers {
+                match reader.try_lock() {
+                    Ok(r) => readers.push(r),
+                    Err(_) => return Ok(None),
+                }
             }
-        }
-        for r in &readers {
-            r.execute_batch("PRAGMA mmap_size = 0;")?;
+            for r in &readers {
+                r.execute_batch("PRAGMA mmap_size = 0;")?;
+            }
         }
         // The copy VACUUM builds goes to a temporary file, not to memory (the size of the base).
         db.execute_batch("PRAGMA temp_store = FILE;")?;
         let done = db.execute_batch("VACUUM;");
         let _ = db.execute_batch("PRAGMA temp_store = MEMORY; PRAGMA wal_checkpoint(TRUNCATE);");
-        for r in &readers {
-            let _ = r.execute_batch(&format!("PRAGMA mmap_size = {READER_MMAP};"));
+        drop(db);
+        for reader in &self.readers {
+            let _ = reader.lock().unwrap_or_else(|e| e.into_inner()).execute_batch(&format!("PRAGMA mmap_size = {READER_MMAP};"));
         }
         done?;
         let freed = before.saturating_sub(file_len()).max(0) as u64;
@@ -1263,11 +1291,12 @@ impl Store {
     /// Its messages go in short steps first: each one deleted unindexes its text, and a large
     /// account in one transaction would hold the writer (every other account's writes) for a minute.
     pub fn delete_account(&self, id: i64) -> Result<()> {
+        let theirs = self.removal_correspondents(id)?;
         loop {
             let mut db = self.db();
             let tx = db.transaction()?;
             quiet_handled(&tx, true)?;
-            let n = tx.execute("DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE account_id = ?1 LIMIT 2000)", [id])?;
+            let n = tx.execute("DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE account_id = ?1 LIMIT ?2)", params![id, STEP_ROWS as i64])?;
             quiet_handled(&tx, false)?;
             tx.commit()?;
             if n == 0 {
@@ -1278,9 +1307,72 @@ impl Store {
         let tx = db.transaction()?;
         tx.execute("DELETE FROM accounts WHERE id = ?1", [id])?;
         tx.execute("DELETE FROM settings WHERE key IN ('sync_every:' || ?1, 'screener_release:' || ?1, 'single_connection:' || ?1, 'single_connection_offer:' || ?1)", [id])?;
-        tx.execute_batch(COUNT_CONTACTS)?;
         tx.commit()?;
+        drop(db);
+        // Their counts again, from the mail left (as `contacts` counts: a message from them, or
+        // one sent to them, is seen; the latter written), or gone with nothing left.
+        let written_to = self.written_to()?;
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        {
+            let mut from = tx.prepare_cached("SELECT COUNT(*), MAX(date) FROM messages WHERE lower(from_addr) = ?1")?;
+            let mut forget = tx.prepare_cached("DELETE FROM contacts WHERE email = ?1")?;
+            let mut recount = tx.prepare_cached("UPDATE contacts SET written = ?2, seen = ?3, last = MAX(?4, 0) WHERE email = ?1")?;
+            for email in &theirs {
+                let (received, last): (i64, Option<i64>) = from.query_row([email], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                let (written, last_written) = written_to.get(email).copied().unwrap_or((0, 0));
+                if received + written == 0 {
+                    forget.execute([email])?;
+                } else {
+                    recount.execute(params![email, written, received + written, last.unwrap_or(0).max(last_written)])?;
+                }
+            }
+        }
+        tx.commit()?;
+        drop(db);
+        self.delete_setting(&format!("removing_contacts:{id}"))?;
         Ok(())
+    }
+
+    /// The account's correspondents, to leave the suggestions unless another account knows them
+    /// too: checked one by one afterwards rather than every account's mail counted again. Kept
+    /// until the removal ends, so one cut halfway still forgets those whose mail went first.
+    fn removal_correspondents(&self, id: i64) -> Result<HashSet<String>> {
+        let key = format!("removing_contacts:{id}");
+        let mut theirs = self.correspondents(id)?;
+        if let Some(saved) = self.setting(&key)? {
+            theirs.extend(serde_json::from_str::<Vec<String>>(&saved).unwrap_or_default());
+        }
+        self.set_setting(&key, &serde_json::to_string(&theirs)?)?;
+        Ok(theirs)
+    }
+
+    /// Those every account wrote to: how many times, and the latest.
+    fn written_to(&self) -> Result<HashMap<String, (i64, i64)>> {
+        let db = self.read();
+        let mut st = db.prepare(
+            "SELECT email, COUNT(*), MAX(date) FROM (
+                 SELECT lower(json_extract(j.value, '$.email')) AS email, m.date AS date FROM messages m JOIN mailboxes b ON b.id = m.mailbox_id, json_each(m.to_list) j WHERE b.role = 'sent'
+                 UNION ALL
+                 SELECT lower(json_extract(j.value, '$.email')), m.date FROM messages m JOIN mailboxes b ON b.id = m.mailbox_id, json_each(m.cc_list) j WHERE b.role = 'sent'
+             ) WHERE email IS NOT NULL GROUP BY email",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?))))?.collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Addresses of an account's mail: its senders, and those it wrote to.
+    fn correspondents(&self, account_id: i64) -> Result<HashSet<String>> {
+        let db = self.read();
+        let mut st = db.prepare(
+            "SELECT lower(from_addr) FROM messages WHERE account_id = ?1 AND from_addr IS NOT NULL
+             UNION SELECT lower(json_extract(j.value, '$.email')) FROM messages m JOIN mailboxes b ON b.id = m.mailbox_id, json_each(m.to_list) j
+                   WHERE b.role = 'sent' AND m.account_id = ?1
+             UNION SELECT lower(json_extract(j.value, '$.email')) FROM messages m JOIN mailboxes b ON b.id = m.mailbox_id, json_each(m.cc_list) j
+                   WHERE b.role = 'sent' AND m.account_id = ?1",
+        )?;
+        let rows = st.query_map([account_id], |r| r.get::<_, Option<String>>(0))?.filter_map(|r| r.transpose()).collect::<Result<_, _>>()?;
+        Ok(rows)
     }
 
     pub fn set_identities(&self, id: i64, identities: &[Identity]) -> Result<()> {
@@ -1543,9 +1635,17 @@ impl Store {
         if keep.is_empty() {
             return Ok(0);
         }
+        let ids = keep.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        let going: Vec<i64> = {
+            let db = self.read();
+            let mut st = db.prepare(&format!("SELECT id FROM mailboxes WHERE account_id = ?1 AND id NOT IN ({ids})"))?;
+            st.query_map([account_id], |r| r.get(0))?.collect::<Result<_, _>>()?
+        };
+        for id in going {
+            self.shed_mailbox_rows(id)?;
+        }
         let mut db = self.db();
         let tx = db.transaction()?;
-        let ids = keep.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
         let gone: Vec<i64> = {
             let mut st = tx.prepare(&format!("SELECT id FROM mailboxes WHERE account_id = ?1 AND id NOT IN ({ids})"))?;
             st.query_map([account_id], |r| r.get(0))?.collect::<Result<_, _>>()?
@@ -2108,6 +2208,7 @@ impl Store {
 
     /// The folder was recreated on the server (UIDVALIDITY changed): its cache and window start over.
     pub fn clear_mailbox(&self, mailbox_id: i64) -> Result<()> {
+        self.shed_mailbox_rows(mailbox_id)?;
         let mut db = self.db();
         let tx = db.transaction()?;
         delete_mailbox_rows(&tx, mailbox_id)?;
@@ -2165,11 +2266,12 @@ impl Store {
     }
 
     pub fn purge_local(&self, mailbox_id: i64) -> Result<usize> {
+        let shed = self.shed_mailbox_rows(mailbox_id)?;
         let mut db = self.db();
         let tx = db.transaction()?;
         let n = delete_mailbox_rows(&tx, mailbox_id)?;
         tx.commit()?;
-        Ok(n)
+        Ok(shed + n)
     }
 
     /// UIDs of the folder targeted by queued operations (move, delete): the server still has them,
@@ -2246,6 +2348,15 @@ impl Store {
         Ok(rows)
     }
 
+    /// Messages of the folder known by their UID, and the unread among them: each counted on an
+    /// index, never by reading the folder's rows (every sync of a server without CONDSTORE).
+    pub fn uid_unseen(&self, mailbox_id: i64) -> Result<(i64, i64)> {
+        let db = self.read();
+        let known = db.prepare_cached(UID_COUNT)?.query_row([mailbox_id], |r| r.get(0))?;
+        let unseen = db.prepare_cached(UID_UNSEEN)?.query_row([mailbox_id], |r| r.get(0))?;
+        Ok((known, unseen))
+    }
+
     /// How many messages of the folder are cached with a UID, and the highest UID: counted on
     /// the (mailbox_id, uid) index, without loading the UID map.
     pub fn uid_stats(&self, mailbox_id: i64) -> Result<(usize, Option<u32>)> {
@@ -2257,20 +2368,53 @@ impl Store {
         Ok((count as usize, max))
     }
 
+    /// In steps (see [`STEP_ROWS`]): thousands gone at once must not hold the writer.
     pub fn delete_uids(&self, mailbox_id: i64, uids: &[u32]) -> Result<()> {
-        let mut db = self.db();
-        let tx = db.transaction()?;
-        let ids: Vec<i64> = {
-            let mut st = tx.prepare("SELECT id FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
-            let mut ids = Vec::with_capacity(uids.len());
-            for uid in uids {
-                ids.extend(st.query_row(params![mailbox_id, uid], |r| r.get::<_, i64>(0)).optional()?);
-            }
-            ids
-        };
-        delete_ids(&tx, &ids)?;
-        tx.commit()?;
+        for step in uids.chunks(STEP_ROWS) {
+            let mut db = self.db();
+            let tx = db.transaction()?;
+            let ids: Vec<i64> = {
+                let mut st = tx.prepare_cached("SELECT id FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
+                let mut ids = Vec::with_capacity(step.len());
+                for uid in step {
+                    ids.extend(st.query_row(params![mailbox_id, uid], |r| r.get::<_, i64>(0)).optional()?);
+                }
+                ids
+            };
+            delete_ids(&tx, &ids)?;
+            tx.commit()?;
+        }
         Ok(())
+    }
+
+    /// A folder's rows deleted in steps of their own, before the transaction that ends the folder
+    /// or its reset: one transaction for 100,000 rows (each unindexed from the full-text table)
+    /// would hold the writer, every other write waiting, for a minute, and swell the WAL. Cut
+    /// midway, what is left goes with that transaction, or at the next try.
+    fn shed_mailbox_rows(&self, mailbox_id: i64) -> Result<usize> {
+        let mut total = 0;
+        loop {
+            let mut db = self.db();
+            let tx = db.transaction()?;
+            quiet_handled(&tx, true)?;
+            let ids: Vec<i64> = {
+                let mut st = tx.prepare_cached("SELECT id FROM messages WHERE mailbox_id = ?1 LIMIT ?2")?;
+                st.query_map(params![mailbox_id, STEP_ROWS as i64], |r| r.get(0))?.collect::<Result<_, _>>()?
+            };
+            if ids.is_empty() {
+                return Ok(total);
+            }
+            let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+            let holders: Vec<i64> = {
+                let mut st = tx.prepare(&format!("SELECT message_id FROM bodies WHERE message_id IN ({list})"))?;
+                st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?
+            };
+            let groups = rehome_bodies(&tx, &holders, &|_, mailbox| mailbox == mailbox_id)?;
+            total += tx.execute(&format!("DELETE FROM messages WHERE id IN ({list})"), [])?;
+            fix_bodiless(&tx, &groups)?;
+            quiet_handled(&tx, false)?;
+            tx.commit()?;
+        }
     }
 
     /// Inserts a header and threads it. A locally moved message (uid NULL) waiting in this folder
@@ -4336,7 +4480,10 @@ impl Store {
             )?;
             st.query_map([mailbox_id], |r| r.get(0))?.collect::<Result<_, _>>()?
         };
+        // Moves that never arrived: no thread left the folder (the inbox) by them.
+        quiet_handled(&tx, true)?;
         delete_ids(&tx, &orphans)?;
+        quiet_handled(&tx, false)?;
         tx.commit()?;
         Ok(())
     }
@@ -4599,6 +4746,7 @@ impl Store {
 
     /// Forgets a deleted folder (its cached messages go with it).
     pub fn delete_mailbox(&self, id: i64) -> Result<()> {
+        self.shed_mailbox_rows(id)?;
         let mut db = self.db();
         let tx = db.transaction()?;
         // Bodies the folder's messages hold go to their copies elsewhere first.
@@ -5169,9 +5317,15 @@ impl Store {
         let tx = db.transaction()?;
         let list = ops.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(",");
         // The same content too: SQLite gives a replayed operation's id to the next one queued, which
-        // an undo must not remove in its place.
+        // an undo must not remove in its place. Not once a replay of it was tried at all: cut,
+        // begun, or refused after a first part went through (a move in chunks), the server may
+        // have done some of it.
         for (id, op) in ops {
-            let same: bool = tx.query_row("SELECT EXISTS (SELECT 1 FROM pending_ops WHERE id = ?1 AND op = ?2)", params![id, op], |r| r.get(0))?;
+            let same: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM pending_ops WHERE id = ?1 AND op = ?2 AND attempts = 0 AND refusals = 0 AND last_error IS NULL)",
+                params![id, op],
+                |r| r.get(0),
+            )?;
             if !same {
                 return Ok(Undone::TooLate);
             }
@@ -5360,12 +5514,23 @@ impl Store {
     /// Drops this draft's saves not replayed yet: only the latest counts.
     pub fn drop_pending_draft(&self, account_id: i64, message_id: &str) -> Result<()> {
         self.db().execute(
-            "DELETE FROM pending_ops WHERE account_id = ?1 AND failed = 0
+            "DELETE FROM pending_ops WHERE account_id = ?1
                AND op LIKE '{\"kind\":\"save_draft\"%'
                AND instr(op, '\"message_id\":\"' || ?2 || '\"') > 0",
             params![account_id, message_id],
         )?;
         Ok(())
+    }
+
+    /// Payloads of the queued saves of a draft (failed ones too), oldest first.
+    pub fn pending_draft_saves(&self, account_id: i64, message_id: &str) -> Result<Vec<(String, bool)>> {
+        let db = self.read();
+        let mut st = db.prepare(
+            "SELECT op, failed FROM pending_ops WHERE account_id = ?1 AND kind = 'save_draft'
+               AND instr(op, '\"message_id\":\"' || ?2 || '\"') > 0 ORDER BY id",
+        )?;
+        let rows = st.query_map(params![account_id, message_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+        Ok(rows)
     }
 
     /// The draft is saved, or on its way: a save still queued (not failed), or a copy in the
@@ -6358,16 +6523,44 @@ mod tests {
     }
 
     #[test]
+    fn a_large_folder_goes_in_steps_its_bodies_kept_for_copies_elsewhere() {
+        let (s, acc, inbox, sent) = setup();
+        let archive = s.upsert_mailbox(acc, "Archive", Some("/"), Some(Role::Archive), true).unwrap();
+        let n = STEP_ROWS as u32 * 2 + 10;
+        for uid in 1..=n {
+            s.insert_header(acc, archive, uid, &header(&format!("m{uid}@x"), None, "Vieux", 1), FLAGS, 10).unwrap();
+        }
+        let kept = s.insert_header(acc, archive, n + 1, &header("k@x", None, "Gardé", 2), FLAGS, 10).unwrap();
+        let copy = s.insert_header(acc, sent, 1, &header("k@x", None, "Gardé", 2), FLAGS, 10).unwrap();
+        let raw = b"Subject: Garde\r\n\r\nBonjour";
+        s.store_body(kept, raw, &crate::mime::body_info(raw)).unwrap();
+        assert_eq!(s.purge_local(archive).unwrap(), n as usize + 1);
+        assert!(s.mailbox_message_ids(archive).unwrap().is_empty());
+        assert_eq!(s.body(copy).unwrap().as_deref(), Some(&raw[..]), "the body passed to the copy that stays");
+        assert_eq!(s.mailbox_message_ids(inbox).unwrap().len(), 0);
+    }
+
+    #[test]
     fn damage_found_while_running_is_checked_at_the_next_start() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("facteur.db");
         drop(Store::open(&path).unwrap());
         let marker = damage_marker(&path);
 
-        // A false alarm: the check passes and the marker goes.
+        // A false alarm: the check passes and the marker goes; the search index is checked
+        // later, once.
         std::fs::write(&marker, b"").unwrap();
-        drop(Store::open(&path).unwrap());
+        let s = Store::open(&path).unwrap();
         assert!(!marker.exists());
+        assert_eq!(s.setting(SEARCH_INDEX_CHECK).unwrap().as_deref(), Some("1"));
+        assert!(!s.check_search_index().unwrap(), "sound");
+        assert!(s.setting(SEARCH_INDEX_CHECK).unwrap().is_none());
+        // A damaged index is found on a reader, then built again.
+        s.set_setting(SEARCH_INDEX_CHECK, "1").unwrap();
+        s.db().execute_batch("INSERT INTO messages_fts(rowid, subject, sender, recipients, body) VALUES (1, 'a', 'b', 'c', 'd'); DELETE FROM messages_fts_content;").unwrap();
+        assert!(s.check_search_index().unwrap(), "rebuilt");
+        assert_eq!(s.read().query_row("PRAGMA integrity_check(messages_fts)", [], |r| r.get::<_, String>(0)).unwrap(), "ok");
+        drop(s);
 
         // A page really damaged: the start reports a damaged database (the set-aside dialog).
         let mut bytes = std::fs::read(&path).unwrap();
@@ -6898,6 +7091,13 @@ mod tests {
         // No move on its way before or after: the server never got it.
         s.drop_orphan_placeholders(archive, false).unwrap();
         assert!(s.summary(id).is_err());
+        // A move back to the inbox that never arrived: no thread left the inbox by it.
+        let back = s.insert_header(acc, archive, 2, &header("b@x", None, "b", 1), FLAGS, 10).unwrap();
+        s.move_local(back, inbox).unwrap();
+        let thread = s.summary(back).unwrap().thread_id;
+        s.drop_orphan_placeholders(inbox, false).unwrap();
+        let handled: i64 = s.read().query_row("SELECT COUNT(*) FROM handled WHERE thread_id = ?1", [thread], |r| r.get(0)).unwrap();
+        assert_eq!(handled, 0);
     }
 
     #[test]
@@ -7140,8 +7340,21 @@ mod tests {
         s.finish_op(first).unwrap();
         let pin = r#"{"kind":"store","mailbox":"Archive","uids":[3],"flag":"\\Flagged","add":true}"#;
         assert_eq!(s.push_op(acc, pin, "", None).unwrap(), first, "SQLite reuses the id");
-        assert_eq!(s.undo(&[(first, text)], &[], &[], &[], false).unwrap(), Undone::TooLate);
+        assert_eq!(s.undo(&[(first, text.clone())], &[], &[], &[], false).unwrap(), Undone::TooLate);
         assert_eq!(s.pending_ops(acc).unwrap().len(), 1, "the pin stays queued");
+
+        // A replay cut midway may have moved it on the server: too late; refused, it did nothing.
+        let cut = s.push_op(acc, &text, "", None).unwrap();
+        s.fail_replayed(cut, &text, "connection lost", 10).unwrap();
+        assert_eq!(s.undo(&[(cut, text.clone())], &[], &[], &[], false).unwrap(), Undone::TooLate);
+        let started = s.push_op(acc, &text, "", None).unwrap();
+        s.mark_op_started(started).unwrap();
+        assert_eq!(s.undo(&[(started, text.clone())], &[], &[], &[], false).unwrap(), Undone::TooLate);
+        let refused = s.push_op(acc, &text, "", None).unwrap();
+        s.refuse_replayed(refused, &text, "NO [LIMIT]", 10).unwrap();
+        assert_eq!(s.undo(&[(refused, text.clone())], &[], &[], &[], false).unwrap(), Undone::TooLate, "a first chunk may have gone");
+        let untried = s.push_op(acc, &text, "", None).unwrap();
+        assert_eq!(s.undo(&[(untried, text)], &[], &[], &[], false).unwrap(), Undone::Done);
     }
 
     #[test]
@@ -7566,12 +7779,32 @@ mod tests {
         s.insert_header(acc, sent, 1, &to_mario, FLAGS, 10).unwrap();
         s.insert_header(other, other_inbox, 1, &from("both@ex.org", "4@x"), FLAGS, 10).unwrap();
         s.insert_header(other, other_inbox, 2, &from("zoe@ex.org", "5@x"), FLAGS, 10).unwrap();
+        // Written to from the account removed, and known to the other: no longer "written to".
+        let mut to_zoe = header("6@x", None, "c", 60);
+        to_zoe.to = vec![Address { name: None, email: "zoe@ex.org".into() }];
+        s.insert_header(acc, sent, 2, &to_zoe, FLAGS, 10).unwrap();
         assert_eq!(s.search_contacts("ex.org", &[], 10).unwrap().len(), 4);
 
         s.delete_account(acc).unwrap();
         let mut left: Vec<String> = s.search_contacts("ex.org", &[], 10).unwrap().into_iter().map(|a| a.email).collect();
         left.sort();
         assert_eq!(left, ["both@ex.org", "zoe@ex.org"]);
+        let counts = |email: &str| s.read().query_row("SELECT written, seen FROM contacts WHERE email = ?1", [email], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))).unwrap();
+        assert_eq!((counts("zoe@ex.org"), counts("both@ex.org")), ((0, 1), (0, 1)));
+    }
+
+    #[test]
+    fn a_removal_cut_halfway_still_forgets_the_people_of_its_first_steps() {
+        let (s, acc, inbox, _) = setup();
+        let from = |email: &str, id: &str| HeaderInfo { from: Some(Address { name: None, email: email.into() }), ..header(id, None, "a", 100) };
+        let first = s.insert_header(acc, inbox, 1, &from("marie@ex.org", "1@x"), FLAGS, 10).unwrap();
+        s.insert_header(acc, inbox, 2, &from("paul@ex.org", "2@x"), FLAGS, 10).unwrap();
+        // The first attempt noted its correspondents, deleted Marie's message, then stopped.
+        s.removal_correspondents(acc).unwrap();
+        s.db().execute("DELETE FROM messages WHERE id = ?1", [first]).unwrap();
+        s.delete_account(acc).unwrap();
+        assert!(s.search_contacts("ex.org", &[], 10).unwrap().is_empty());
+        assert_eq!(s.setting(&format!("removing_contacts:{acc}")).unwrap(), None);
     }
 
     #[test]
@@ -7643,6 +7876,9 @@ mod tests {
     fn only_the_latest_draft_version_is_queued() {
         let (s, acc, _, _) = setup();
         let save = |raw: &str| format!(r#"{{"kind":"save_draft","mailbox":"Drafts","message_id":"d1@x","raw":"{raw}"}}"#);
+        // An older save that failed goes too: retried later, it would put back an old text.
+        let failed = s.push_op(acc, &save("v0"), "", None).unwrap();
+        assert!(s.fail_replayed(failed, &save("v0"), "too large", 0).unwrap());
         s.push_op(acc, &save("v1"), "", None).unwrap();
         s.push_op(acc, r#"{"kind":"save_draft","mailbox":"Drafts","message_id":"autre@x","raw":"a"}"#, "", None).unwrap();
         s.drop_pending_draft(acc, "d1@x").unwrap();
@@ -7650,7 +7886,7 @@ mod tests {
         let ops: Vec<String> = s.pending_ops(acc).unwrap().into_iter().map(|p| s.op_payload(p.id).unwrap().unwrap()).collect();
         assert_eq!(ops.len(), 2, "{ops:?}");
         assert!(ops.iter().any(|o| o.contains("autre@x")), "another draft is left alone");
-        assert!(ops.iter().any(|o| o.contains("v2")) && !ops.iter().any(|o| o.contains("v1")));
+        assert!(ops.iter().any(|o| o.contains("v2")) && !ops.iter().any(|o| o.contains("v1") || o.contains("v0")));
     }
 
     #[test]
@@ -8362,6 +8598,11 @@ mod tests {
         assert!(copy.contains("SEARCH o USING INDEX messages_") && !copy.contains("SCAN o"), "{copy}");
         let mailboxes = plan("SELECT (SELECT COUNT(*) FROM messages m WHERE m.mailbox_id = 1 AND m.seen = 0) FROM mailboxes");
         assert!(mailboxes.contains("messages_unread"), "{mailboxes}");
+        // At every sync of a server without CONDSTORE: indexes only, no folder rows read.
+        let known = plan(&UID_COUNT.replace("?1", "1"));
+        assert!(known.contains("COVERING INDEX"), "{known}");
+        let unseen = plan(&UID_UNSEEN.replace("?1", "1"));
+        assert!(unseen.contains("messages_unread"), "{unseen}");
     }
 
     #[test]

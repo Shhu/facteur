@@ -102,30 +102,41 @@ fn etags_body(from: i64, to: i64) -> String {
     )
 }
 
-/// These objects, their recurring events expanded over the window by the server.
-fn multiget_body(hrefs: &[String], from: i64, to: i64) -> String {
-    let (start, end) = time_range(from, to);
+/// These objects as stored: a server expanding them (`<c:expand>`) writes their times in UTC
+/// and drops their zone, which an edit would then lose. Series are expanded here, but those whose
+/// rule is read here only in part (`expand`: the window, see [`crate::calendar::needs_expansion`]).
+fn multiget_body(hrefs: &[String], expand: Option<(i64, i64)>) -> String {
     let escape = |h: &str| h.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     let list: String = hrefs.iter().map(|h| format!("<d:href>{}</d:href>", escape(h))).collect();
+    let data = match expand {
+        Some((from, to)) => {
+            let (start, end) = time_range(from, to);
+            format!(r#"<c:calendar-data><c:expand start="{start}" end="{end}"/></c:calendar-data>"#)
+        }
+        None => "<c:calendar-data/>".to_string(),
+    };
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <c:calendar-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-  <d:prop><d:getetag/><c:calendar-data><c:expand start="{start}" end="{end}"/></c:calendar-data></d:prop>
+  <d:prop><d:getetag/>{data}</d:prop>
   {list}
 </c:calendar-multiget>"#
     )
 }
 
 /// (address, ETag) of each object listed.
+/// An object listed without its ETag makes the whole listing unusable: it would be read as gone.
 fn parse_etags(xml: &str, base: &Url) -> Result<Vec<(String, String)>> {
     let doc = document(xml)?;
-    Ok(responses(&doc)
+    responses(&doc)
         .into_iter()
         .filter_map(|(href, props)| {
-            let etag = props.into_iter().find(|p| is(p, DAV, "getetag")).map(text).filter(|e| !e.is_empty())?;
-            Some((base.join(&href).ok()?.to_string(), etag))
+            let Some(etag) = props.into_iter().find(|p| is(p, DAV, "getetag")).map(text).filter(|e| !e.is_empty()) else {
+                return Some(Err(Error::Other("CalDAV object listed without its ETag".into())));
+            };
+            Some(Ok((base.join(&href).ok()?.to_string(), etag)))
         })
-        .collect())
+        .collect()
 }
 
 fn cards_body(hrefs: &[String]) -> String {
@@ -558,7 +569,27 @@ impl Client {
         for chunk in hrefs.chunks(MULTIGET_CHUNK) {
             // Paths, as servers expect them in a multiget.
             let paths: Vec<String> = chunk.iter().filter_map(|h| Url::parse(h).ok()).map(|u| u.path().to_string()).collect();
-            let (base, xml) = self.dav("REPORT", calendar, "1", &multiget_body(&paths, from, to), MAX_REPORT).await?;
+            let (base, xml) = self.dav("REPORT", calendar, "1", &multiget_body(&paths, None), MAX_REPORT).await?;
+            out.extend(self.instances_of(calendar, &base, parse_calendar_data(&xml)?, from, to, me).await?);
+        }
+        Ok(out)
+    }
+
+    /// The occurrences of these objects (address, data as stored); those the server must expand
+    /// asked again, expanded.
+    async fn instances_of(&self, calendar: &Url, base: &Url, objects: Vec<(String, String)>, from: i64, to: i64, me: &[String]) -> Result<Vec<Instance>> {
+        let mut out = Vec::new();
+        let mut expand = Vec::new();
+        for (href, ics) in objects {
+            if crate::calendar::needs_expansion(&ics) {
+                expand.extend(base.join(&href).ok().map(|u| u.path().to_string()));
+                continue;
+            }
+            let href = base.join(&href).ok().map(|u| u.to_string());
+            out.extend(crate::calendar::instances(&ics, from, to, me).into_iter().map(|i| Instance { href: href.clone(), ..i }));
+        }
+        for chunk in expand.chunks(MULTIGET_CHUNK) {
+            let (base, xml) = self.dav("REPORT", calendar, "1", &multiget_body(chunk, Some((from, to))), MAX_REPORT).await?;
             for (href, ics) in parse_calendar_data(&xml)? {
                 let href = base.join(&href).ok().map(|u| u.to_string());
                 out.extend(crate::calendar::instances(&ics, from, to, me).into_iter().map(|i| Instance { href: href.clone(), ..i }));
@@ -567,26 +598,19 @@ impl Client {
         Ok(out)
     }
 
-    /// The server is asked to expand recurring events; those it leaves whole are expanded by
-    /// [`crate::calendar::instances`].
+    /// The objects as stored (see [`multiget_body`]), expanded by [`crate::calendar::instances`].
     pub async fn events(&self, calendar: &Url, from: i64, to: i64, me: &[String]) -> Result<Vec<Instance>> {
         let utc = |t: i64| chrono::DateTime::from_timestamp(t, 0).map(|d| d.format("%Y%m%dT%H%M%SZ").to_string()).unwrap_or_default();
         let (start, end) = (utc(from), utc(to));
         let body = format!(
             r#"<?xml version="1.0" encoding="utf-8"?>
 <c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-  <d:prop><d:getetag/><c:calendar-data><c:expand start="{start}" end="{end}"/></c:calendar-data></d:prop>
+  <d:prop><d:getetag/><c:calendar-data/></d:prop>
   <c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT"><c:time-range start="{start}" end="{end}"/></c:comp-filter></c:comp-filter></c:filter>
 </c:calendar-query>"#
         );
         let (base, xml) = self.dav("REPORT", calendar, "1", &body, MAX_REPORT).await?;
-        Ok(parse_calendar_data(&xml)?
-            .iter()
-            .flat_map(|(href, ics)| {
-                let href = base.join(href).ok().map(|u| u.to_string());
-                crate::calendar::instances(ics, from, to, me).into_iter().map(move |i| Instance { href: href.clone(), ..i })
-            })
-            .collect())
+        self.instances_of(calendar, &base, parse_calendar_data(&xml)?, from, to, me).await
     }
 }
 
@@ -777,9 +801,16 @@ mod tests {
 </d:multistatus>"#;
         let listed = parse_etags(xml, &base).unwrap();
         assert_eq!(listed, [("https://dav.example/cal/y/a.ics".to_string(), "\"1\"".to_string()), ("https://dav.example/cal/y/b%20c.ics".to_string(), "\"7\"".to_string())]);
-        let body = multiget_body(&["/cal/y/a&b.ics".into()], 0, 86400);
-        assert!(body.contains("<c:calendar-multiget") && body.contains("<d:href>/cal/y/a&amp;b.ics</d:href>") && body.contains("<c:expand start=\"19700101T000000Z\""));
+        let body = multiget_body(&["/cal/y/a&b.ics".into()], None);
+        assert!(body.contains("<c:calendar-multiget") && body.contains("<d:href>/cal/y/a&amp;b.ics</d:href>"));
+        assert!(!body.contains("expand"), "an expanded object comes back in UTC, its zone lost");
+        assert!(multiget_body(&["/cal/y/s.ics".into()], Some((0, 86400))).contains("<c:expand start=\"19700101T000000Z\""), "a rule read here in part");
         assert!(etags_body(0, 86400).contains("<d:getetag/></d:prop>") && !etags_body(0, 86400).contains("calendar-data"));
+        let without = r#"<d:multistatus xmlns:d="DAV:">
+ <d:response><d:href>/cal/y/a.ics</d:href><d:propstat><d:prop><d:getetag>"1"</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+ <d:response><d:href>/cal/y/b.ics</d:href><d:propstat><d:prop/><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+</d:multistatus>"#;
+        assert!(parse_etags(without, &base).is_err(), "b.ics would be taken for deleted");
     }
 
     #[test]

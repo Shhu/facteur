@@ -21,6 +21,16 @@ pub enum Stream {
     Tls(Box<TlsStream<TcpStream>>),
 }
 
+/// Handed to lettre for SMTP, connected (and encrypted, for implicit TLS) here.
+impl lettre::transport::smtp::client::AsyncTokioStream for Stream {
+    fn peer_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        match self {
+            Stream::Plain(tcp) => tcp.peer_addr(),
+            Stream::Tls(tls) => tls.get_ref().0.peer_addr(),
+        }
+    }
+}
+
 impl AsyncRead for Stream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
@@ -125,12 +135,9 @@ pub async fn connect(server: &ServerConfig, username: &str, credential: &Credent
 }
 
 async fn connect_inner(server: &ServerConfig, username: &str, credential: &Credential) -> Result<Session> {
-    let tcp = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        TcpStream::connect((server.host.as_str(), server.port)),
-    )
-    .await
-    .map_err(|_| Error::Other(crate::tr!("délai dépassé en se connectant à {}", "timed out connecting to {}", server.host)))??;
+    let tcp = tokio::time::timeout(std::time::Duration::from_secs(20), tcp_connect(&server.host, server.port))
+        .await
+        .map_err(|_| Error::Other(crate::tr!("délai dépassé en se connectant à {}", "timed out connecting to {}", server.host)))??;
     keepalive(&tcp);
 
     let mut client = match server.security {
@@ -148,6 +155,45 @@ async fn connect_inner(server: &ServerConfig, username: &str, credential: &Crede
     };
     client.read_response().await?;
     authenticate(client, username, credential).await
+}
+
+/// The server's addresses raced in the manner of Happy Eyeballs (RFC 8305): IPv6 and IPv4
+/// alternating, one more attempt every 300 ms while the earlier ones go on, the first connected
+/// kept. Tried one after the other, an address whose packets are dropped (IPv6 on some networks)
+/// would take the whole time allowed.
+pub(crate) async fn tcp_connect(host: &str, port: u16) -> std::io::Result<TcpStream> {
+    let mut addresses = interleaved(tokio::net::lookup_host((host, port)).await?.collect()).into_iter();
+    let mut tries = tokio::task::JoinSet::new();
+    let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, format!("no address for {host}"));
+    loop {
+        if let Some(address) = addresses.next() {
+            tries.spawn(TcpStream::connect(address));
+        } else if tries.is_empty() {
+            return Err(last);
+        }
+        let more = addresses.len() > 0;
+        tokio::select! {
+            Some(done) = tries.join_next() => match done {
+                Ok(Ok(tcp)) => return Ok(tcp),
+                Ok(Err(e)) => last = e,
+                Err(e) => last = std::io::Error::other(e),
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_millis(300)), if more => {}
+        }
+    }
+}
+
+/// The resolver's order, the two families alternating from the first one's.
+fn interleaved(addresses: Vec<std::net::SocketAddr>) -> Vec<std::net::SocketAddr> {
+    let Some(first) = addresses.first().map(|a| a.is_ipv6()) else { return addresses };
+    let (mut same, mut other): (std::collections::VecDeque<_>, std::collections::VecDeque<_>) =
+        addresses.into_iter().partition(|a| a.is_ipv6() == first);
+    let mut out = Vec::with_capacity(same.len() + other.len());
+    while !same.is_empty() || !other.is_empty() {
+        out.extend(same.pop_front());
+        out.extend(other.pop_front());
+    }
+    out
 }
 
 /// A connection that died silently (laptop asleep, Wi-Fi switched, NAT entry dropped) then
@@ -242,6 +288,43 @@ pub struct FolderStatus {
 pub async fn folder_status_of(session: &mut Session, name: &str, items: &str) -> Result<FolderStatus> {
     let m = session.status(name, items).await?;
     Ok(FolderStatus { messages: Some(m.exists), uidnext: m.uid_next, uidvalidity: m.uid_validity, highestmodseq: m.highest_modseq, unseen: m.unseen })
+}
+
+/// [`folder_status_of`] for several folders, their STATUS sent one after the other without
+/// waiting for the answers (pipelining, RFC 3501 5.5): one round trip per batch instead of one
+/// per folder (37 folders on Outlook: about 4 s). A folder the server refuses is left out.
+pub async fn folder_statuses(session: &mut Session, names: &[String], items: &str) -> Result<HashMap<String, FolderStatus>> {
+    use async_imap::imap_proto::{MailboxDatum, Response};
+    let mut out = HashMap::new();
+    for batch in names.chunks(STATUS_BATCH) {
+        let mut waiting = HashSet::new();
+        for name in batch {
+            waiting.insert(session.run_command(format!("STATUS {} {items}", quoted(name))).await?.0);
+        }
+        while !waiting.is_empty() {
+            let Some(response) = session.read_response().await? else {
+                return Err(Error::Imap(async_imap::error::Error::ConnectionLost));
+            };
+            match response.parsed() {
+                Response::Done { tag, .. } => {
+                    waiting.remove(&tag.0);
+                }
+                Response::MailboxData(MailboxDatum::Status { mailbox, status }) => {
+                    out.insert(mailbox.to_string(), folder_status(status));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Commands sent ahead of their answers: few enough for any server to queue.
+const STATUS_BATCH: usize = 25;
+
+/// An IMAP quoted string.
+fn quoted(name: &str) -> String {
+    format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 pub async fn list_mailboxes(session: &mut Session) -> Result<Vec<ListedMailbox>> {
@@ -532,9 +615,16 @@ pub fn server_flags<'a>(flags: impl Iterator<Item = Flag<'a>>) -> ServerFlags {
 }
 
 pub fn uid_set(uids: &[u32]) -> String {
+    uid_sets(uids, usize::MAX).pop().unwrap_or_default()
+}
+
+/// [`uid_set`] cut into sets of at most about `max` characters: a command line of hundreds of
+/// kilobytes is refused by many servers (Dovecot: 64 KiB).
+pub fn uid_sets(uids: &[u32], max: usize) -> Vec<String> {
     let mut sorted = uids.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
+    let mut sets = Vec::new();
     let mut out = String::new();
     let mut i = 0;
     while i < sorted.len() {
@@ -542,22 +632,51 @@ pub fn uid_set(uids: &[u32]) -> String {
         while i + 1 < sorted.len() && sorted[i + 1] == sorted[i] + 1 {
             i += 1;
         }
+        let range = if sorted[i] == start { start.to_string() } else { format!("{start}:{}", sorted[i]) };
+        if !out.is_empty() && out.len() + 1 + range.len() > max {
+            sets.push(std::mem::take(&mut out));
+        }
         if !out.is_empty() {
             out.push(',');
         }
-        if sorted[i] == start {
-            out.push_str(&start.to_string());
-        } else {
-            out.push_str(&format!("{start}:{}", sorted[i]));
-        }
+        out.push_str(&range);
         i += 1;
     }
-    out
+    if !out.is_empty() || sets.is_empty() {
+        sets.push(out);
+    }
+    sets
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn long_uid_sets_are_cut() {
+        assert_eq!(crate::imap::uid_set(&[5, 1, 2, 3, 9]), "1:3,5,9");
+        assert_eq!(crate::imap::uid_set(&[]), "");
+        let scattered: Vec<u32> = (0..20_000).map(|n| n * 2).collect();
+        let sets = uid_sets(&scattered, 8000);
+        assert!(sets.len() > 1 && sets.iter().all(|s| s.len() <= 8000));
+        assert_eq!(sets.join(","), crate::imap::uid_set(&scattered));
+    }
+
+    #[test]
+    fn address_families_alternate() {
+        let a = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+        let got = interleaved(vec![a("[2001:db8::1]:993"), a("[2001:db8::2]:993"), a("[2001:db8::3]:993"), a("192.0.2.1:993")]);
+        assert_eq!(got, vec![a("[2001:db8::1]:993"), a("192.0.2.1:993"), a("[2001:db8::2]:993"), a("[2001:db8::3]:993")]);
+        assert!(interleaved(vec![]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn raced_connect_reaches_a_listening_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(tcp_connect("localhost", port).await.is_ok());
+        assert!(tcp_connect("127.0.0.1", 1).await.is_err());
+    }
 
     #[test]
     fn a_handshake_cut_is_tried_again_a_refused_certificate_is_not() {
@@ -669,6 +788,22 @@ pub(crate) mod tests {
         let mut client = async_imap::Client::new(Stream::Plain(tcp));
         client.read_response().await.unwrap();
         (authenticate(client, "u", &Credential::Password("p".into())).await.unwrap(), log)
+    }
+
+    #[tokio::test]
+    async fn folder_statuses_are_asked_all_at_once() {
+        let (mut session, log) = scripted_with_log(vec![
+            ("* STATUS INBOX (MESSAGES 3 UIDNEXT 9 UIDVALIDITY 1 UNSEEN 1)\r\n{tag} OK done", false),
+            ("{tag} NO [NONEXISTENT] gone", false),
+            ("* STATUS \"Clients/Jill & Joy\" (MESSAGES 0 UIDNEXT 1 UIDVALIDITY 2 UNSEEN 0)\r\n{tag} OK done", false),
+        ])
+        .await;
+        let names = ["INBOX".to_string(), "Old".into(), "Clients/Jill & Joy".into()];
+        let found = folder_statuses(&mut session, &names, "(MESSAGES UIDNEXT UIDVALIDITY UNSEEN)").await.unwrap();
+        assert_eq!((found["INBOX"].messages, found["INBOX"].unseen), (Some(3), Some(1)));
+        assert_eq!(found["Clients/Jill & Joy"].uidvalidity, Some(2));
+        assert!(!found.contains_key("Old"), "refused: asked again alone");
+        assert_eq!(log.lock().unwrap()[2], "STATUS \"Clients/Jill & Joy\" (MESSAGES UIDNEXT UIDVALIDITY UNSEEN)");
     }
 
     #[tokio::test]

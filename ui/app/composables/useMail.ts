@@ -1,5 +1,5 @@
 import { invoke } from '~/utils/ipc'
-import type { AccountColor } from '~/utils/accountColors'
+import type { AccountColor, AccountColorName } from '~/utils/accountColors'
 import type { Diagnostics, LogLine } from '~/composables/usePerf'
 import type {
   Account, AccountStats, AddressBookStatus, CalendarEvent, CalendarInfo, EventAnswer, EventDraft, SeriesRepeat, CalendarStatus, AiStatus, FoundEvent, OpsDetails, Address, Coverage, MailClientStatus, BackupManifest, BackupMessage, BackupStats, BackupStatus, Catalog, AttachmentReport, Category, CategoryUnread, Dashboard, Discovered, Draft, FolderSummary, FollowUp, HeldSender, Identity, Rule, RulePreview, LinkFacts, LinkReport, Outgoing, Mailbox, MessageDetail, MessageSummary, NewAccount, OAuthIdentity, OAuthProvider, OpsStatus, Unsubscribed,
@@ -123,7 +123,7 @@ export const api = {
   /** After sleep or a network return: the engine syncs and listens again now. */
   wake: () => invoke<void>('wake'),
   retryOp: (id: number) => invoke<void>('retry_op', { id }),
-  discardOp: (id: number) => invoke<void>('discard_op', { id }),
+  discardOp: (id: number, createdAt: number) => invoke<void>('discard_op', { id, createdAt }),
   setSignature: (accountId: number, signature: string) => invoke<void>('set_signature', { accountId, signature }),
   contacts: (query: string) => invoke<Address[]>('contacts', { query }),
   saveDraft: (draft: Draft) => invoke<string>('save_draft', { draft }),
@@ -271,11 +271,28 @@ export function useMail() {
     return accounts.value.find(a => a.id === id) ?? null
   }
 
-  /** Account address and aliases, lowercased. */
-  const ownAddresses = computed(() => new Map(accounts.value.map(a => [
-    a.id,
-    new Set([a.email, ...a.identities.map(i => i.email)].map(e => e.toLowerCase()))
-  ])))
+  /** Account address and aliases, lowercased. The same Map while they stay the same: every
+   *  sync gives a new account list (its date, its quota), which must not rebuild each row of
+   *  the message list. */
+  const ownAddresses = computed<Map<number, Set<string>>>((before) => {
+    const next = new Map(accounts.value.map(a => [
+      a.id,
+      new Set([a.email, ...a.identities.map(i => i.email)].map(e => e.toLowerCase()))
+    ]))
+    return before && sameSets(before, next) ? before : next
+  })
+  /** Each account's name and colour, kept the same way. */
+  const faces = computed<Map<number, { name: string, color: AccountColorName }>>((before) => {
+    const next = new Map(accounts.value.map(a => [a.id, { name: accountName(a), color: accountColorName(a, accounts.value) }]))
+    const same = before && before.size === next.size
+      && [...next].every(([id, f]) => before.get(id)?.name === f.name && before.get(id)?.color === f.color)
+    return same ? before : next
+  })
+  /** For the message list: the account's name when several are shown together. */
+  function accountNameOf(id: number): string | null {
+    return faces.value.get(id)?.name ?? null
+  }
+  const accountCount = computed(() => faces.value.size)
   const noAddress: ReadonlySet<string> = new Set()
   function ownSet(accountId: number): ReadonlySet<string> {
     return ownAddresses.value.get(accountId) ?? noAddress
@@ -294,12 +311,11 @@ export function useMail() {
   }
 
   function accountColor(id: number): AccountColor {
-    const a = accountById(id)
-    return ACCOUNT_COLORS[a ? accountColorName(a, accounts.value) : 'orange']
+    return ACCOUNT_COLORS[faces.value.get(id)?.color ?? 'orange']
   }
 
   return {
-    accounts, accountId, account, accountById, accountColor, mailboxes, syncing, syncProgress, isSyncing, unifiedUnread, tick,
+    accounts, accountId, account, accountById, accountColor, accountNameOf, accountCount, mailboxes, syncing, syncProgress, isSyncing, unifiedUnread, tick,
     ownSet, isMine, loadAccounts, loadMailboxes, mailboxByRole, syncAll
   }
 }
@@ -315,4 +331,13 @@ export function useErrorToast() {
 /** For errors that would otherwise leave no trace in facteur's log file. */
 export function logUi(level: 'error' | 'warn' | 'info', message: string) {
   invoke('log_ui', { level, message }).catch(() => {})
+}
+
+function sameSets(a: Map<number, Set<string>>, b: Map<number, Set<string>>): boolean {
+  if (a.size !== b.size) return false
+  for (const [id, set] of b) {
+    const other = a.get(id)
+    if (!other || other.size !== set.size || [...set].some(e => !other.has(e))) return false
+  }
+  return true
 }

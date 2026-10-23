@@ -1,21 +1,37 @@
 import { openUrl } from '@tauri-apps/plugin-opener'
 import { confirm } from '~/composables/useConfirm'
+import { generatedText, invisibleColor } from '~/utils/linkStyle'
 import type { LinkFacts } from '~/utils/types'
 
-/** Leaves out text hidden by style, so a lookalike domain cannot be pushed out of the leading
- *  position by words nobody sees. */
-export function visibleLinkText(link: Element): string {
+/** Below that, text reads as a dot or nothing. */
+const UNREADABLE_PX = 6
+
+/** The link's text with what style hides left out, so a lookalike domain cannot be pushed out
+ *  of the leading position by words nobody sees. `doubtful`: text the check cannot read (written
+ *  by a style), so the link is opened only once asked. */
+export function linkText(link: Element): { text: string, doubtful: boolean } {
   const doc = link.ownerDocument
   const view = doc.defaultView
-  if (!view) return link.textContent ?? ''
+  if (!view) return { text: link.textContent ?? '', doubtful: false }
+  const width = doc.documentElement.scrollWidth
+  const height = doc.documentElement.scrollHeight
   const hidden = new Map<Element, boolean>()
   const isHidden = (el: Element | null): boolean => {
     if (!el) return false
     const known = hidden.get(el)
     if (known !== undefined) return known
     const s = view.getComputedStyle(el)
-    const own = s.display === 'none' || s.visibility === 'hidden' || s.visibility === 'collapse'
-      || Number.parseFloat(s.opacity) === 0 || Number.parseFloat(s.fontSize) < 1
+    let own = s.display === 'none' || s.visibility === 'hidden' || s.visibility === 'collapse'
+      || Number.parseFloat(s.opacity) === 0 || Number.parseFloat(s.fontSize) < UNREADABLE_PX || invisibleColor(s.color)
+    if (!own) {
+      // Out of the page, or in a box too small to show it.
+      const r = el.getBoundingClientRect()
+      const left = r.left + view.scrollX
+      const top = r.top + view.scrollY
+      const laidOut = r.width > 0 || r.height > 0 || el.getClientRects().length > 0
+      own = laidOut && (left + r.width <= 0 || top + r.height <= 0 || left >= width || top >= height
+        || (s.overflow !== 'visible' && (r.width < 1 || r.height < 1)))
+    }
     const result = own || (el !== link && isHidden(el.parentElement))
     hidden.set(el, result)
     return result
@@ -25,7 +41,13 @@ export function visibleLinkText(link: Element): string {
   for (let n = walker.nextNode(); n; n = walker.nextNode()) {
     if (!isHidden(n.parentElement)) text += n.nodeValue ?? ''
   }
-  return text.trim()
+  const doubtful = [link, ...link.querySelectorAll('*')].some(el =>
+    generatedText(view.getComputedStyle(el, '::before').content) || generatedText(view.getComputedStyle(el, '::after').content))
+  return { text: text.trim(), doubtful }
+}
+
+export function visibleLinkText(link: Element): string {
+  return linkText(link).text
 }
 
 /** A calendar event counts: anyone can put one in your calendar by inviting you. */

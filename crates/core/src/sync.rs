@@ -212,7 +212,7 @@ pub async fn sync_account_into(
             }
             keep.extend(still);
             if current.values().any(|(id, ..)| !keep.contains(id)) {
-                store.retain_mailboxes(account.id, &keep)?;
+                crate::rt::offload(|| store.retain_mailboxes(account.id, &keep))?;
             }
         }
     } else {
@@ -280,9 +280,29 @@ pub async fn sync_account_into(
             // Only the newest WINDOW inbox messages are cached: a larger inbox is no drift.
             statuses.get(&name).and_then(|s| s.messages).is_some_and(|n| here > i64::from(n) || here < i64::from(n).min(WINDOW as i64))
         });
+    // Without LIST-STATUS, the known folders' STATUS asked for all at once (see the loop).
+    if matches!(scope, Scope::All | Scope::System) && !caps.list_status && !slow_status().contains(&account.id) {
+        let names: Vec<String> = states.iter().filter(|s| !statuses.contains_key(&s.name) && may_stay_unopened(s, &caps)).map(|s| s.name.clone()).collect();
+        if !names.is_empty() {
+            match crate::error::bounded(status_secs(names.len()), "STATUS", imap::folder_statuses(session, &names, status_items(&caps))).await {
+                Ok(found) => statuses.extend(found),
+                // Too slow at once (statuses the server computes slowly): one by one from now on,
+                // each bounded alone. Cut, the session holds answers not read: a new one is taken.
+                Err(e) if !e.is_connection_drop() => {
+                    tracing::info!("account {}: STATUS of {} folders at once too slow ({e}), asked one by one", account.id, names.len());
+                    slow_status().insert(account.id);
+                    return Err(crate::Error::Imap(async_imap::error::Error::ConnectionLost));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
     let mut untouched = 0;
     let mut synced = 0;
+    let mut periodic = 0;
+    let budget = periodic_budget(states.iter().filter(|s| periodic_due(store, s, &caps)).count());
     for state in states {
+        let mut for_check = false;
         let drift = inbox_drift && state.role == Some(Role::All);
         // Without LIST-STATUS, ask a known folder for its STATUS alone: one command instead of the three
         // or four of opening it (on Outlook, about 0.1 s against 0.4 s, for dozens of folders).
@@ -291,9 +311,18 @@ pub async fn sync_account_into(
             status = crate::error::bounded(30, "STATUS", imap::folder_status_of(session, &state.name, status_items(&caps))).await.ok();
         }
         let saved_unseen = if caps.condstore { None } else { store.server_unseen(state.id)? };
-        if !drift && status.is_some_and(|s| unchanged_on_server(&state, &s, &caps, saved_unseen)) && settled(store, account.id, &state, &caps)? {
-            untouched += 1;
-            continue;
+        if !drift && status.is_some_and(|s| unchanged_on_server(&state, &s, &caps, saved_unseen)) && settled_otherwise(store, account.id, &state)? {
+            // Nothing changed: opened only for a periodic check, and only a few per pass.
+            let forced = forced_check(state.id);
+            if !opens_for_check(periodic_due(store, &state, &caps), forced, &scope, periodic, budget) {
+                untouched += 1;
+                continue;
+            }
+            // Asked for by a mismatch or a change given up: at this pass, not in turn.
+            if !forced {
+                periodic += 1;
+            }
+            for_check = true;
         }
         let state_id = state.id;
         // First pass on this folder: nothing is "new" to the user.
@@ -309,9 +338,24 @@ pub async fn sync_account_into(
         }
         synced += 1;
         let name = state.name.clone();
+        // A folder failing each time it is opened for its periodic check would take a place at
+        // every pass: it waits for the next period instead.
+        let skip = |why: String| {
+            tracing::warn!("{why}");
+            if for_check {
+                postpone_checks(state_id);
+            }
+        };
         match watched(&name, sync_mailbox(store, account.id, session, &caps, state, progress)).await {
             Ok((ids, changed)) => {
                 if !caps.condstore {
+                    // A message read or unread elsewhere beyond the newest ones the sync rereads:
+                    // the whole folder's flags at the next pass, not at the periodic check.
+                    if let Some(s) = status
+                        && unseen_disagrees(store.uid_unseen(state_id)?, s)
+                    {
+                        force_full_flags(state_id);
+                    }
                     store.set_server_unseen(state_id, status.and_then(|s| s.unseen))?;
                 }
                 report.changed |= changed;
@@ -337,16 +381,16 @@ pub async fn sync_account_into(
                 }
             }
             // An inaccessible folder must not block the others.
-            Err(crate::Error::Imap(async_imap::error::Error::No(msg))) => tracing::warn!("folder skipped: {msg}"),
+            Err(crate::Error::Imap(async_imap::error::Error::No(msg))) => skip(format!("folder skipped: {msg}")),
             // Refused or unreadable command for this folder (odd name, server quirk): the others still
             // sync.
             Err(e @ crate::Error::Imap(async_imap::error::Error::Bad(_) | async_imap::error::Error::Parse(_) | async_imap::error::Error::Validate(_))) => {
-                tracing::warn!("folder {} skipped: {e}", crate::utf7::decode(&name))
+                skip(format!("folder {} skipped: {e}", crate::utf7::decode(&name)))
             }
             // Nor a message the database refuses (malformed header): retried at the next sync. A full
             // disk, or a busy, read-only or broken database is not about this folder: the sync stops.
-            Err(e @ crate::Error::Mime(_)) => tracing::warn!("folder {} skipped: {e}", crate::utf7::decode(&name)),
-            Err(e @ crate::Error::Db(_)) if message_db_error(&e) => tracing::warn!("folder {} skipped: {e}", crate::utf7::decode(&name)),
+            Err(e @ crate::Error::Mime(_)) => skip(format!("folder {} skipped: {e}", crate::utf7::decode(&name))),
+            Err(e @ crate::Error::Db(_)) if message_db_error(&e) => skip(format!("folder {} skipped: {e}", crate::utf7::decode(&name))),
             Err(e) => return Err(e),
         }
     }
@@ -421,12 +465,45 @@ fn unchanged_on_server(state: &MailboxState, status: &imap::FolderStatus, caps: 
     }
 }
 
-/// Nothing local waits on a read of the folder: no periodic check due, no move or deletion
-/// queued from or into it, no message to restore, no row awaiting its UID, no body to fetch.
-fn settled(store: &Store, account_id: i64, state: &MailboxState, caps: &Caps) -> Result<bool> {
-    if peek_due(store, FULL_LIST, state.id, FULL_LIST_EVERY) || peek_due(store, FULL_FLAGS, state.id, full_flags_every(caps)) {
-        return Ok(false);
+/// A periodic check of the folder is due (its whole UID list, or its flags without CONDSTORE).
+fn periodic_due(store: &Store, state: &MailboxState, caps: &Caps) -> bool {
+    peek_due(store, FULL_LIST, state.id, FULL_LIST_EVERY) || peek_due(store, FULL_FLAGS, state.id, full_flags_every(caps, state))
+}
+
+/// An unchanged folder is opened for its periodic check, unless this pass already opened
+/// `budget` for theirs (a pass over named folders opens them all). A check `forced` (see
+/// `force_full_flags`) is not held back.
+fn opens_for_check(due: bool, forced: bool, scope: &Scope, opened: usize, budget: usize) -> bool {
+    due && (forced || !matches!(scope, Scope::All | Scope::System) || opened < budget)
+}
+
+/// A check of the folder was asked for, not only due by its date.
+fn forced_check(mailbox_id: i64) -> bool {
+    let checks = periodic();
+    [FULL_FLAGS, FULL_LIST].iter().any(|k| checks.get(&(*k, mailbox_id)).is_some_and(|c| c.forced))
+}
+
+/// Folders opened per pass for their periodic check, `due` being late: enough for all of them
+/// within a period at a pass every 15 minutes, [`PERIODIC_PER_PASS`] at least.
+fn periodic_budget(due: usize) -> usize {
+    PERIODIC_PER_PASS.max(due.div_ceil(24))
+}
+
+/// The folder's periodic checks counted as done for this period, in memory only.
+fn postpone_checks(mailbox_id: i64) {
+    let now = crate::store::now();
+    let mut checks = periodic();
+    for kind in [FULL_FLAGS, FULL_LIST] {
+        let c = checks.entry((kind, mailbox_id)).or_default();
+        if !c.forced {
+            c.last = Some(now);
+        }
     }
+}
+
+/// Nothing local waits on a read of the folder: no move or deletion queued from or into it, no
+/// message to restore, no row awaiting its UID, no body to fetch.
+fn settled_otherwise(store: &Store, account_id: i64, state: &MailboxState) -> Result<bool> {
     if restoring().contains_key(&state.id) || store.moves_pending_into(state.id)? || !store.in_flight_uids(account_id, &state.name)?.is_empty() {
         return Ok(false);
     }
@@ -517,11 +594,19 @@ fn is_under(name: &str, parent: &str, delimiter: Option<&str>) -> bool {
 const FULL_FLAGS_EVERY: i64 = 3600;
 const FULL_FLAGS_EVERY_CONDSTORE: i64 = 6 * 3600;
 
-fn full_flags_every(caps: &Caps) -> i64 {
-    if caps.condstore { FULL_FLAGS_EVERY_CONDSTORE } else { FULL_FLAGS_EVERY }
+/// Without CONDSTORE the inbox's flags are read again hourly; another folder's every 6 hours, or
+/// at the next pass when its unread count differs from STATUS (see `unseen_disagrees`).
+fn full_flags_every(caps: &Caps, state: &MailboxState) -> i64 {
+    if caps.condstore || state.role != Some(Role::Inbox) { FULL_FLAGS_EVERY_CONDSTORE } else { FULL_FLAGS_EVERY }
 }
+
+/// Folders opened in one pass only because a periodic check is due: the others wait for the next
+/// passes, so that a launch does not open them all (37 on an Outlook account: 15 seconds).
+const PERIODIC_PER_PASS: usize = 4;
 const RECENT_FLAGS: usize = 500;
 const FLAGS_CHUNK: usize = 1000;
+/// Longest UID set in one command line, in characters.
+const SET_MAX: usize = 8000;
 
 /// A message skipped once (being moved during a sync, say) is fetched at the latest then. Kept in
 /// the database so a launch does not check every folder again (on a slow server, three commands
@@ -724,15 +809,24 @@ pub(crate) fn unescape_label(label: &str) -> String {
 }
 
 /// Skips messages with a queued change still on its way: a label change, or a pin (the Starred
-/// label follows `\Flagged`).
-fn keep_server_labels(store: &Store, state: &MailboxState, names: &HashMap<String, i64>, given: &[(u32, Vec<String>)]) -> Result<bool> {
+/// label follows `\Flagged`). `before`: those queued before the labels were read (see
+/// [`label_changes_queued`]), as one sent meanwhile has left the queue though the server's
+/// answer predates it.
+fn keep_server_labels(store: &Store, state: &MailboxState, names: &HashMap<String, i64>, given: &[(u32, Vec<String>)], before: &HashSet<u32>) -> Result<bool> {
     if given.is_empty() {
         return Ok(false);
     }
-    let mut keep = store.pending_label_uids(state.account_id, &state.name)?;
-    keep.extend(store.pending_flag_uids(state.account_id, &state.name)?);
+    let mut keep = label_changes_queued(store, state)?;
+    keep.extend(before);
     let labels: Vec<(u32, Vec<i64>)> = given.iter().map(|(uid, l)| (*uid, label_ids(names, l))).collect();
     store.set_server_labels(state.id, &labels, &keep)
+}
+
+/// Messages of the folder with a label change or a pin queued.
+fn label_changes_queued(store: &Store, state: &MailboxState) -> Result<HashSet<u32>> {
+    let mut queued = store.pending_label_uids(state.account_id, &state.name)?;
+    queued.extend(store.pending_flag_uids(state.account_id, &state.name)?);
+    Ok(queued)
 }
 
 /// Spreads the cache's backlog over a few syncs.
@@ -782,8 +876,7 @@ async fn complete_gmail(store: &Store, session: &mut Session, state: &MailboxSta
         }
     }
     let in_flight = store.in_flight_uids(state.account_id, &state.name)?;
-    let mut pending = store.pending_label_uids(state.account_id, &state.name)?;
-    pending.extend(store.pending_flag_uids(state.account_id, &state.name)?);
+    let pending = label_changes_queued(store, state)?;
     let mut wanted: HashSet<u32> = HashSet::new();
     // Cached messages whose labels here disagree with the search: read again.
     let mut recheck: HashSet<u32> = HashSet::new();
@@ -817,7 +910,7 @@ async fn complete_gmail(store: &Store, session: &mut Session, state: &MailboxSta
             fetch_flags(session, &uid_set(chunk), "(UID FLAGS X-GM-LABELS)", &mut flags, Some(&mut labels)).await?;
         }
         imap::still_open(session).await?;
-        changed |= keep_server_labels(store, state, names, &labels)?;
+        changed |= keep_server_labels(store, state, names, &labels, &pending)?;
         let read: Vec<String> = labels.iter().map(|(uid, l)| format!("{uid} {l:?}")).collect();
         tracing::info!(
             "labels of {} messages read again, they differed from the server's folders ({}); read: {}",
@@ -847,15 +940,19 @@ async fn refresh_flags(
     known: Option<&[u32]>,
 ) -> Result<bool> {
     if known.is_some_and(|k| k.is_empty()) {
+        if let Some(t) = due(store, FULL_FLAGS, state.id, full_flags_every(caps, state)) {
+            done(store, t);
+        }
         return Ok(false);
     }
     // Read before the FETCH: a change leaving the queue after this point is already on the server
     // when its flags are read.
     let mut keep = store.pending_flag_uids(state.account_id, &state.name)?;
     let all_seen_below = store.mark_all_seen_below(state.account_id, &state.name)?;
-    let full = due(store, FULL_FLAGS, state.id, full_flags_every(caps));
+    let full = due(store, FULL_FLAGS, state.id, full_flags_every(caps, state));
     let mut updates = Vec::new();
     let names = gmail_labels(store, state)?;
+    let labels_before = if names.is_some() { label_changes_queued(store, state)? } else { HashSet::new() };
     let mut labels: Vec<(u32, Vec<String>)> = Vec::new();
     let items = if names.is_some() { "UID FLAGS X-GM-LABELS" } else { "UID FLAGS" };
     let mut sent = false;
@@ -915,7 +1012,7 @@ async fn refresh_flags(
     }
     let mut changed = crate::rt::offload(|| store.update_flags(state.id, &updates, &keep))? > 0;
     if let Some(names) = &names {
-        changed |= keep_server_labels(store, state, names, &labels)?;
+        changed |= keep_server_labels(store, state, names, &labels, &labels_before)?;
     }
     if let Some(t) = full.filter(|_| whole || given_up) {
         done(store, t);
@@ -969,6 +1066,29 @@ async fn open_folder(session: &mut Session, caps: &Caps, name: &str) -> Result<a
 /// The cached UIDs below `next` the server still has (`still`, its answer to a search of them),
 /// when that is consistent with `departed` messages gone; `None` (the whole list is read instead)
 /// for an empty answer, which may be a refused search, or more gone than the count says.
+/// Which of the cached UIDs the server still lists, in a few searches at most (one line naming
+/// tens of thousands of scattered UIDs is refused). `None`, for the whole list instead: too many
+/// searches to be worth it (a large cache answers as long as the whole list), or one refused
+/// (an empty part would read as deleted messages).
+async fn still_listed(session: &mut Session, cached: &[u32]) -> Result<Option<HashSet<u32>>> {
+    let sets = imap::uid_sets(cached, SET_MAX);
+    if sets.len() > DEPARTURE_SEARCHES {
+        return Ok(None);
+    }
+    let mut still = HashSet::new();
+    for set in sets {
+        match imap::uid_search_strict(session, &format!("UID {set}")).await {
+            Ok(found) => still.extend(found),
+            Err(crate::Error::Imap(async_imap::error::Error::No(_) | async_imap::error::Error::Bad(_))) => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Some(still))
+}
+
+/// See [`still_listed`].
+const DEPARTURE_SEARCHES: usize = 4;
+
 fn departures_only(cached: &[u32], still: HashSet<u32>, departed: i64, next: u32) -> Option<HashSet<u32>> {
     let asked: HashSet<u32> = cached.iter().copied().collect();
     let known: HashSet<u32> = still.into_iter().filter(|u| *u < next && asked.contains(u)).collect();
@@ -1015,6 +1135,7 @@ pub async fn sync_mailbox(
         Err(crate::Error::NotFound(_)) => return Ok((Vec::new(), false)),
         Err(e) => return Err(e),
     };
+    let complete = completes_gmail(&state);
     // A Gmail label is not synced on its own: its messages are All Mail's.
     let state = match state.is_label {
         true => match store.mailbox_by_role(state.account_id, Role::All)? {
@@ -1023,9 +1144,17 @@ pub async fn sync_mailbox(
         },
         false => state,
     };
-    sync_mailbox_locked(store, account_id, session, caps, state, progress, &mut steps).await
+    sync_mailbox_locked(store, account_id, session, caps, state, progress, &mut steps, complete).await
 }
 
+/// Drafts and Sent are read again after a save or a send, for that message alone: the search
+/// for the inbox's and starred messages beyond the window (`complete_gmail`) waits for the next
+/// sync asked by anything else.
+fn completes_gmail(asked: &MailboxState) -> bool {
+    !(asked.is_label && matches!(asked.role, Some(Role::Drafts | Role::Sent)))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn sync_mailbox_locked(
     store: &Store,
     account_id: i64,
@@ -1034,6 +1163,7 @@ async fn sync_mailbox_locked(
     mut state: MailboxState,
     progress: &mut OnProgress<'_>,
     steps: &mut crate::perf::Steps,
+    complete: bool,
 ) -> Result<(Vec<i64>, bool)> {
     let mut changed = false;
     let before = state.clone();
@@ -1068,12 +1198,17 @@ async fn sync_mailbox_locked(
         // reads only what it needs, often nothing (same HIGHESTMODSEQ).
         if mb.exists > 0 {
             changed |= refresh_flags(store, session, caps, &state, mb.highest_modseq, None).await?;
+        } else if let Some(t) = due(store, FULL_FLAGS, state.id, full_flags_every(caps, &state)) {
+            // No flags to read: checked, or the folder would stay due and be opened at every sync.
+            done(store, t);
         }
         steps.mark("flags");
         changed |= prefetch_bodies(store, session, &state).await? > 0;
         steps.mark("bodies");
         if let Some(names) = gmail_labels(store, &state)? {
-            changed |= complete_gmail(store, session, &state, &names).await?;
+            if complete {
+                changed |= complete_gmail(store, session, &state, &names).await?;
+            }
             changed |= read_gmail_threads(store, session, &state).await?;
             steps.mark("labels");
         }
@@ -1141,14 +1276,13 @@ async fn sync_mailbox_locked(
             // Only departures (a delete, a move to spam: Gmail's All Mail loses it): which cached
             // messages are still there, rather than the folder's whole list (200,000 UIDs).
             let cached: Vec<u32> = local.keys().copied().filter(|u| *u < next).collect();
-            if !cached.is_empty() {
-                let still = imap::uid_search_checked(session, &format!("UID {}", imap::uid_set(&cached)), 0).await?;
-                if let Some(known) = departures_only(&cached, still, departed, next) {
-                    let mut known = known;
-                    known.extend(arrived);
-                    server = Some(known);
-                    arrived_only = Some(next);
-                }
+            if !cached.is_empty()
+                && let Some(still) = still_listed(session, &cached).await?
+                && let Some(mut known) = departures_only(&cached, still, departed, next)
+            {
+                known.extend(arrived);
+                server = Some(known);
+                arrived_only = Some(next);
             }
         }
     }
@@ -1249,7 +1383,9 @@ async fn sync_mailbox_locked(
     changed |= prefetch_bodies(store, session, &state).await? > 0;
     steps.mark("bodies");
     if let Some(names) = gmail_labels(store, &state)? {
-        changed |= complete_gmail(store, session, &state, &names).await?;
+        if complete {
+            changed |= complete_gmail(store, session, &state, &names).await?;
+        }
         changed |= read_gmail_threads(store, session, &state).await?;
         steps.mark("labels");
     }
@@ -1331,6 +1467,25 @@ impl Unreadable {
             self.suspect.insert(uid);
         }
     }
+}
+
+/// The folder is cached whole (`here`: messages, unread) and its unread count differs from the
+/// server's: some flag here is out of date.
+fn unseen_disagrees(here: (i64, i64), status: imap::FolderStatus) -> bool {
+    let (Some(messages), Some(unseen)) = (status.messages, status.unseen) else { return false };
+    here.0 == i64::from(messages) && here.1 != i64::from(unseen)
+}
+
+/// Accounts whose folders' STATUS are asked one by one (see `sync_account_into`).
+fn slow_status() -> std::sync::MutexGuard<'static, HashSet<i64>> {
+    use std::sync::{Mutex, OnceLock};
+    static SET: OnceLock<Mutex<HashSet<i64>>> = OnceLock::new();
+    SET.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Time allowed for `folders` STATUS at once: the half second one takes on a slow server each.
+fn status_secs(folders: usize) -> u64 {
+    20 + folders as u64 / 2
 }
 
 fn unreadable() -> std::sync::MutexGuard<'static, HashMap<i64, Unreadable>> {
@@ -1458,6 +1613,7 @@ pub async fn fetch_headers(
     // Requested, not sent, no error: (UID, fetched alone).
     let mut short: Vec<(u32, bool)> = Vec::new();
     while let Some(batch) = batches.pop_front() {
+        let labels_before = if names.is_some() { label_changes_queued(store, &state)? } else { HashSet::new() };
         let (fetches, err) = fetch_header_batch(session, &batch, query).await;
         // Header parsing and the store's writer (another account's sync may hold it) off the async
         // worker.
@@ -1467,7 +1623,7 @@ pub async fn fetch_headers(
                 .iter()
                 .filter_map(|f| Some((f.uid?, f.gmail_labels()?.iter().map(|l| l.to_string()).collect())))
                 .collect();
-            crate::rt::offload(|| keep_server_labels(store, &state, names, &given))?;
+            crate::rt::offload(|| keep_server_labels(store, &state, names, &given, &labels_before))?;
         }
         done += batch.len();
         on_chunk(done);
@@ -1768,6 +1924,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn periodic_checks_are_spread_over_passes() {
+        let all = Scope::All;
+        let budget = periodic_budget(37);
+        assert_eq!(budget, PERIODIC_PER_PASS);
+        assert!((0..budget).all(|n| opens_for_check(true, false, &all, n, budget)));
+        assert!(!opens_for_check(true, false, &all, budget, budget), "the other folders wait for the next pass");
+        assert!(!opens_for_check(true, false, &Scope::System, budget, budget));
+        assert!(opens_for_check(true, false, &Scope::Folders(vec!["Clients".into()]), 40, budget), "folders asked for by name are read");
+        assert!(!opens_for_check(false, false, &all, 0, budget));
+        // An unread count that disagrees, a flag change given up: read at the next pass all the same.
+        assert!(opens_for_check(true, true, &all, budget, budget));
+        let id = 9_100_001;
+        assert!(!forced_check(id));
+        force_full_flags(id);
+        assert!(forced_check(id));
+        // Hundreds of quiet folders: all checked within the 6 hours.
+        assert!(periodic_budget(400) * 24 >= 400);
+    }
+
+    #[test]
     fn departures_are_found_among_the_cached_messages_only() {
         let cached = [10, 11, 12, 20];
         // One message deleted (Gmail: moved out of All Mail): the others are still there.
@@ -1831,6 +2007,45 @@ mod tests {
     }
 
     #[test]
+    fn an_unread_count_differing_from_the_server_rereads_all_flags() {
+        let status = |messages, unseen| imap::FolderStatus { messages: Some(messages), unseen: Some(unseen), ..Default::default() };
+        assert!(unseen_disagrees((5000, 12), status(5000, 13)), "an old message marked unread on the phone");
+        assert!(!unseen_disagrees((5000, 13), status(5000, 13)));
+        assert!(!unseen_disagrees((1000, 12), status(5000, 40)), "only the newest are cached: no telling");
+    }
+
+    #[tokio::test]
+    async fn a_refused_part_of_the_departure_search_is_no_deletion() {
+        use crate::imap::tests::scripted;
+        let mut ok = scripted(vec![("* SEARCH 1 3\r\n{tag} OK done", false)]).await;
+        assert_eq!(still_listed(&mut ok, &[1, 2, 3]).await.unwrap(), Some(HashSet::from([1, 3])));
+        let mut refused = scripted(vec![("{tag} NO [UNAVAILABLE] try later", false)]).await;
+        assert_eq!(still_listed(&mut refused, &[1, 2, 3]).await.unwrap(), None, "the whole list is read instead");
+        // Too scattered for a few searches: nothing asked, the whole list instead.
+        let scattered: Vec<u32> = (0..40_000).map(|n| n * 2).collect();
+        let mut idle = scripted(vec![]).await;
+        assert_eq!(still_listed(&mut idle, &scattered).await.unwrap(), None);
+    }
+
+    #[test]
+    fn labels_read_before_a_change_left_the_queue_do_not_undo_it() {
+        let (s, inbox) = store_with_folder();
+        let state = s.mailbox_state(inbox).unwrap();
+        let flags = crate::store::ServerFlags { seen: false, flagged: false, answered: false, draft: false };
+        let header = crate::mime::HeaderInfo { message_id: Some("m@x".into()), subject: "Avis".into(), date: 1, ..Default::default() };
+        let id = s.insert_header(state.account_id, inbox, 1, &header, flags, 10).unwrap();
+        let mairie = s.upsert_mailbox(state.account_id, "Mairie", Some("/"), None, true).unwrap();
+        s.set_labels(id, &[mairie]).unwrap();
+        let names = HashMap::from([("\\Inbox".to_string(), inbox), ("Mairie".to_string(), mairie)]);
+        // The archive (a label change) was queued when the FETCH started, and sent since: the
+        // answer still names the inbox.
+        let before = HashSet::from([1]);
+        assert!(!keep_server_labels(&s, &state, &names, &[(1, vec!["\\Inbox".into()])], &before).unwrap());
+        assert_eq!(s.message_labels(&[id]).unwrap()[&id], vec![mairie]);
+        assert!(keep_server_labels(&s, &state, &names, &[(1, vec!["\\Inbox".into()])], &HashSet::new()).unwrap());
+    }
+
+    #[test]
     fn periodic_checks_are_done_only_once_they_have_run() {
         let (s, _) = store_with_folder();
         // Folder numbers of their own: the map is shared with the other tests.
@@ -1847,6 +2062,11 @@ mod tests {
         let t = due(&s, FULL_LIST, id, 3600).expect("the request still stands");
         done(&s, t);
         assert!(due(&s, FULL_LIST, id, 3600).is_none());
+        // A folder whose periodic open fails waits for the next period, not the next pass.
+        let id = -4244;
+        assert!(peek_due(&s, FULL_FLAGS, id, 3600));
+        postpone_checks(id);
+        assert!(!peek_due(&s, FULL_FLAGS, id, 3600) && !peek_due(&s, FULL_LIST, id, 3600));
     }
 
     #[test]
@@ -1870,6 +2090,28 @@ mod tests {
         assert_eq!(read_quota(&mut session).await.unwrap(), Some((512 * 1024, 1024 * 1024)));
         let mut session = crate::imap::tests::scripted(vec![("* QUOTAROOT INBOX\r\n{tag} OK done", false)]).await;
         assert_eq!(read_quota(&mut session).await.unwrap(), None);
+    }
+
+    #[test]
+    fn a_draft_or_a_sent_message_does_not_search_all_mail_again() {
+        let folder = |role, is_label| MailboxState {
+            id: 1,
+            account_id: 1,
+            name: "[Gmail]/x".into(),
+            role,
+            selectable: true,
+            uidvalidity: None,
+            uidnext: None,
+            highestmodseq: None,
+            sync_from_uid: None,
+            server_count: None,
+            is_label,
+        };
+        assert!(!completes_gmail(&folder(Some(Role::Drafts), true)));
+        assert!(!completes_gmail(&folder(Some(Role::Sent), true)));
+        assert!(completes_gmail(&folder(Some(Role::Inbox), true)), "inbox arrivals complete the inbox");
+        assert!(completes_gmail(&folder(None, true)));
+        assert!(completes_gmail(&folder(Some(Role::Drafts), false)), "not a label: a folder of its own");
     }
 
     #[test]

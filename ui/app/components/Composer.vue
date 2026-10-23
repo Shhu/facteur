@@ -148,6 +148,15 @@ function onEdited() {
   timer = setTimeout(save, autosaveDelay())
 }
 
+/** Editor updates for the draft of session `of` only: an editor unmounting after another draft
+ *  replaced its own writes its last keys out, which must not land in the new one. */
+const htmlFor = (of: number) => (v: string) => {
+  if (draft.value && of === session.value) draft.value.html = v
+}
+const textFor = (of: number) => (text: string) => {
+  if (of === session.value) onText(text)
+}
+
 function onText(text: string) {
   const d = draft.value
   if (!d || d.body === text) return
@@ -425,6 +434,8 @@ const sender = computed({
     const next = Number(account)
     const nextFrom = alias || null
     if (next === d.account_id && nextFrom === (d.from ?? null)) return
+    // The last keys first: the signature is swapped in the text as typed.
+    editor.value?.flush()
     // The signature follows the sender: its block is replaced as a whole.
     const before = senderSignature(accountById(d.account_id), d.from)
     const after = senderSignature(accountById(next), nextFrom)
@@ -587,7 +598,6 @@ const { templates } = useTemplates()
 const { status: aiStatus } = useAi()
 const dictationReady = computed(() => !!aiStatus.value?.dictation_ready)
 const dictation = useDictation()
-const { locale } = useI18n()
 async function toggleDictation() {
   if (dictation.transcribing.value) return
   if (!dictation.recording.value) {
@@ -601,7 +611,7 @@ async function toggleDictation() {
   // Only into the draft it was said for: another one opened meanwhile gets nothing.
   const said = draft.value
   try {
-    const text = await dictation.stop(locale.value === 'en' ? 'en' : 'fr')
+    const text = await dictation.stop()
     if (text && draft.value === said && open.value) editor.value?.insert(`${escapeHtml(text)} `)
   } catch (e) {
     showError(e)
@@ -838,8 +848,8 @@ defineShortcuts({
             :used-bytes="attachedBytes"
             autofocus="start"
             :placeholder="$t('app.composer.bodyPlaceholder')"
-            @update:model-value="(v) => { if (draft) draft.html = v }"
-            @text="onText"
+            @update:model-value="htmlFor(session)"
+            @text="textFor(session)"
             @changed="onEdited"
             @files="attach"
           >
@@ -1036,8 +1046,8 @@ defineShortcuts({
               :used-bytes="attachedBytes"
               autofocus="start"
               :placeholder="$t('app.composer.bodyPlaceholder')"
-              @update:model-value="(v) => { if (draft) draft.html = v }"
-              @text="onText"
+              @update:model-value="htmlFor(session)"
+              @text="textFor(session)"
               @changed="onEdited"
               @files="attach"
             />

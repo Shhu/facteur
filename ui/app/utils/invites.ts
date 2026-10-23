@@ -17,6 +17,16 @@ const WEAK_PREFIXES: [RegExp, InviteKind][] = [
 ]
 /** Google's tail: "@ Fri Oct 23, 2026 8am - 11am (UTC+2) (me@x.com)". */
 const GOOGLE_TAIL = /\s+@\s+(?=[^@]*\d).*\(.*\)\s*$/
+/** The tail is looked for in the subject's last characters only: on a whole crafted subject
+ *  ("@ 1( @ 1( …") the pattern backtracks for minutes. */
+const TAIL_MAX = 200
+
+/** Where Google's tail starts in `text`, or -1. */
+function googleTail(text: string): number {
+  const from = Math.max(0, text.length - TAIL_MAX)
+  const m = GOOGLE_TAIL.exec(text.slice(from))
+  return m ? from + m.index : -1
+}
 
 /** Conservative: a weak prefix ("Invitation:", "Cancelled:") counts only with Google's date tail
  *  or an attachment (the .ics), never on its own. */
@@ -28,14 +38,15 @@ export function inviteFromSubject(subject: string, hasAttachments = false): { ki
   for (const [re, kind] of WEAK_PREFIXES) {
     if (!re.test(s)) continue
     const rest = s.replace(re, '')
-    if (!GOOGLE_TAIL.test(rest) && !hasAttachments) return null
+    if (googleTail(rest) < 0 && !hasAttachments) return null
     return { kind, title: clean(rest) || s }
   }
   return null
 }
 
 function clean(title: string): string {
-  return title.replace(GOOGLE_TAIL, '').trim()
+  const tail = googleTail(title)
+  return (tail < 0 ? title : title.slice(0, tail)).trim()
 }
 
 /** Google's change label, in French and English ("Changed: time"). */
@@ -110,7 +121,8 @@ export function meetingLink(invite: Pick<Invite, 'location' | 'description'> & {
  *  of underscores before the Teams block, and link-only lines. */
 export function inviteNotes(description: string | null): string | null {
   if (!description) return null
-  let text = /<[a-z][\s\S]*>/i.test(description) ? htmlLines(description) : description
+  // Bounded: "<a<a<a…" without a ">" made the open pattern quadratic on a long description.
+  let text = /<[a-z][^<>]{0,500}>/i.test(description.slice(0, 20_000)) ? htmlLines(description) : description
   text = text.split(/-::~[:~]*/)[0]!.split(/\n?_{10,}/)[0]!
   const lines = text.split('\n').filter(l => !/^\s*<?https?:\/\/\S+>?\s*$/.test(l) && !MEETING_LINKS.some(({ re }) => re.test(l)))
   const notes = lines.join('\n').replace(/\n{3,}/g, '\n\n').trim()

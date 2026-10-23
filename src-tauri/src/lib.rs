@@ -599,8 +599,8 @@ async fn retry_op(engine: Eng<'_>, id: i64) -> Res<()> {
 }
 
 #[tauri::command]
-async fn discard_op(engine: Eng<'_>, id: i64) -> Res<()> {
-    blocking(&engine, move |e| e.discard_op(id)).await
+async fn discard_op(engine: Eng<'_>, id: i64, created_at: i64) -> Res<()> {
+    blocking(&engine, move |e| e.discard_op(id, created_at)).await
 }
 
 #[tauri::command]
@@ -1461,6 +1461,9 @@ pub fn run() {
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
                 tracing::info!("facteur exiting");
+                // First: the AI process would finish a request, holding gigabytes meanwhile, and one
+                // waiting would start another nothing stops.
+                facteur_core::ai::shut_down();
                 // The servers are told: Outlook would otherwise turn down the next launch's
                 // sign-ins for a minute.
                 if let Some(engine) = app.try_state::<Arc<Engine>>() {
