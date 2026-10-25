@@ -69,13 +69,39 @@ fn unicode(host: &str) -> String {
 /// Domain a link text shows: its leading domain-like token once invisible characters are gone
 /// (a zero-width space must not split « pay\u{200B}pal.com » out of reach). Normalised like a URL
 /// host (IDNA mapping, fullwidth dots, case) so both sides of the comparison match.
+#[cfg(test)]
 fn shown_host(text: &str) -> Option<String> {
+    shown_hosts(text).into_iter().next()
+}
+
+/// Every domain a link text shows: the leading one, then each written-out address wherever it
+/// sits (« 🔒 https://www.paypal.com », « Voir : https://… »). All are compared: one further on
+/// must not cover the first (« paypal.com/signin?next=https://elsewhere »).
+fn shown_hosts(text: &str) -> Vec<String> {
     let t: String = text.chars().filter(|c| !crate::attachments::invisible(*c)).collect();
-    let t = t.trim_start();
-    let t = ["https://", "http://", "//"]
+    // The leading word, past brackets, arrows and quotes, and one scheme.
+    let lead = t.trim_start_matches(|c: char| !c.is_alphanumeric());
+    let lead = ["https://", "http://", "//"]
         .iter()
-        .find_map(|p| t.get(..p.len()).filter(|h| h.eq_ignore_ascii_case(p)).map(|_| &t[p.len()..]))
-        .unwrap_or(t);
+        .find_map(|p| lead.get(..p.len()).filter(|h| h.eq_ignore_ascii_case(p)).map(|_| &lead[p.len()..]))
+        .unwrap_or(lead);
+    let mut found: Vec<String> = domain_at(lead).into_iter().collect();
+    // ASCII lowering keeps byte offsets.
+    let lower = t.to_ascii_lowercase();
+    for p in ["https://", "http://"] {
+        for (i, _) in lower.match_indices(p) {
+            if let Some(d) = domain_at(&t[i + p.len()..])
+                && !found.contains(&d)
+            {
+                found.push(d);
+            }
+        }
+    }
+    found
+}
+
+/// The domain at the start of `t`, if its leading token is one.
+fn domain_at(t: &str) -> Option<String> {
     // Dots as IDNA reads them: ideographic and fullwidth full stops are dots too.
     let token: String = t
         .chars()
@@ -93,6 +119,11 @@ fn shown_host(text: &str) -> Option<String> {
     valid.then(|| bare(&unicode(&ascii)))
 }
 
+/// Characters that change the order text is displayed in.
+fn bidi_control(c: char) -> bool {
+    matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
 pub fn analyze(href: &str, text: &str) -> Option<LinkFacts> {
     let url = url::Url::parse(href.trim()).ok()?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -104,8 +135,16 @@ pub fn analyze(href: &str, text: &str) -> Option<LinkFacts> {
     let domain_ascii = if ip { ascii.clone() } else { registrable(&ascii) };
     let domain = if ip { ascii.clone() } else { unicode(&domain_ascii) };
 
-    let shown = shown_host(text);
-    let deceptive = shown.as_ref().is_some_and(|s| *s != host && !host.ends_with(&format!(".{s}")) && !s.ends_with(&format!(".{host}")));
+    let differs = |s: &String| *s != host && !host.ends_with(&format!(".{s}")) && !s.ends_with(&format!(".{host}"));
+    let candidates = shown_hosts(text);
+    let mut deceptive = candidates.iter().any(differs);
+    let mut shown = candidates.iter().find(|s| differs(s)).or(candidates.first()).cloned();
+    // Text reordered for display (`moc.lapyap` shown as `paypal.com`): what is read in it is not
+    // what the user sees, so the link is never taken at its word.
+    if text.chars().any(bidi_control) {
+        deceptive = true;
+        shown = shown.or_else(|| Some(text.chars().filter(|c| !crate::attachments::invisible(*c)).take(80).collect::<String>().trim().to_string()));
+    }
 
     let redirect_to = url
         .query_pairs()
@@ -390,6 +429,34 @@ pub struct LinkReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_domain_shown_after_brackets_or_words_is_still_compared() {
+        for text in ["[https://www.paypal.com/login]", "<https://www.paypal.com>", "🔒 https://www.paypal.com", "→ paypal.com/connexion", "« paypal.com »", "Voir : https://www.paypal.com"] {
+            let f = analyze("https://login-check.example/", text).unwrap();
+            assert!(f.deceptive, "{text}");
+        }
+        assert_eq!(shown_host("Voir paypal.com"), None, "a bare word first is no address");
+        assert!(!analyze("https://www.paypal.com/x", "[https://www.paypal.com/x]").unwrap().deceptive);
+    }
+
+    #[test]
+    fn an_address_further_in_the_text_does_not_cover_the_leading_domain() {
+        for text in ["www.paypal.com https://login-check.example", "paypal.com/signin?continue=https://login-check.example"] {
+            let f = analyze("https://login-check.example/", text).unwrap();
+            assert!(f.deceptive, "{text}");
+            assert_eq!(f.shown_host.as_deref(), Some("paypal.com"), "{text}");
+        }
+        assert!(!analyze("https://www.paypal.com/", "www.paypal.com https://www.paypal.com").unwrap().deceptive);
+    }
+
+    #[test]
+    fn text_reordered_for_display_is_never_taken_at_its_word() {
+        // Shown as « https://www.paypal.com », written backwards behind a right-to-left override.
+        let f = analyze("https://login-check.example/", "\u{202E}moc.lapyap.www//:sptth").unwrap();
+        assert!(f.deceptive && f.shown_host.is_some());
+        assert!(!analyze("https://www.paypal.com/", "www.paypal.com").unwrap().deceptive);
+    }
 
     #[test]
     fn reads_what_the_link_hides() {

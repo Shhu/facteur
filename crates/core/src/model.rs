@@ -298,6 +298,8 @@ pub enum Role {
     Archive,
     All,
     Flagged,
+    /// Gmail's Important label (`\Important`, RFC 8457), whatever the interface language names it.
+    Important,
     /// Created by facteur, no SPECIAL-USE equivalent.
     Snoozed,
     /// First messages from unknown senders, waiting for the user's decision (folder created by
@@ -317,6 +319,7 @@ impl Role {
             Role::Archive => "archive",
             Role::All => "all",
             Role::Flagged => "flagged",
+            Role::Important => "important",
             Role::Snoozed => "snoozed",
             Role::Screener => "screener",
             Role::Refused => "refused",
@@ -333,6 +336,7 @@ impl Role {
             "archive" => Role::Archive,
             "all" => Role::All,
             "flagged" => Role::Flagged,
+            "important" => Role::Important,
             "snoozed" => Role::Snoozed,
             "screener" => Role::Screener,
             "refused" => Role::Refused,

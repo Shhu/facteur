@@ -65,6 +65,8 @@ async function block() {
   if (!await confirm(t('mail.address.blockConfirm', { email: props.address.email }), { title: t('mail.address.block'), kind: 'warning' })) return
   try {
     await api.blockSender(props.address.email)
+    // Their inbox messages went to the junk folder: the list reads them again.
+    useListStale().bump()
     toast.add({ title: t('mail.address.blocked'), description: props.address.email, icon: 'i-lucide-ban' })
   } catch (e) {
     showError(e)

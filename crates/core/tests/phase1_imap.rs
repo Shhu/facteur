@@ -96,7 +96,7 @@ async fn drafts_history_and_server_search() {
 
     // Server search: finds outside the cache, in the body.
     store.clear_mailbox(inbox.id).unwrap();
-    let found = sync::search_server(&store, &mut s, &[store.mailbox_state(inbox.id).unwrap()], "parfait", 50).await.unwrap();
+    let found = sync::search_server(&store, &mut s, &[store.mailbox_state(inbox.id).unwrap()], "parfait", 50).await.unwrap().ids;
     assert_eq!(found.len(), 1, "the word only appears in the body of a reply");
     assert_eq!(store.summary(found[0]).unwrap().subject, "Re: Réunion lundi");
     s.logout().await.unwrap();

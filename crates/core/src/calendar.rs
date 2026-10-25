@@ -807,7 +807,9 @@ impl<'a> Shape<'a> {
             response: if self.own { None } else { self.response.clone() },
             attendees: shared.attendees.clone(),
             meeting: shared.meeting.clone(),
-            reminders: self.reminders(start),
+            // An alarm at a set time on a whole day is measured from the day's start here, as the
+            // event is shown and its reminders scheduled.
+            reminders: self.reminders(if let Stamp::Date(d) = at { local_midnight(d)? } else { start }, at.timestamp() == self.start.timestamp()),
             zone: if matches!(at, Stamp::Date(_)) { None } else { self.get("DTSTART").and_then(|l| l.param("TZID")).and_then(event_zone) },
         })
     }
@@ -848,13 +850,18 @@ impl<'a> Shape<'a> {
     }
 
     /// Minutes before `start` of its on-screen alarms (relative to the start, or at a date).
-    fn reminders(&self, start: i64) -> Vec<i64> {
+    /// `first`: the block's own start (a single event, or a series' first occurrence): an alarm
+    /// at a date belongs to it alone, not to every occurrence of the following weeks.
+    fn reminders(&self, start: i64, first: bool) -> Vec<i64> {
         let mut out: Vec<i64> = self
             .lines
             .iter()
             .filter(|l| l.name == ALARM && !l.param("RELATED").is_some_and(|r| r.eq_ignore_ascii_case("END")))
             .filter_map(|l| {
                 let before = if l.param("VALUE").is_some_and(|v| v.eq_ignore_ascii_case("DATE-TIME")) {
+                    if !first {
+                        return None;
+                    }
                     start - parse_utc(&l.value)?
                 } else {
                     let (days, secs) = duration(&l.value)?;
@@ -1754,7 +1761,11 @@ fn rework(block: &[String], drop: &[&str], add: Vec<String>, now: i64) -> Option
     let mut gone: HashSet<usize> = props.iter().filter(|(_, l)| drop.contains(&l.name.as_str()) || marks.contains(&l.name.as_str())).map(|(i, _)| *i).collect();
     if drop.contains(&"VALARM") {
         let lines: Vec<Line> = block.iter().filter_map(|l| parse_line(l)).collect();
-        let start = lines.iter().find(|l| l.name == "DTSTART").and_then(|l| stamp_of(l, &Zones::read(&lines))).and_then(Stamp::timestamp);
+        // As shown: a whole day's from its start here (see `Shape::instance`).
+        let start = lines.iter().find(|l| l.name == "DTSTART").and_then(|l| stamp_of(l, &Zones::read(&lines))).and_then(|s| match s {
+            Stamp::Date(d) => local_midnight(d),
+            s => s.timestamp(),
+        });
         let mut inside: Option<(usize, Vec<Line>)> = None;
         for (i, raw) in block.iter().enumerate() {
             let Some(l) = parse_line(raw) else { continue };
@@ -1990,6 +2001,28 @@ pub fn zone_named(name: &str) -> Option<(String, chrono_tz::Tz)> {
     Some((tz.name().to_string(), tz))
 }
 
+/// Days from `day` to the first of a weekly repetition's chosen days (0 when `day` is one, or
+/// for any other repetition): a series' first occurrence is on one of its days, never on a day
+/// the user left out.
+pub fn days_to_chosen(day: NaiveDate, repeat: Option<&crate::repeat::Repeat>) -> i64 {
+    let Some(r) = repeat.filter(|r| r.freq == crate::repeat::Freq::Weekly && !r.weekdays.is_empty()) else { return 0 };
+    let from = chrono::Datelike::weekday(&day).num_days_from_monday() as u8;
+    (0..7).find(|k| r.weekdays.contains(&((from + k) % 7))).map_or(0, i64::from)
+}
+
+/// `t` moved by `days` days of wall time (the same time of day across a change of hour), in
+/// `zone` (`None`, or a whole-day event: the computer's).
+pub fn moved_days(t: i64, days: i64, zone: Option<&str>, all_day: bool) -> Option<i64> {
+    use chrono::TimeZone;
+    if days == 0 {
+        return Some(t);
+    }
+    let tz = if all_day { crate::repeat::local_zone() } else { series_zone(zone) };
+    let Some((_, tz)) = tz else { return Some(t + days * 86400) };
+    let wall = Zone::Named(tz).wall(t)? + chrono::Duration::days(days);
+    tz.from_local_datetime(&wall).earliest().map(|d| d.timestamp())
+}
+
 /// The zone a timed series is written in: the one asked for, else the computer's.
 pub fn series_zone(asked: Option<&str>) -> Option<(String, chrono_tz::Tz)> {
     asked.and_then(zone_named).or_else(crate::repeat::local_zone)
@@ -2126,10 +2159,15 @@ impl Zone {
 /// new start, in the series' own zone, and the new length. The result does not depend on the
 /// series' current time, so a change sent twice gives the same series. Occurrences changed alone
 /// move along, and keep the texts they were given. `None`: not a series, or the change turns it
-/// into whole days or back (left to the calendar's own app).
-pub fn edit_series(ics: &str, changes: &EventChanges, current: (i64, i64, bool), now: i64) -> Option<String> {
+/// into whole days or back (left to the calendar's own app). `opened`: the original start of
+/// the occurrence the change was made from, if one changed alone: it takes the series' new
+/// time, rather than moving by as much again from its own.
+pub fn edit_series(ics: &str, changes: &EventChanges, current: (i64, i64, bool), opened: Option<i64>, now: i64) -> Option<String> {
     let mut parts = split(ics);
     let series = Series::read(&parts);
+    let opened_index = opened.and_then(|o| {
+        parts.iter().position(|p| matches!(p, Part::Event(b) if prop(b, "RECURRENCE-ID").is_some_and(|l| series.instant(&l) == Some(o))))
+    });
     let master_index = parts.iter().position(|p| matches!(p, Part::Event(b) if is_series(b) && !is_override(b)))?;
     let master = match &parts[master_index] {
         Part::Event(b) => b.clone(),
@@ -2153,29 +2191,53 @@ pub fn edit_series(ics: &str, changes: &EventChanges, current: (i64, i64, bool),
         None => (0, 0),
     };
     let old_text = |b: &[String], name: &str| prop(b, name).map(|l| unescape(&l.value).trim().to_string()).filter(|s| !s.is_empty());
-    for part in parts.iter_mut() {
+    for (index, part) in parts.iter_mut().enumerate() {
         let Part::Event(block) = part else { continue };
         let master_block = !is_override(block);
+        let follows = Some(index) == opened_index;
         let (mut drop, mut add) = (Vec::new(), Vec::new());
         // An occurrence keeps a text it was given apart from the series.
         for (name, new) in [("SUMMARY", changes.summary.clone().map(Some)), ("LOCATION", changes.location.clone()), ("DESCRIPTION", changes.description.clone())] {
             let Some(new) = new else { continue };
-            if master_block || old_text(block, name) == old_text(&master, name) {
+            if master_block || follows || old_text(block, name) == old_text(&master, name) {
                 drop.push(name);
                 add.extend(new.map(|v| text_line(name, &v)));
             }
         }
-        // Reminders and guests are the series' own: the occurrences changed alone keep theirs.
-        if master_block {
+        // Reminders and guests are the series' own: the occurrences changed alone keep theirs,
+        // except the one the change was made from.
+        if master_block || follows {
             let others = EventChanges { reminders: changes.reminders.clone(), attendees: changes.attendees.clone(), ..Default::default() };
             let (more_drop, more_add) = text_changes(&others, block);
             drop.extend(more_drop);
             add.extend(more_add);
         }
-        if changes.times.is_some() && delta != 0 || (master_block && changes.times.is_some()) {
+        if changes.times.is_some() && delta != 0 || ((master_block || follows) && changes.times.is_some()) {
             let props = own_props(block);
             for (_, l) in &props {
                 match l.name.as_str() {
+                    // The occurrence opened: on its own day (it may have been moved to another), at the
+                    // series' new time and length, as the form shows it.
+                    "DTSTART" if follows => {
+                        let rid = prop(block, "RECURRENCE-ID")?;
+                        let timed = |v: &str| v.trim().len() != 8;
+                        match changes.times {
+                            Some((start, end, _)) if timed(&rid.value) && timed(&l.value) => {
+                                let utc = rid.value.trim().ends_with(['Z', 'z']);
+                                let zone = if utc { Zone::Utc } else { series.zones.of(rid.param("TZID")) };
+                                let at = |t| zone.wall(t).map(|w| format!("{}{}", w.format("%Y%m%dT%H%M%S"), if utc { "Z" } else { "" }));
+                                add.push(format!("DTSTART{}:{}", params_of(&rid), at(start)?));
+                                add.push(format!("DTEND{}:{}", params_of(&rid), at(end.max(start))?));
+                            }
+                            _ => {
+                                let start = if timed(&l.value) { shift_value(&rid.value, delta)? } else { l.value.trim().to_string() };
+                                let length = if start.len() == 8 { duration.max(86400) } else { duration };
+                                add.push(format!("DTSTART{}:{start}", params_of(&rid)));
+                                add.push(format!("DTEND{}:{}", params_of(&rid), shift_value(&start, length)?));
+                            }
+                        }
+                    }
+                    "DTEND" | "DURATION" if follows => continue,
                     "DTSTART" if master_block => {
                         let start = shift_value(&l.value, delta)?;
                         let length = if start.len() == 8 { duration.max(86400) } else { duration };
@@ -2196,7 +2258,7 @@ pub fn edit_series(ics: &str, changes: &EventChanges, current: (i64, i64, bool),
                     _ => "RRULE",
                 });
             }
-            if master_block {
+            if master_block || follows {
                 drop.extend(["DTEND", "DURATION"]);
             }
         }
@@ -2298,7 +2360,26 @@ fn occurrence_block(parts: &mut Vec<Part>, series: &Series, original: i64) -> Op
         .filter(|(_, l)| matches!(l.name.as_str(), "RRULE" | "RDATE" | "EXDATE" | "EXRULE" | "RECURRENCE-ID" | "DTSTART" | "DTEND" | "DURATION"))
         .map(|(i, _)| i)
         .collect();
-    let mut block: Vec<String> = master.iter().enumerate().filter(|(i, _)| !skipped.contains(i)).map(|(_, l)| l.clone()).collect();
+    // An alarm at a set time rings for the series' first occurrence only: another one changed alone
+    // does not take it.
+    let first = series.instant(prop(master, "DTSTART").as_ref()?) == Some(original);
+    let mut dated = HashSet::new();
+    let mut alarm: Option<(usize, bool)> = None;
+    for (i, raw) in master.iter().enumerate() {
+        let Some(l) = parse_line(raw) else { continue };
+        let is_alarm = l.value.trim().eq_ignore_ascii_case("VALARM");
+        if l.name == "BEGIN" && is_alarm {
+            alarm = Some((i, false));
+        } else if l.name == "TRIGGER" && l.param("VALUE").is_some_and(|v| v.eq_ignore_ascii_case("DATE-TIME")) {
+            if let Some((_, at)) = alarm.as_mut() {
+                *at = true;
+            }
+        } else if l.name == "END" && is_alarm && let Some((begin, true)) = alarm.take() {
+            dated.extend(begin..=i);
+        }
+    }
+    let mut block: Vec<String> =
+        master.iter().enumerate().filter(|(i, _)| !skipped.contains(i) && (first || !dated.contains(i))).map(|(_, l)| l.clone()).collect();
     let end = block.pop()?;
     block.push(series.naming("RECURRENCE-ID", master, original)?);
     block.push(end);
@@ -2469,6 +2550,93 @@ ORGANIZER:mailto:a@example.org\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n");
         let found = instances(&ics, 1_790_000_000, 1_830_000_000, &[]);
         assert!(found.len() <= MAX_INSTANCES && !found.is_empty());
         assert!(found.iter().all(|i| i.description.as_ref().is_some_and(|d| d.len() <= 20_000) && i.attendees.len() <= MAX_GUESTS));
+    }
+
+    #[test]
+    fn the_occurrence_opened_takes_the_series_new_time_once() {
+        // Daily at 10:00 UTC; the 3 October one moved alone to 15:00.
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:d\r\nDTSTART:20261001T100000Z\r\nDTEND:20261001T110000Z\r\nRRULE:FREQ=DAILY;COUNT=10\r\nSUMMARY:x\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:d\r\nRECURRENCE-ID:20261003T100000Z\r\nDTSTART:20261003T150000Z\r\nDTEND:20261003T160000Z\r\nSUMMARY:x\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let original = Stamp::parse("20261003T100000Z", Zone::Utc, false).and_then(Stamp::timestamp).unwrap();
+        let moved = Stamp::parse("20261003T150000Z", Zone::Utc, false).and_then(Stamp::timestamp).unwrap();
+        // From that occurrence, the whole series set to 16:00.
+        let start = Stamp::parse("20261003T160000Z", Zone::Utc, false).and_then(Stamp::timestamp).unwrap();
+        let changes = EventChanges { times: Some((start, start + 3600, false)), ..Default::default() };
+        let out = edit_series(ics, &changes, (moved, moved + 3600, false), Some(original), 1_792_400_000).unwrap();
+        let unfolded = out.replace("\r\n ", "");
+        assert!(unfolded.contains("DTSTART:20261003T160000Z"), "{unfolded}");
+        assert!(!unfolded.contains("T210000Z"), "not moved by as much again from 15:00: {unfolded}");
+        assert!(unfolded.contains("DTSTART:20261001T160000Z"));
+    }
+
+    #[test]
+    fn an_occurrence_moved_to_another_day_keeps_its_day_and_takes_the_series_changes() {
+        // Daily at 10:00 UTC; the 3 October one moved alone to the 4th, same title.
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:d\r\nDTSTART:20261001T100000Z\r\nDTEND:20261001T110000Z\r\nRRULE:FREQ=DAILY;COUNT=10\r\nSUMMARY:x\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:d\r\nRECURRENCE-ID:20261003T100000Z\r\nDTSTART:20261004T100000Z\r\nDTEND:20261004T110000Z\r\nSUMMARY:moved\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let at = |v: &str| Stamp::parse(v, Zone::Utc, false).and_then(Stamp::timestamp).unwrap();
+        let (original, moved, start) = (at("20261003T100000Z"), at("20261004T100000Z"), at("20261004T160000Z"));
+        // From that occurrence, the whole series at 16:00 and renamed.
+        let changes = EventChanges { times: Some((start, start + 3600, false)), summary: Some("y".into()), ..Default::default() };
+        let out = edit_series(ics, &changes, (moved, moved + 3600, false), Some(original), 1_792_400_000).unwrap();
+        let unfolded = out.replace("\r\n ", "");
+        assert!(unfolded.contains("DTSTART:20261004T160000Z"), "{unfolded}");
+        assert!(!unfolded.contains("DTSTART:20261003T160000Z"), "not back to its original day: {unfolded}");
+        let opened = unfolded.split("BEGIN:VEVENT").find(|b| b.contains("RECURRENCE-ID")).unwrap();
+        assert!(opened.contains("SUMMARY:y"), "the occurrence opened takes the new title: {opened}");
+    }
+
+    #[test]
+    fn editing_the_reminders_of_a_whole_day_event_replaces_those_shown() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 2).unwrap();
+        let at = |t: i64| chrono::DateTime::from_timestamp(t, 0).unwrap().format("%Y%m%dT%H%M%SZ").to_string();
+        let (before, after) = (at(local_midnight(day).unwrap() - 60), at(local_midnight(day).unwrap() + 60));
+        let alarm = |t: &str| format!("BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:x\r\nTRIGGER;VALUE=DATE-TIME:{t}\r\nEND:VALARM\r\n");
+        let ics = format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a\r\nDTSTART;VALUE=DATE:20261002\r\nDTEND;VALUE=DATE:20261003\r\nSUMMARY:x\r\n{}{}END:VEVENT\r\nEND:VCALENDAR\r\n",
+            alarm(&before),
+            alarm(&after)
+        );
+        assert_eq!(instances(&ics, 1_790_000_000, 1_800_000_000, &[])[0].reminders, [1]);
+        let out = edit_event(&ics, &EventChanges { reminders: Some(vec![30]), ..Default::default() }, 1_792_400_000).unwrap().replace("\r\n ", "");
+        assert!(!out.contains(&before), "the one shown is replaced: {out}");
+        assert!(out.contains(&after), "the one not shown stays: {out}");
+    }
+
+    #[test]
+    fn an_occurrence_changed_alone_does_not_inherit_the_series_absolute_alarm() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:d\r\nDTSTART:20261001T100000Z\r\nDTEND:20261001T110000Z\r\nRRULE:FREQ=DAILY;COUNT=5\r\nSUMMARY:x\r\n\
+BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:x\r\nTRIGGER;VALUE=DATE-TIME:20261001T090000Z\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let third = Stamp::parse("20261003T100000Z", Zone::Utc, false).and_then(Stamp::timestamp).unwrap();
+        let out = edit_occurrence(ics, third, (third, third + 3600, false), &EventChanges { summary: Some("y".into()), ..Default::default() }, 1_792_400_000).unwrap();
+        let found = instances(&out, 1_790_000_000, 1_800_000_000, &[]);
+        assert_eq!(found.iter().find(|i| i.start == third).unwrap().reminders, Vec::<i64>::new());
+        assert_eq!(found.iter().find(|i| i.summary == "x" && i.start < third).map(|i| i.reminders.clone()), Some(vec![60]));
+    }
+
+    #[test]
+    fn an_alarm_at_a_time_on_a_whole_day_event_rings_then() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 2).unwrap();
+        let ring = local_midnight(day).unwrap() - 15 * 3600;
+        let trigger = chrono::DateTime::from_timestamp(ring, 0).unwrap().format("%Y%m%dT%H%M%SZ");
+        let ics = format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a\r\nDTSTART;VALUE=DATE:20261002\r\nDTEND;VALUE=DATE:20261003\r\nSUMMARY:x\r\n\
+BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:x\r\nTRIGGER;VALUE=DATE-TIME:{trigger}\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+        let found = instances(&ics, 1_790_000_000, 1_800_000_000, &[]);
+        assert_eq!(found[0].reminders, [900], "15 hours before the day begins here");
+    }
+
+    #[test]
+    fn an_alarm_at_a_date_rings_for_its_own_occurrence_only() {
+        // Daily from 1 October 2026 at 10:00 UTC, an alarm at 09:00 on the first day.
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:d\r\nDTSTART:20261001T100000Z\r\nDTEND:20261001T103000Z\r\nRRULE:FREQ=DAILY;COUNT=10\r\nSUMMARY:x\r\n\
+BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:x\r\nTRIGGER;VALUE=DATE-TIME:20261001T090000Z\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let found = instances(ics, 1_790_000_000, 1_800_000_000, &[]);
+        assert_eq!(found.len(), 10);
+        let ringing: Vec<_> = found.iter().filter(|i| !i.reminders.is_empty()).collect();
+        assert_eq!(ringing.len(), 1, "not once per occurrence at the same moment");
+        assert_eq!(ringing[0].reminders, [60]);
     }
 
     #[test]
@@ -2706,7 +2874,7 @@ SUMMARY:Point\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT10M\r\nEND:VALARM\
         // The whole series' reminders and guests change with it (CalDAV), not only its texts.
         let guest = crate::model::EventAttendee { email: "marie@example.org".into(), ..Default::default() };
         let changes = EventChanges { reminders: Some(vec![30]), attendees: Some(vec![guest]), ..Default::default() };
-        let out = edit_series(ics, &changes, (old.start, old.end, false), 1_792_400_100).unwrap();
+        let out = edit_series(ics, &changes, (old.start, old.end, false), None, 1_792_400_100).unwrap();
         assert!(out.contains("TRIGGER:-PT30M\r\n") && !out.contains("TRIGGER:-PT10M"), "{out}");
         assert!(out.replace("\r\n ", "").contains("mailto:marie@example.org"), "{out}");
     }
@@ -2795,7 +2963,7 @@ DTEND;TZID=Europe/Paris:20261019T170000\r\nSUMMARY:Point (décalé)\r\nLOCATION:
         // The 26th moved an hour later and lasting two: the whole series does.
         let current = (paris(2026, 10, 26, 14), paris(2026, 10, 26, 15), false);
         let changes = EventChanges { summary: Some("Point hebdo".into()), times: Some((paris(2026, 10, 26, 15), paris(2026, 10, 26, 17), false)), ..Default::default() };
-        let out = edit_series(WEEKLY, &changes, current, 1_792_400_000).unwrap();
+        let out = edit_series(WEEKLY, &changes, current, None, 1_792_400_000).unwrap();
         assert!(out.contains("DTSTART;TZID=Europe/Paris:20261005T150000\r\nDTEND;TZID=Europe/Paris:20261005T170000\r\n"));
         assert!(out.contains("EXDATE;TZID=Europe/Paris:20261012T150000\r\n") && out.contains("UNTIL=20261231T140000Z"));
         assert!(out.contains("RECURRENCE-ID;TZID=Europe/Paris:20261019T150000\r\n"), "the occurrence changed alone follows");
@@ -2808,9 +2976,9 @@ DTEND;TZID=Europe/Paris:20261019T170000\r\nSUMMARY:Point (décalé)\r\nLOCATION:
         assert_eq!(after[1].2, "Point (décalé)", "a title given apart is kept");
         // Into whole days: refused.
         let days = EventChanges { times: Some((paris(2026, 10, 26, 0), paris(2026, 10, 27, 0), true)), ..Default::default() };
-        assert!(edit_series(WEEKLY, &days, current, 0).is_none());
+        assert!(edit_series(WEEKLY, &days, current, None, 0).is_none());
         // Sent again (an answer lost on the way), the same change gives the same series.
-        let again = edit_series(&out, &changes, current, 1_792_400_000).unwrap();
+        let again = edit_series(&out, &changes, current, None, 1_792_400_000).unwrap();
         assert_eq!(occurrences(&again), after);
     }
 

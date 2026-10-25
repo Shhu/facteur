@@ -117,6 +117,7 @@ pub(super) struct Index {
 
 impl Index {
     pub fn open(root: &Path) -> Result<Self> {
+        let _other = crate::error::OtherDb::enter();
         std::fs::create_dir_all(root)?;
         let conn = Connection::open(root.join(INDEX_FILE))?;
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
@@ -129,16 +130,19 @@ impl Index {
 
     /// One transaction per batch: one disk write instead of one per message.
     pub fn begin(&self) -> Result<()> {
+        let _other = crate::error::OtherDb::enter();
         self.conn.execute_batch("BEGIN")?;
         Ok(())
     }
 
     pub fn commit(&self) -> Result<()> {
+        let _other = crate::error::OtherDb::enter();
         self.conn.execute_batch("COMMIT")?;
         Ok(())
     }
 
     pub fn upsert_folder(&self, path: &str, info: &FolderInfo) -> Result<()> {
+        let _other = crate::error::OtherDb::enter();
         self.conn.execute(
             "INSERT INTO folders (path, name, delimiter) VALUES (?1, ?2, ?3)
              ON CONFLICT (path) DO UPDATE SET name = excluded.name, delimiter = excluded.delimiter",
@@ -148,6 +152,7 @@ impl Index {
     }
 
     pub fn insert(&self, folder: &str, file: &str, received: i64, h: &HeaderInfo, size: u64) -> Result<()> {
+        let _other = crate::error::OtherDb::enter();
         let (base, flags) = split_info(file);
         let (from_name, from_addr) = match &h.from {
             Some(a) => (a.name.clone(), Some(a.email.clone())),
@@ -170,6 +175,7 @@ impl Index {
 
     /// The file was renamed (flags changed).
     pub fn rename(&self, folder: &str, file: &str) -> Result<()> {
+        let _other = crate::error::OtherDb::enter();
         let (base, flags) = split_info(file);
         self.conn.execute(
             "UPDATE entries SET file = ?3, flags = ?4 WHERE folder = ?1 AND base = ?2",
@@ -180,6 +186,7 @@ impl Index {
 
     /// Entries of a folder with this Message-ID: (base, file, size, received).
     pub fn copies(&self, folder: &str, message_id: &str) -> Result<Vec<(String, String, i64, i64)>> {
+        let _other = crate::error::OtherDb::enter();
         let mut st = self.conn.prepare_cached("SELECT base, file, size, received FROM entries WHERE folder = ?1 AND message_id = ?2")?;
         let rows = st.query_map(params![folder, message_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?;
         Ok(rows)
@@ -189,6 +196,7 @@ impl Index {
     /// Same Message-ID, size and arrival date (kept by a server's COPY and MOVE): two different
     /// messages are not taken for one on a reused Message-ID.
     pub fn elsewhere(&self, folder: &str, message_id: &str, size: i64, received: i64) -> Result<Option<(String, String)>> {
+        let _other = crate::error::OtherDb::enter();
         let mut st = self.conn.prepare_cached(
             "SELECT folder, file FROM entries WHERE message_id = ?2 AND size = ?3 AND received = ?4 AND folder <> ?1 ORDER BY id LIMIT 1",
         )?;
@@ -197,6 +205,7 @@ impl Index {
 
     /// `file` of `folder` is a copy of `source`: its headers are not read again.
     pub fn insert_copy(&self, source_folder: &str, source: &str, folder: &str, file: &str, received: i64) -> Result<()> {
+        let _other = crate::error::OtherDb::enter();
         let (base, flags) = split_info(file);
         self.conn.execute(
             "INSERT INTO entries
@@ -215,6 +224,7 @@ impl Index {
     /// Messages saved more than once (same Message-ID, same size: a Gmail label, an older backup
     /// that downloaded each copy): their files, (folder, file), by message.
     pub fn saved_twice(&self) -> Result<Vec<Vec<(String, String)>>> {
+        let _other = crate::error::OtherDb::enter();
         let mut st = self.conn.prepare(
             "SELECT message_id, size, folder, file FROM entries
              WHERE message_id IS NOT NULL AND (message_id, size) IN
@@ -238,6 +248,7 @@ impl Index {
 
     /// The file of an entry was renamed to a new base (taken over by a new UID).
     pub fn rebase(&self, folder: &str, old_base: &str, file: &str) -> Result<()> {
+        let _other = crate::error::OtherDb::enter();
         let (base, flags) = split_info(file);
         self.conn.execute(
             "UPDATE entries SET base = ?3, file = ?4, flags = ?5 WHERE folder = ?1 AND base = ?2",
@@ -247,6 +258,7 @@ impl Index {
     }
 
     pub fn refresh(&self, root: &Path) -> Result<()> {
+        let _other = crate::error::OtherDb::enter();
         let mut folders = Vec::new();
         collect_folders(root, &mut folders)?;
         let kept: HashSet<String> = folders.iter().map(|(dir, _)| rel_path(root, dir)).collect();
@@ -272,6 +284,7 @@ impl Index {
     }
 
     pub fn refresh_folder(&self, root: &Path, dir: &Path, info: &FolderInfo) -> Result<()> {
+        let _other = crate::error::OtherDb::enter();
         let rel = rel_path(root, dir);
         let tx = self.conn.unchecked_transaction()?;
         self.upsert_folder(&rel, info)?;
@@ -314,6 +327,7 @@ impl Index {
     }
 
     pub fn catalog(&self, filter: &RestoreFilter, limit: usize, offset: usize) -> Result<Catalog> {
+        let _other = crate::error::OtherDb::enter();
         // Per-folder counts: date/text/flag criteria without the folder filter.
         let (cond, args) = conditions(filter, false);
         let mut st = self.conn.prepare(&format!(
@@ -369,6 +383,7 @@ impl Index {
 
     /// The explicit selection when given, otherwise everything the filter matches.
     pub fn items(&self, filter: &RestoreFilter, ids: Option<&[i64]>) -> Result<Vec<Item>> {
+        let _other = crate::error::OtherDb::enter();
         let map = |r: &rusqlite::Row| {
             Ok(Item {
                 folder: r.get(0)?,
@@ -397,6 +412,7 @@ impl Index {
     }
 
     pub fn folder(&self, path: &str) -> Result<FolderInfo> {
+        let _other = crate::error::OtherDb::enter();
         self.conn
             .query_row("SELECT name, delimiter FROM folders WHERE path = ?1", [path], |r| {
                 Ok(FolderInfo { name: r.get(0)?, delimiter: r.get(1)? })
@@ -406,6 +422,7 @@ impl Index {
     }
 
     pub fn location(&self, id: i64) -> Result<(String, String)> {
+        let _other = crate::error::OtherDb::enter();
         self.conn
             .query_row("SELECT folder, file FROM entries WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?

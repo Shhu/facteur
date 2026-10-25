@@ -153,7 +153,7 @@ const PROGRAMS: &[&str] = &[
     "exe", "scr", "com", "pif", "cpl", "msi", "msix", "msp", "appx", "appxbundle", "dll", "bat", "cmd", "js", "jse",
     "vbs", "vbe", "wsf", "wsh", "hta", "ps1", "psm1", "jar", "lnk", "reg", "inf", "scf", "url", "application",
     "gadget", "msc", "sh", "app", "command", "apk", "deb", "rpm", "dmg", "pkg", "xll", "iqy", "slk", "py", "pyw",
-    "chm", "ws", "wsc", "sct", "one", "settingcontent-ms", "library-ms", "search-ms", "appref-ms", "website",
+    "chm", "ws", "wsc", "sct", "one", "settingcontent-ms", "searchconnector-ms", "library-ms", "search-ms", "appref-ms", "website",
     // Opened by a system tool that connects or installs: Remote Desktop, App Installer, themes
     // (a wallpaper on a share leaks the Windows password hash), troubleshooters.
     "rdp", "appinstaller", "theme", "themepack", "desktopthemepack", "diagcab", "xbap", "msh", "msh1", "msh2",
@@ -173,18 +173,45 @@ const ARCHIVES: &[&str] = &["zip", "rar", "7z", "gz", "tgz", "tar", "bz2", "xz",
 /// judged suspicious (saving one anyway, once warned, is no consent to running it).
 pub fn openable(report: &AttachmentReport, saved_as: &str) -> bool {
     let risky = |name: &str| {
-        ext(name).is_some_and(|e| [PROGRAMS, DISK_IMAGES, MACRO_OFFICE, ACTIVE_IMAGES].iter().any(|list| list.contains(&e.as_str())))
+        ext(name).is_some_and(|e| [PROGRAMS, DISK_IMAGES, MACRO_OFFICE, ACTIVE_IMAGES, WEB_DOCUMENTS].iter().any(|list| list.contains(&e.as_str())))
     };
-    report.kind != Kind::Executable && !report.trust.is_low() && !risky(&report.filename) && !risky(saved_as)
+    // The file's own name, not a folder of its path (« /home/j.doe/Facture »).
+    let saved = saved_as.rsplit(['/', '\\']).next().unwrap_or(saved_as);
+    // A web page by its content, or a name without an extension (the system then goes by the
+    // content, a browser for HTML): opened, it would run its scripts.
+    let unnamed = ext(saved).is_none();
+    report.kind != Kind::Executable && !report.trust.is_low() && !report.web_document && !unnamed && !risky(&report.filename) && !risky(saved)
 }
+
+/// Documents a browser opens and runs (XML may be XHTML, or styled by an XSLT).
+const WEB_DOCUMENTS: &[&str] = &["html", "htm", "xhtml", "xht", "xhtm", "shtml", "mht", "mhtml", "xml", "xsl", "xslt"];
+
+/// Text that is in fact a web document: what a browser would show and run.
+fn web_document(data: &[u8]) -> bool {
+    let head = String::from_utf8_lossy(&data[..data.len().min(512)]).trim_start_matches('\u{FEFF}').trim_start().to_ascii_lowercase();
+    // Any markup: with no doctype, `<body>` or `<script>` first is HTML to a browser and to the
+    // system's content sniffing.
+    let mut chars = head.chars();
+    let markup = chars.next() == Some('<') && chars.next().is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '!' | '?'));
+    // Nor after a few words: the system's content sniffing finds a page anywhere in its start.
+    markup || ["<!doctype html", "<html", "<head", "<body", "<script", "<title", "<iframe", "<svg", "<?xml"].iter().any(|t| head.contains(t))
+}
+
+/// Longer than any listed in [`PROGRAMS`] (`searchconnector-ms`): a shorter cap would let those
+/// through as no extension at all.
+const MAX_EXT: usize = 24;
 
 fn ext(name: &str) -> Option<String> {
     let (stem, e) = name.rsplit_once('.')?;
-    (!stem.is_empty() && !e.is_empty() && e.len() <= 12).then(|| e.trim().to_ascii_lowercase())
+    (!stem.is_empty() && !e.is_empty() && e.len() <= MAX_EXT && !e.contains(['/', '\\'])).then(|| e.trim().to_ascii_lowercase())
 }
 
-/// File names in a ZIP's central directory, and whether one is encrypted.
-fn zip_entries(data: &[u8]) -> (Vec<String>, bool) {
+/// Entries of a ZIP read at most: past them, what it holds is not known.
+const ZIP_ENTRIES: usize = 50_000;
+
+/// File names in a ZIP's central directory, whether one is encrypted, and whether there are
+/// more than [`ZIP_ENTRIES`].
+fn zip_entries(data: &[u8]) -> (Vec<String>, bool, bool) {
     let mut names = Vec::new();
     let mut encrypted = false;
     let mut i = 0;
@@ -198,11 +225,65 @@ fn zip_entries(data: &[u8]) -> (Vec<String>, bool) {
             names.push(String::from_utf8_lossy(name).into_owned());
         }
         i = at + 46 + len;
-        if names.len() >= 2000 {
-            break;
+        if names.len() >= ZIP_ENTRIES {
+            let more = data.get(i..).is_some_and(|rest| rest.windows(4).any(|w| w == b"PK\x01\x02"));
+            return (names, encrypted, more);
         }
     }
-    (names, encrypted)
+    (names, encrypted, false)
+}
+
+/// Code or a hidden file in a PDF: its names read with their `#xx` escapes (`/J#61vaScript`), in
+/// its compressed object streams too, where modern writers put the objects.
+fn pdf_active(data: &[u8]) -> bool {
+    const ACTIVE: [&[u8]; 8] = [b"/JavaScript", b"/JS", b"/Launch", b"/EmbeddedFile", b"/GoToR", b"/GoToE", b"/SubmitForm", b"/RichMedia"];
+    let found = |text: &[u8]| {
+        let names = unescaped_names(text);
+        ACTIVE.iter().any(|a| names.windows(a.len()).any(|w| w == *a))
+    };
+    if found(data) {
+        return true;
+    }
+    // Inflated with a budget: a crafted stream must not fill the memory.
+    let mut budget: u64 = 32 << 20;
+    let mut i = 0;
+    while budget > 0
+        && let Some(at) = data.get(i..).and_then(|rest| rest.windows(7).position(|w| w == b"/ObjStm")).map(|p| i + p)
+    {
+        let Some(start) = data.get(at..).and_then(|rest| rest.windows(6).position(|w| w == b"stream")).map(|p| at + p + 6) else { break };
+        let start = start + data.get(start..).map_or(0, |r| r.iter().take(2).take_while(|c| matches!(c, b'\r' | b'\n')).count());
+        let end = data.get(start..).and_then(|rest| rest.windows(9).position(|w| w == b"endstream")).map_or(data.len(), |p| start + p);
+        let mut out = Vec::new();
+        let read = std::io::Read::read_to_end(&mut std::io::Read::take(flate2::read::ZlibDecoder::new(&data[start..end]), budget), &mut out);
+        budget = budget.saturating_sub(out.len() as u64);
+        if (read.is_ok() || !out.is_empty()) && found(&out) {
+            return true;
+        }
+        i = end;
+    }
+    false
+}
+
+/// PDF names with their `#xx` escapes decoded.
+fn unescaped_names(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if !data.contains(&b'#') {
+        return std::borrow::Cow::Borrowed(data);
+    }
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == b'#'
+            && let (Some(h), Some(l)) = (data.get(i + 1).copied().and_then(hex), data.get(i + 2).copied().and_then(hex))
+        {
+            out.push(h << 4 | l);
+            i += 3;
+            continue;
+        }
+        out.push(data[i]);
+        i += 1;
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 fn contains(data: &[u8], needle: &[u8]) -> bool {
@@ -225,6 +306,9 @@ pub struct AttachmentReport {
     pub archive_entries: Vec<String>,
     pub archive_count: usize,
     pub trust: Trust,
+    /// Text whose content is a web document (HTML, XHTML, XML): never opened from facteur.
+    #[serde(skip)]
+    pub web_document: bool,
 }
 
 pub fn inspect(filename: &str, declared_mime: &str, data: &[u8], message_trust: Option<Level>) -> AttachmentReport {
@@ -252,7 +336,7 @@ pub fn inspect(filename: &str, declared_mime: &str, data: &[u8], message_trust: 
         note(&mut score, &mut reasons, -50, tr!("Fichier exécutable (.{e}) : l'ouvrir lance un programme sur l'ordinateur", "Executable file (.{e}): opening it runs a program on the computer"));
     } else if DISK_IMAGES.contains(&e) {
         note(&mut score, &mut reasons, -35, tr!("Image disque (.{e}) : souvent utilisée pour faire passer un programme", "Disk image (.{e}): often used to sneak in a program"));
-    } else if matches!(e, "html" | "htm" | "xhtml" | "xht" | "xhtm" | "shtml" | "mht" | "mhtml") {
+    } else if WEB_DOCUMENTS.contains(&e) {
         note(&mut score, &mut reasons, -25, tr!("Page web jointe : technique courante pour imiter une page de connexion", "Attached web page: a common trick to imitate a sign-in page"));
     }
     let disguised = !trapped && (filename.chars().any(invisible) || filename.trim_end() != filename.trim_end().trim_end_matches('.'));
@@ -284,7 +368,7 @@ pub fn inspect(filename: &str, declared_mime: &str, data: &[u8], message_trust: 
     let mut archive_count = 0;
     match detected {
         Detected::Zip => {
-            let (names, encrypted) = zip_entries(data);
+            let (names, encrypted, more) = zip_entries(data);
             let office = names.iter().any(|n| n.starts_with("word/") || n.starts_with("xl/") || n.starts_with("ppt/"));
             if office || MACRO_OFFICE.contains(&e) {
                 if names.iter().any(|n| n.to_ascii_lowercase().ends_with("vbaproject.bin")) || MACRO_OFFICE.contains(&e) {
@@ -294,7 +378,11 @@ pub fn inspect(filename: &str, declared_mime: &str, data: &[u8], message_trust: 
                 if encrypted {
                     note(&mut score, &mut reasons, -25, tr!("Archive protégée par mot de passe : son contenu échappe aux antivirus", "Password-protected archive: its content evades antivirus scanners"));
                 }
-                if let Some(bad) = names.iter().find(|n| ext(n).is_some_and(|x| PROGRAMS.contains(&x.as_str()) || DISK_IMAGES.contains(&x.as_str()))) {
+                if more {
+                    note(&mut score, &mut reasons, -25, tr!("Archive trop grande pour être vérifiée entièrement", "Archive too large to be checked entirely"));
+                }
+                // Judged as extracted: the last part of its path, trailing dots and spaces dropped.
+                if let Some(bad) = names.iter().find(|n| ext(&safe_filename(n)).is_some_and(|x| PROGRAMS.contains(&x.as_str()) || DISK_IMAGES.contains(&x.as_str()))) {
                     note(&mut score, &mut reasons, -40, tr!("L'archive contient un exécutable : {}", "The archive contains an executable: {}", bad.rsplit('/').next().unwrap_or(bad)));
                 }
                 archive_count = names.iter().filter(|n| !n.ends_with('/')).count();
@@ -304,7 +392,7 @@ pub fn inspect(filename: &str, declared_mime: &str, data: &[u8], message_trust: 
         Detected::Rar | Detected::SevenZip => note(&mut score, &mut reasons, -10, tr!("Archive dont facteur ne peut pas lire le contenu", "Archive whose content facteur cannot read")),
         Detected::Ole => note(&mut score, &mut reasons, -15, tr!("Ancien format Office : peut contenir des macros", "Legacy Office format: may contain macros")),
         Detected::Pdf => {
-            if contains(data, b"/JavaScript") || contains(data, b"/Launch") || contains(data, b"/EmbeddedFile") {
+            if pdf_active(data) {
                 note(&mut score, &mut reasons, -20, tr!("Le PDF contient du code ou un fichier caché (JavaScript, lancement, pièce intégrée)", "The PDF contains code or a hidden file (JavaScript, launch action, embedded file)"));
             }
         }
@@ -361,6 +449,8 @@ pub fn inspect(filename: &str, declared_mime: &str, data: &[u8], message_trust: 
         archive_entries,
         archive_count,
         trust: Trust { score, level, reasons },
+        // A NUL first makes it no text to facteur, still a page to a browser.
+        web_document: matches!(detected, Detected::Text | Detected::Unknown) && web_document(data),
     }
 }
 
@@ -417,6 +507,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn long_program_extensions_are_recognised() {
+        for name in ["x.desktopthemepack", "x.settingcontent-ms", "x.searchConnector-ms"] {
+            let e = ext(name).expect(name);
+            assert!(PROGRAMS.contains(&e.as_str()), "{name}");
+        }
+    }
+
+    #[test]
     fn a_disguised_name_does_not_hide_a_program() {
         for name in ["facture.pdf.js.", "facture.pdf.j\u{200B}s", "facture.pdf.js .."] {
             let report = inspect(name, "application/octet-stream", b"WScript.Shell", None);
@@ -460,6 +558,56 @@ mod tests {
         assert!(!openable(&rdp, "acces-vpn.rdp"), "Remote Desktop would connect to the sender's machine");
         let theme = inspect("noel.theme", "text/plain", b"[Control Panel\\Desktop]\nWallpaper=\\\\evil\\share\\a.jpg\n", None);
         assert!(!openable(&theme, "noel.theme"));
+        let xml = inspect("facture.xml", "text/xml", b"<?xml version=\"1.0\"?><html xmlns=\"http://www.w3.org/1999/xhtml\"><script>x()</script></html>", None);
+        assert!(!openable(&xml, "facture.xml"), "a browser would run its script");
+        let page = inspect("Facture", "application/octet-stream", b"<!DOCTYPE html><form action=https://x/>", None);
+        assert!(!openable(&page, "Facture"), "no extension: the system goes by the content");
+        let notes = inspect("notes.txt", "text/plain", b"Rendez-vous lundi", None);
+        assert!(openable(&notes, "notes.txt"));
+        assert!(openable(&notes, "/home/j.doe/notes.txt"));
+        // A dot in a folder of the path is no extension of the file.
+        let bare = inspect("Facture", "application/octet-stream", b"Bonjour", None);
+        assert!(!openable(&bare, "/home/j.doe/Downloads/Facture"));
+        assert!(!openable(&bare, "C:\\Users\\j.doe\\Facture"));
+        // Markup without a doctype is still what a browser (or the system's content sniffing) runs.
+        let body = inspect("Facture.v2", "application/octet-stream", b"<body><script>x()</script>", None);
+        assert!(!openable(&body, "Facture.v2"));
+        // Nor after a line of text, or a NUL that makes it binary to facteur.
+        let lead = inspect("Facture.v2", "application/octet-stream", b"Facture n 42\n<html><body><script>x()</script>", None);
+        assert!(!openable(&lead, "Facture.v2"));
+        let nul = inspect("Facture.v2", "application/octet-stream", b"\0<html><script>x()</script>", None);
+        assert!(!openable(&nul, "Facture.v2"));
+    }
+
+    #[test]
+    fn an_executable_in_an_archive_is_found_however_named_or_far() {
+        for name in ["facture.pdf.exe.", "scan/facture.pdf.exe .", "x.scr.."] {
+            let r = inspect("factures.zip", "application/zip", &zip_with(&[name], false), None);
+            assert!(r.trust.is_low(), "{name}: {:?}", r.trust);
+            assert!(!openable(&r, "factures.zip"));
+        }
+        let mut many: Vec<String> = (0..2000).map(|i| format!("f{i}.txt")).collect();
+        many.push("payload.exe".into());
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert!(!openable(&inspect("a.zip", "application/zip", &zip_with(&refs, false), None), "a.zip"));
+    }
+
+    #[test]
+    fn pdf_actions_are_found_escaped_or_compressed() {
+        let escaped = inspect("facture.pdf", "application/pdf", b"%PDF-1.7\n1 0 obj<</Type/Action/S/J#61vaScript/JS(app.alert(1))>>endobj", None);
+        assert!(escaped.trust.is_low(), "{:?}", escaped.trust);
+        assert!(!openable(&escaped, "facture.pdf"));
+        use std::io::Write;
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(b"1 0 2 40 <</S/Launch/F(cmd.exe)>>").unwrap();
+        let packed = z.finish().unwrap();
+        let mut pdf = format!("%PDF-1.7\n5 0 obj<</Type/ObjStm/N 1/First 4/Filter/FlateDecode/Length {}>>stream\n", packed.len()).into_bytes();
+        pdf.extend(&packed);
+        pdf.extend(b"\nendstream\nendobj");
+        let hidden = inspect("facture.pdf", "application/pdf", &pdf, None);
+        assert!(hidden.trust.is_low(), "{:?}", hidden.trust);
+        let plain = inspect("facture.pdf", "application/pdf", b"%PDF-1.7\n1 0 obj<</Type/Page/Annots[<</Subtype/Link/A<</S/URI/URI(https://x.example)>>>>]>>endobj", None);
+        assert_eq!(plain.trust.level, Level::High, "an ordinary invoice with a link");
     }
 
     #[test]

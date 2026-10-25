@@ -164,6 +164,63 @@ What remains to be done, by theme. Decisions already made are noted under each i
   by a style asking first, the message list no longer rebuilt at each sync, the microphone
   released when audio fails to start, forced flag checks not waiting their turn, AI requests left
   by the interface not run, dictation going before them, and no AI process started after quit.
+- Done (October 2026): a deep pass by fifteen specialists, 51 findings, all fixed, with
+  regression tests where a test can reach them. Among them: crafted formatting tags no longer
+  blowing up the HTML parser, a charset given only in the HTML (or none) read right, replies to
+  an original never received kept in one thread, Gmail server searches in a label read through
+  All Mail, a message restored from the bin into a label kept while its move waits, a Gmail
+  account without All Mail in IMAP moving its mail, arrivals left to the sync by server search, a
+  flag changed during the server's flag read kept, a send that may have gone given a new
+  Message-ID when edited even after Retry, sends retried with a fresh offline count, connect
+  failures no longer counted as dropped sessions, autoconfig refusing https-to-http redirects,
+  keychain reads bounded and not asked again every minute, the search index rebuilt from the
+  messages, indexes rebuilt after a damage report, a backup index's damage kept apart from the
+  database, a refused folder no longer stopping a backup, weekly series without a named day no
+  longer rebuilt on another day, an event saved again after a failure taking the new version,
+  CalDAV calendars changing often still read whole as the window moves, sender DNS records looked
+  up only for trusted senders, reordered (bidi) link text and blocked images' alt text checked,
+  long program extensions blocked, the open thread and short lists no longer re-rendered at each
+  sync, read changes and moves reflected past the first page, the single-instance lock in the
+  Flatpak, and the local AI's download and turn-off races.
+- Done (October 2026): a seventh pass by the same fifteen specialists, 49 findings, all fixed,
+  thirteen of them gaps in the sixth pass's own fixes, with regression tests where a test can
+  reach them. Among them: a damaged unique index no longer keeping facteur from starting (its
+  duplicates removed, a failing REINDEX offered as damage), the search index rebuild resumable and
+  safe beside the sync, the HTML parser guard bounding formatting tags left open times what
+  follows, links whose image or leading symbols hid the domain checked again, Gmail's sent
+  message no longer taken for a deleted draft, the calendar re-read whole when shown again, an
+  occurrence edited from a series moved once, alarms at a date ringing once, weekly series
+  starting on a chosen day, bottom-posted replies kept for the AI, blank text parts falling back
+  to the HTML, a Gmail label named Archive left a label, history fetch not re-syncing All Mail per
+  label, keychain and Outlook sign-in retries, scheduled sends waited for at quit, and the count
+  of a folder kept right when mail arrives during its sync.
+- Done (October 2026): an eighth pass by the same fifteen specialists, 40 findings, each checked
+  again by a reviewer asked to refute it, all fixed test first. Among them: the HTML guard
+  reading tags as the parser does (closing tags in attributes, comments or styles no longer
+  counted, tag names read once, nesting and stray end tags bounded), link text compared on every
+  domain it shows, a Gmail account whose All Mail is hidden from IMAP going back to folders, mail
+  sent from Gmail making correspondents and contacts (and leaving with its account), an
+  unreadable flag answer no longer stopping an account's sync, server search syncing the folders
+  of recent matches, a draft reopened after its upload showing the version saved, no Drafts
+  folder created before the folder list, follow-ups kept through out-of-office replies, a folder
+  locked for a while failing the backup rather than skipped for a day, a restore cut by a quit
+  going on in the same folder, the occurrence opened keeping its own day in a series change,
+  alarms at a time on whole days, the calendar token of a removed account forgotten, installing
+  one AI model keeping the other's cut download, and the message list and sidebar no longer
+  rebuilt whole during a sync.
+- Done (October 2026): a ninth pass by the same fifteen specialists, 36 findings, each checked
+  again by a reviewer asked to refute it, all fixed test first. Among them: the duplicate cleanup
+  after a damage report taking bodies and labels with the copies, a full disk or busy file at
+  that check no longer offered as damage, a folder left as a bare name on the server emptied, a
+  cached message with unreadable flags found and left out, Gmail's Important label known in every
+  language, a draft deleted or saved again while a save or deletion of it waits staying as the
+  user left it, an operation being sent no longer said discarded, accented recipient domains sent
+  in ASCII, the machine's name kept out of EHLO, invitations that may have gone said so, a reply
+  sent late flagging only the message it answers, executables in archives and PDF actions found
+  however hidden, an attribution-heavy mail no longer slow to open, ordinary unclosed formatting
+  kept, a restore to the original folders skipping what moved since the backup, a failed
+  self-update restart putting the previous exe back, all month names and abbreviations read for
+  appointments, and a model download stopping at once when asked.
 
 ## Distribution
 

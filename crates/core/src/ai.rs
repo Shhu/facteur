@@ -55,11 +55,12 @@ pub fn available() -> bool {
     cfg!(feature = "local-ai") && processor_supported()
 }
 
-/// The processor runs the AI's own code. On Windows it is built for AVX2 (with AVX, FMA, F16C and
-/// BMI2), which a Celeron, a Pentium Silver or an older processor lacks: the AI process would crash
-/// at its first request, the graphics card blamed.
+/// The processor runs the AI's own code. On x86-64 it is built for AVX2 (with AVX, FMA, F16C and
+/// BMI2: ggml's defaults on Windows, set explicitly in the Flatpak), which a Celeron, a Pentium
+/// Silver or an older processor lacks: the AI process would crash at its first request, the
+/// graphics card blamed.
 pub fn processor_supported() -> bool {
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     {
         std::arch::is_x86_feature_detected!("avx")
             && std::arch::is_x86_feature_detected!("avx2")
@@ -67,7 +68,7 @@ pub fn processor_supported() -> bool {
             && std::arch::is_x86_feature_detected!("f16c")
             && std::arch::is_x86_feature_detected!("bmi2")
     }
-    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    #[cfg(not(target_arch = "x86_64"))]
     true
 }
 
@@ -240,8 +241,17 @@ pub async fn download(model: &Model, dest: &Path, cancel: &std::sync::atomic::At
                     progress(done);
                 }
                 Ok(())
-            }
-            .await;
+            };
+            // Stopped while the network sends nothing: at once, not when the read times out.
+            let stopped = async {
+                while !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            };
+            let step = tokio::select! {
+                step = step => step,
+                () = stopped => Err(Error::Other(crate::tr!("téléchargement arrêté", "download stopped"))),
+            };
             match step {
                 Ok(()) => break,
                 Err(Error::Unreachable(e)) if !cancel.load(std::sync::atomic::Ordering::Relaxed) => {
@@ -250,12 +260,20 @@ pub async fn download(model: &Model, dest: &Path, cancel: &std::sync::atomic::At
                         return Err(Error::Unreachable(e));
                     }
                     tracing::info!("model download cut at {done} bytes ({e}): resuming");
-                    tokio::time::sleep(std::time::Duration::from_secs(5 * (1 << retries.min(4)))).await;
+                    // Stopped during the wait: at once, not after it.
+                    let wait = std::time::Instant::now() + std::time::Duration::from_secs(5 * (1 << retries.min(4)));
+                    while std::time::Instant::now() < wait {
+                        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Err(Error::Other(crate::tr!("téléchargement arrêté", "download stopped")));
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
                 }
                 Err(e) => return Err(e),
             }
         }
-        file.sync_all()?;
+        // Gigabytes written to the disk: off the async workers.
+        tokio::task::spawn_blocking(move || file.sync_all()).await.map_err(|e| Error::Other(e.to_string()))??;
         let digest: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
         if done != model.bytes || digest != model.sha256 {
             return Err(Error::Other(crate::tr!("fichier du modèle abîmé : téléchargez-le de nouveau", "damaged model file: download it again")));
@@ -264,7 +282,8 @@ pub async fn download(model: &Model, dest: &Path, cancel: &std::sync::atomic::At
         Ok(())
     }
     .await;
-    if res.as_ref().is_err_and(|e| !matches!(e, Error::Unreachable(_))) {
+    // Stopped by the user (even while the network was stalled): nothing left behind.
+    if res.as_ref().is_err_and(|e| cancel.load(std::sync::atomic::Ordering::Relaxed) || !matches!(e, Error::Unreachable(_))) {
         let _ = std::fs::remove_file(&part);
     }
     res
@@ -323,6 +342,8 @@ pub fn thread_text(messages: &[(String, i64, String)], budget: usize) -> String 
 /// an Outlook "From:" block) left out.
 pub fn fresh(body: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
+    // Some own text kept already: told once, not by reading back every line at each attribution.
+    let mut own = false;
     for line in body.lines() {
         let t = line.trim();
         let lower = folded(t);
@@ -331,12 +352,18 @@ pub fn fresh(body: &str) -> String {
             || lower.starts_with("-----original message")
             || lower.starts_with("-----message d'origine")
             || ((lower.starts_with("de :") || lower.starts_with("from:")) && !out.is_empty() && out.last().is_some_and(|l| l.trim().is_empty() || l.trim().starts_with("___")));
+        // Written below the quote (bottom-posting, inline replies): before any own text, the
+        // attribution only starts the quote, whose `>` lines are left out below.
         if quote_header {
-            break;
+            if own {
+                break;
+            }
+            continue;
         }
         if t.starts_with('>') {
             continue;
         }
+        own |= !t.is_empty();
         out.push(line);
     }
     let text = out.join("\n");
@@ -602,11 +629,13 @@ fn folded(text: &str) -> String {
         .collect()
 }
 
-const MONTHS: [(&str, u32); 31] = [
-    ("janvier", 1), ("janv", 1), ("january", 1), ("jan", 1), ("fevrier", 2), ("fevr", 2), ("february", 2), ("feb", 2),
-    ("mars", 3), ("march", 3), ("avril", 4), ("april", 4), ("apr", 4), ("mai", 5), ("may", 5), ("juin", 6), ("june", 6),
-    ("juillet", 7), ("july", 7), ("aout", 8), ("august", 8), ("aug", 8), ("septembre", 9), ("september", 9), ("sept", 9),
-    ("octobre", 10), ("october", 10), ("oct", 10), ("novembre", 11), ("november", 11), ("decembre", 12),
+// Not « mar » (mardi as much as mars).
+const MONTHS: [(&str, u32); 40] = [
+    ("janvier", 1), ("janv", 1), ("january", 1), ("jan", 1), ("fevrier", 2), ("fevr", 2), ("fev", 2), ("february", 2), ("feb", 2),
+    ("mars", 3), ("march", 3), ("avril", 4), ("avr", 4), ("april", 4), ("apr", 4), ("mai", 5), ("may", 5), ("juin", 6), ("june", 6),
+    ("jun", 6), ("juillet", 7), ("juil", 7), ("july", 7), ("jul", 7), ("aout", 8), ("august", 8), ("aug", 8), ("septembre", 9),
+    ("september", 9), ("sept", 9), ("sep", 9), ("octobre", 10), ("october", 10), ("oct", 10), ("novembre", 11), ("november", 11),
+    ("nov", 11), ("decembre", 12), ("december", 12), ("dec", 12),
 ];
 
 const WEEKDAYS: [(&str, u32); 14] = [
@@ -756,13 +785,16 @@ static CARD: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Turns the graphics card on or off for the local AI: the models in memory leave it, the next
 /// request loads them as asked.
-pub fn set_graphics(on: bool) {
-    if GRAPHICS.swap(on, std::sync::atomic::Ordering::SeqCst) != on {
+/// Whether it changed: the process running in the other mode is then the caller's to stop (a
+/// request under way first), the next request starting one in this mode anyway.
+pub fn set_graphics(on: bool) -> bool {
+    let changed = GRAPHICS.swap(on, std::sync::atomic::Ordering::SeqCst) != on;
+    if changed {
         #[cfg(feature = "local-ai")]
         worker::GPU_FAILED.store(false, std::sync::atomic::Ordering::SeqCst);
-        unload();
         *CARD.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
+    changed
 }
 
 /// The graphics card failed the local AI, in this session or an earlier one (see
@@ -1029,10 +1061,9 @@ mod run {
     fn answer(backend: &LlamaBackend, model: &LlamaModel, turns: &[Turn], max_tokens: usize, grammar: Option<&str>) -> std::result::Result<String, Failed> {
         let run = |e: &dyn std::fmt::Display| Failed::Run(e.to_string());
         let tokens = prompt_tokens(model, turns).map_err(Failed::Other)?;
-        let room = (tokens.len() + max_tokens + 16).min(model.n_ctx_train() as usize).max(512);
-        if tokens.len() + 16 >= room {
+        let Some((room, max_tokens)) = context_room(tokens.len(), max_tokens, model.n_ctx_train() as usize) else {
             return Err(Failed::Other(Error::Other(crate::tr!("texte trop long pour le modèle", "text too long for the model"))));
-        }
+        };
         let params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(room as u32))
             .with_n_batch(512)
@@ -1296,6 +1327,12 @@ mod worker {
                 let started = started.map_err(|e| Error::Other(crate::tr!("IA locale impossible à lancer : {e}", "the local AI could not start: {e}")))?;
                 *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = Some(started.child.clone());
                 *process = Some(started);
+                // A stop while it was starting found nothing to end: this one ends it.
+                if stopped_since(stops) {
+                    *process = None;
+                    *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    return Err(Error::Other(crate::tr!("IA locale arrêtée", "local AI stopped")));
+                }
             }
             let p = process.as_mut().expect("started");
             let (answer, late) = exchange_within(p, request, DEADLINE);
@@ -1586,6 +1623,15 @@ pub fn transcribe(_path: &Path, _samples: &[f32], _language: Option<&str>) -> Re
     Err(Error::Other(crate::tr!("cette version de facteur n'a pas l'IA locale", "this build of facteur has no local AI")))
 }
 
+/// The context for a prompt of `prompt` tokens and an answer of `max_tokens` at most, within what
+/// the model was trained on: (its size, the answer's room in it). `None` when the prompt leaves
+/// no room: the answer would run out of context midway (an error taken for the card's).
+#[cfg_attr(not(feature = "local-ai"), allow(dead_code))]
+fn context_room(prompt: usize, max_tokens: usize, trained: usize) -> Option<(usize, usize)> {
+    let room = (prompt + max_tokens + 16).min(trained).max(512);
+    (prompt + 16 < room).then(|| (room, max_tokens.min(room - prompt - 16)))
+}
+
 #[cfg(not(feature = "local-ai"))]
 pub fn unload() {}
 
@@ -1600,7 +1646,68 @@ pub fn unload_if_idle(_idle: std::time::Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn many_attributions_before_any_text_stay_quick() {
+        let body = "\nfrom:\n".repeat(200_000);
+        let started = std::time::Instant::now();
+        assert_eq!(fresh(&body), "");
+        let wrote = format!("{}Real text", "\nOn Mon, X wrote:\n".repeat(100_000));
+        assert_eq!(fresh(&wrote), "Real text");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    }
     use chrono::TimeZone;
+
+    #[test]
+    fn an_answer_fits_in_a_short_trained_context() {
+        assert_eq!(context_room(3800, 512, 4096), Some((4096, 280)));
+        assert_eq!(context_room(100, 512, 32_768), Some((628, 512)));
+        assert_eq!(context_room(4090, 512, 4096), None);
+        for prompt in [0, 500, 3000, 4000, 4079] {
+            if let Some((room, max)) = context_room(prompt, 512, 4096) {
+                assert!(prompt + max + 16 <= room, "{prompt}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_download_stalled_by_the_network_stops_when_asked() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = sock.read(&mut request).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n0123456789").await.unwrap();
+            // Then nothing more, the connection held open.
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        });
+        let model = Model {
+            id: "test",
+            name: "test",
+            tier: "light",
+            file: "test.gguf",
+            url: Box::leak(format!("http://{addr}/m").into_boxed_str()),
+            sha256: "",
+            bytes: 1000,
+            memory: 1,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("test.gguf");
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = cancel.clone();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            download(&model, &dest, &cancel, |done| {
+                if done >= 10 {
+                    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }),
+        )
+        .await;
+        assert!(res.expect("stopped without waiting for the network").is_err());
+    }
 
     #[test]
     fn a_cut_download_goes_on_from_its_part() {
@@ -1618,6 +1725,14 @@ mod tests {
         std::fs::write(&part, b"far too long for it").unwrap();
         assert_eq!(resumed(&part, 11).unwrap().2, 0);
         assert_eq!(std::fs::metadata(&part).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_reply_written_below_the_quote_is_kept() {
+        let bottom = "On Tue, Oct 20, 2026, Alice wrote:\n> Shall we meet Thursday?\n\nYes, 3pm works for me.";
+        assert_eq!(fresh(bottom).trim(), "Yes, 3pm works for me.");
+        let top = "Oui, jeudi 15h.\n\nLe mar. 20 oct. 2026, Alice a écrit :\n> On se voit jeudi ?";
+        assert_eq!(fresh(top).trim(), "Oui, jeudi 15h.");
     }
 
     #[test]
@@ -1738,6 +1853,9 @@ mod tests {
         assert_eq!(parse_when("on November 3rd, 10am to 11:15am", received), Some((d(11, 3), t(10, 0), t(11, 15))));
         assert_eq!(parse_when("le 1er août", received), Some((chrono::NaiveDate::from_ymd_opt(2027, 8, 1).unwrap(), None, None)), "past this year: next year's");
         assert_eq!(parse_when("le 05/11 à 18:00", received), Some((d(11, 5), t(18, 0), None)));
+        assert_eq!(parse_when("Thursday, December 3 at 2 pm", received), Some((d(12, 3), t(14, 0), None)));
+        assert_eq!(parse_when("jeudi 3 déc. à 14h", received), Some((d(12, 3), t(14, 0), None)));
+        assert_eq!(parse_when("Nov 5 at 10am", received), Some((d(11, 5), t(10, 0), None)));
         assert_eq!(parse_when("2026-12-24", received), Some((d(12, 24), None, None)));
         assert_eq!(parse_when("bientôt", received), None);
         assert_eq!(parse_when("le 3 novembre, salle 12", received).map(|w| w.1), Some(None), "a room number is no time");

@@ -215,7 +215,7 @@ const actions = (item: ListItem) => [
             :opened="opened"
             :selected="selected"
             :selecting="selecting"
-            :hovered="hovered"
+            :hovered="hovered === (rows[v.index] as Extract<Row, { kind: 'item' }>).item.key"
             :actions="actions"
             :row-id="rowId((rows[v.index] as Extract<Row, { kind: 'item' }>).item)"
             @click="onClick"

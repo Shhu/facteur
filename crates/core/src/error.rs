@@ -85,11 +85,17 @@ impl Error {
         use async_imap::error::Error as Imap;
         match self {
             Error::Dropped(_) | Error::Imap(Imap::ConnectionLost) => true,
-            Error::Imap(Imap::Io(e)) => !(e.kind() == std::io::ErrorKind::Other && e.to_string().contains("during parsing")),
-            Error::Io(e) => !is_local(e),
+            Error::Imap(Imap::Io(e)) => !is_parse_failure(e),
+            Error::Io(e) => !is_local(e) && !is_parse_failure(e),
             _ => false,
         }
     }
+}
+
+/// async-imap 0.12 reports a response it cannot parse as this I/O error, whether it reaches us
+/// wrapped (`Imap(Io)`) or straight from `read_response` (`Io`).
+pub(crate) fn is_parse_failure(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::Other && e.to_string().contains("during parsing")
 }
 
 fn is_local(e: &std::io::Error) -> bool {
@@ -140,10 +146,37 @@ impl std::error::Error for Error {
     }
 }
 
+thread_local! {
+    /// Another database is being used on this thread (a backup's index): its damage is not the
+    /// main database's.
+    static OTHER_DB: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// While it lives, SQLite errors on this thread are another database's (see [`OTHER_DB`]).
+pub struct OtherDb(());
+
+impl OtherDb {
+    pub fn enter() -> Self {
+        OTHER_DB.with(|n| n.set(n.get() + 1));
+        OtherDb(())
+    }
+}
+
+impl Drop for OtherDb {
+    fn drop(&mut self) {
+        OTHER_DB.with(|n| n.set(n.get().saturating_sub(1)));
+    }
+}
+
+/// A damaged main database, which the next start must check.
+fn marks_damage(e: &Error) -> bool {
+    e.is_damaged_db() && OTHER_DB.with(|n| n.get() == 0)
+}
+
 impl From<rusqlite::Error> for Error {
     fn from(e: rusqlite::Error) -> Self {
         let e = Error::Db(e);
-        if e.is_damaged_db()
+        if marks_damage(&e)
             && let Some(marker) = DAMAGE_MARKER.get()
         {
             // The next start checks the whole file and offers to set it aside (see `Store::open`):
@@ -190,6 +223,17 @@ impl Serialize for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn another_databases_damage_leaves_the_main_one_alone() {
+        let corrupt = Error::Db(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT), None));
+        assert!(marks_damage(&corrupt));
+        {
+            let _other = OtherDb::enter();
+            assert!(!marks_damage(&corrupt), "a backup index's damage is not the main database's");
+        }
+        assert!(marks_damage(&corrupt));
+    }
 
     #[test]
     fn local_disk_errors_are_not_called_network_errors() {

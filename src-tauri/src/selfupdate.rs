@@ -58,11 +58,7 @@ pub fn cleanup() {
 
 #[cfg(windows)]
 fn replace_and_restart(app: &AppHandle, bytes: &[u8]) -> Result<()> {
-    use std::io::Write as _;
-
     let exe = std::env::current_exe()?;
-    let new = exe.with_extension("exe.new");
-    let old = exe.with_extension("exe.old");
     let denied = |e: std::io::Error| {
         Error::Other(facteur_core::tr!(
             "impossible de remplacer {} ({e}) : placez facteur.exe dans un dossier où vous pouvez écrire",
@@ -71,36 +67,8 @@ fn replace_and_restart(app: &AppHandle, bytes: &[u8]) -> Result<()> {
         ))
     };
     tracing::info!(exe = %exe.display(), size = bytes.len(), "update: writing the new exe");
-    // Synced before the renames: a crash right after them must not leave a truncated exe.
-    let written = std::fs::File::create(&new).and_then(|mut file| {
-        file.write_all(bytes)?;
-        file.sync_all()
-    });
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&new);
-        return Err(denied(e));
-    }
-    let _ = std::fs::remove_file(&old);
-    // The running exe can be renamed, not overwritten.
-    if let Err(e) = std::fs::rename(&exe, &old) {
-        let _ = std::fs::remove_file(&new);
-        return Err(denied(e));
-    }
-    if let Err(e) = std::fs::rename(&new, &exe) {
-        let _ = std::fs::rename(&old, &exe);
-        let _ = std::fs::remove_file(&new);
-        return Err(denied(e));
-    }
-    tracing::info!("update: exe replaced, restarting");
     let pid = std::process::id();
-    if let Err(e) = std::process::Command::new(&exe).arg("--after-update").arg(pid.to_string()).spawn() {
-        // The new exe is in place: the next launch uses it.
-        tracing::error!("update: restart failed: {e}");
-        return Err(Error::Other(facteur_core::tr!(
-            "mise à jour installée, mais le redémarrage a échoué ({e}) : relancez facteur",
-            "update installed, but the restart failed ({e}): start facteur again"
-        )));
-    }
+    facteur_core::update::swap_and_launch(&exe, bytes, |exe| std::process::Command::new(exe).arg("--after-update").arg(pid.to_string()).spawn().map(drop), denied)?;
     tracing::info!(pid, "update: new instance started, quitting");
     app.exit(0);
     Ok(())

@@ -5,15 +5,15 @@ import type { Mailbox } from '~/utils/types'
  *  date) nor the containers that cannot hold messages. Special folders first, user folders after. */
 export function moveTargets(mailboxes: Mailbox[], accountId: number): Mailbox[] {
   const order: Partial<Record<NonNullable<Mailbox['role']>, number>> = { inbox: 0, all: 1, archive: 2, sent: 3, junk: 5, trash: 6 }
-  const rank = (m: Mailbox) => (m.role ? order[m.role] ?? 9 : isImportant(m) ? 4 : 7)
+  const rank = (m: Mailbox) => (isImportant(m) ? 4 : m.role ? order[m.role] ?? 9 : 7)
   return mailboxes
     .filter(m => m.account_id === accountId && m.selectable && m.role !== 'flagged' && m.role !== 'drafts' && m.role !== 'snoozed')
     .sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name))
 }
 
-/** Gmail's "Important" label is an ordinary folder over IMAP: it has no role of its own. */
+/** Gmail's "Important" label: told by the server (any language), or by its English name. */
 function isImportant(m: Mailbox): boolean {
-  return !m.role && /(^|[/.])important$/i.test(m.name)
+  return m.role === 'important' || (!m.role && /(^|[/.])important$/i.test(m.name))
 }
 
 export function folderLabel(m: Mailbox): string {

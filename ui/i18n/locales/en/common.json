@@ -19,6 +19,7 @@
       "archive": "Archive",
       "all": "All mail",
       "flagged": "Pinned",
+      "important": "Important",
       "snoozed": "Later",
       "screener": "New senders",
       "refused": "Screened out"

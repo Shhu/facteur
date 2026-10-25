@@ -300,6 +300,13 @@ async fn refresh_graph(refresh_token: &str, scopes: &str) -> Result<Tokens> {
     token_request(&app, &body).await
 }
 
+/// Not reached at all (offline, nothing answering): only a matter of waiting, as an IMAP server
+/// out of reach is (a sync after a wake is tried again soon).
+fn unreachable(e: reqwest::Error) -> Error {
+    let msg = crate::tr!("fournisseur OAuth injoignable : {e}", "OAuth provider unreachable: {e}");
+    if e.is_connect() || e.is_timeout() { Error::Unreachable(msg) } else { Error::Other(msg) }
+}
+
 async fn token_request(app: &App, body: &[(&str, &str)]) -> Result<Tokens> {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let form: Vec<String> = body.iter().map(|(k, v)| format!("{k}={}", urlencode(v))).collect();
@@ -312,7 +319,7 @@ async fn token_request(app: &App, body: &[(&str, &str)]) -> Result<Tokens> {
         .body(form.join("&"))
         .send()
         .await
-        .map_err(|e| Error::Other(crate::tr!("fournisseur OAuth injoignable : {e}", "OAuth provider unreachable: {e}")))?;
+        .map_err(unreachable)?;
     let status = resp.status();
     let text = resp.text().await.map_err(|e| Error::Other(e.to_string()))?;
     let json: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
@@ -463,6 +470,16 @@ pub(crate) fn urldecode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_oauth_provider_out_of_reach_is_unreachable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let e = reqwest::Client::new().post(format!("http://127.0.0.1:{port}/token")).send().await.unwrap_err();
+        assert!(matches!(unreachable(e), Error::Unreachable(_)));
+    }
 
     #[test]
     fn a_revoked_grant_is_told_apart_from_a_passing_failure() {

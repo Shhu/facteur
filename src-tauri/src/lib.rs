@@ -1221,13 +1221,22 @@ pub fn run() {
 
     let builder = tauri::Builder::default();
     // Registered first: a second launch (a mailto: link) is handed to the open window.
+    // In the Flatpak, the sandbox only lets the app own bus names under its own id: under the
+    // configured identifier, the name is refused and every launch would start a second engine on
+    // the same database.
     #[cfg(desktop)]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-        notify::focus(app);
-        if let Some(link) = mailclient::mailto_arg(&argv) {
-            let _ = app.emit("mailto", link);
+    let builder = builder.plugin({
+        let single = tauri_plugin_single_instance::Builder::new().callback(|app, argv, _cwd| {
+            notify::focus(app);
+            if let Some(link) = mailclient::mailto_arg(&argv) {
+                let _ = app.emit("mailto", link);
+            }
+        });
+        match std::env::var("FLATPAK_ID").ok().filter(|id| !id.is_empty()) {
+            Some(id) => single.dbus_id(id).build(),
+            None => single.build(),
         }
-    }));
+    });
     // Window geometry persists, not its visibility: it opens hidden until the UI has drawn.
     #[cfg(desktop)]
     let builder = builder.plugin({

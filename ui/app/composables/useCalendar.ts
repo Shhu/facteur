@@ -2,7 +2,7 @@ import twColors from 'tailwindcss/colors'
 import type { Account, CalendarEvent, CalendarInfo, CalendarStatus } from '~/utils/types'
 
 // The engine emits `calendar_changed` after a calendar sync (plugins/engine.client.ts bumps
-// `calendarTick`); the shared `tick` also reloads, spaced out.
+// `calendarTick`); the shared `tick` also reloads the events shown, spaced out.
 
 let watching = false
 let calendarsRequest = 0
@@ -43,8 +43,11 @@ export function useCalendar() {
     scope.run(() => {
       const reloader = useReloader(load)
       reloader.now()
+      // Calendars change through their own event: not reread at every mail sync. Their sync
+      // times move without one (a sync that changed nothing): read again a minute apart at most.
       watch(calendarTick, () => reloader.now())
-      watch(tick, reloader.schedule)
+      const slow = useReloader(load, 60_000)
+      watch(tick, slow.schedule)
       watch(() => accounts.value.map(a => a.id).join(), () => reloader.now())
     })
   }

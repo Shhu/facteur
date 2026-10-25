@@ -666,7 +666,64 @@ CREATE TABLE caldav_etags (
     PRIMARY KEY (calendar_id, href)
 ) WITHOUT ROWID;
 "#,
+r#"
+-- A send that may have reached the server once (tried, or cut by a quit), kept through "Retry":
+-- edited, it leaves under a new Message-ID, or receivers would drop it as the same message.
+ALTER TABLE outbox ADD COLUMN tried INTEGER NOT NULL DEFAULT 0;
+UPDATE outbox SET tried = 1 WHERE attempts > 0 OR error = 'interrupted';
+"#,
+r#"
+-- A folder's latest arrivals in order (the screener's usual verdicts, read from the inbox):
+-- 500 rows of the index rather than a sort of the whole folder.
+CREATE INDEX messages_box_arrival ON messages (mailbox_id, COALESCE(received_at, date));
+"#,
+r#"
+-- Gmail's labels: what was sent sits in All Mail with the Sent label, and its recipients were
+-- never written to (only a Sent folder's were).
+INSERT OR IGNORE INTO correspondents (account_id, email)
+SELECT m.account_id, lower(json_extract(j.value, '$.email'))
+FROM labels l JOIN mailboxes b ON b.id = l.mailbox_id AND b.role = 'sent' JOIN messages m ON m.id = l.message_id, json_each(m.to_list) j
+WHERE json_extract(j.value, '$.email') IS NOT NULL
+UNION
+SELECT m.account_id, lower(json_extract(j.value, '$.email'))
+FROM labels l JOIN mailboxes b ON b.id = l.mailbox_id AND b.role = 'sent' JOIN messages m ON m.id = l.message_id, json_each(m.cc_list) j
+WHERE json_extract(j.value, '$.email') IS NOT NULL;
+INSERT INTO contacts (email, name, written, seen, last)
+SELECT email, MAX(name), COUNT(*), COUNT(*), MAX(date) FROM (
+    SELECT lower(json_extract(j.value, '$.email')) AS email, NULLIF(json_extract(j.value, '$.name'), '') AS name, m.date AS date
+    FROM labels l JOIN mailboxes b ON b.id = l.mailbox_id AND b.role = 'sent' JOIN messages m ON m.id = l.message_id, json_each(m.to_list) j
+    UNION ALL
+    SELECT lower(json_extract(j.value, '$.email')), NULLIF(json_extract(j.value, '$.name'), ''), m.date
+    FROM labels l JOIN mailboxes b ON b.id = l.mailbox_id AND b.role = 'sent' JOIN messages m ON m.id = l.message_id, json_each(m.cc_list) j
+)
+WHERE email IS NOT NULL GROUP BY email
+ON CONFLICT (email) DO UPDATE SET
+    name = COALESCE(contacts.name, excluded.name),
+    written = MAX(contacts.written, excluded.written),
+    seen = MAX(contacts.seen, excluded.seen),
+    last = MAX(contacts.last, excluded.last);
+"#,
 ];
+
+/// A move into folder ?1 still on its way. With Gmail's labels, a move out of the bin or spam
+/// into a label (the inbox, "Mairie") lands in All Mail, where its placeholder waits.
+const MOVE_PENDING_INTO: &str = "EXISTS (SELECT 1 FROM pending_ops p JOIN mailboxes b ON b.account_id = p.account_id AND b.name = p.dest
+                                JOIN mailboxes here ON here.id = ?1 AND here.account_id = p.account_id
+                                WHERE p.failed = 0 AND (b.id = here.id OR (here.role = 'all' AND b.is_label = 1)))";
+
+/// A folder's UIDs whose flags changed here: the tick of the change, and when.
+type FlagMarks = HashMap<u32, (u64, std::time::Instant)>;
+
+/// Longer than any flag read of a folder: a mark older than that concerns no merge under way.
+const FLAG_MARKS_KEPT: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// A searched word as an FTS5 phrase, a prefix unless its last piece is one letter: the index
+/// splits `paul@g` into `paul g`, and the star applies to `g` alone.
+fn fts_word(w: &str) -> String {
+    let last = w.rsplit(|c: char| !c.is_alphanumeric()).find(|s| !s.is_empty()).map_or(0, |s| s.chars().count());
+    let star = if last < 2 { "" } else { "*" };
+    format!("\"{}\"{star}", w.replace('"', "\"\""))
+}
 
 const UID_COUNT: &str = "SELECT COUNT(uid) FROM messages WHERE mailbox_id = ?1";
 /// The unread rows alone, through their partial index: SQLite would otherwise pick the (mailbox_id,
@@ -783,6 +840,10 @@ pub struct Store {
     next_reader: std::sync::atomic::AtomicUsize,
     /// Last `PRAGMA shrink_memory` (seconds).
     last_shrink: std::sync::atomic::AtomicI64,
+    /// Flags changed here, per folder and UID, with the tick of the change: a sync merging the
+    /// server's flags read before then leaves them alone (see [`Store::flags_tick`]).
+    flag_marks: Mutex<HashMap<i64, FlagMarks>>,
+    flag_clock: std::sync::atomic::AtomicU64,
 }
 
 const READERS: usize = 3;
@@ -819,13 +880,21 @@ const VOUCHES: &str = "COALESCE(b.role, '') NOT IN ('junk', 'trash', 'screener',
     AND NOT EXISTS (SELECT 1 FROM labels vl JOIN mailboxes vb ON vb.id = vl.mailbox_id
                     WHERE vl.message_id = m.id AND vb.role IN ('screener', 'refused'))";
 
-/// Verdicts of an account's 500 latest arrivals (`?2`: the inbox only), by server and with
-/// their number of sender domains. Walks messages_account_arrival, whose expression it repeats.
+/// Verdicts of an account's 500 latest arrivals, by server and with their number of sender
+/// domains. Walks messages_account_arrival, whose expression it repeats.
 const USUAL_AUTHSERV: &str = "SELECT a, COUNT(*), COUNT(DISTINCT d) FROM (
         SELECT json_extract(m.signals, '$.authserv') AS a, lower(substr(m.from_addr, instr(m.from_addr, '@') + 1)) AS d
         FROM messages m JOIN mailboxes b ON b.id = m.mailbox_id
         WHERE m.account_id = ?1 AND COALESCE(b.role, '') NOT IN ('sent', 'drafts', 'junk', 'trash', 'screener', 'refused') AND m.signals IS NOT NULL
-          AND (?2 = 0 OR b.role = 'inbox')
+        ORDER BY COALESCE(m.received_at, m.date) DESC LIMIT 500)
+     WHERE a IS NOT NULL GROUP BY a ORDER BY 2 DESC";
+
+/// [`USUAL_AUTHSERV`] among the inbox's messages alone, read from the inbox's rows: walking the
+/// whole account's arrivals for them would read every archived message when the inbox is small.
+const USUAL_AUTHSERV_INBOX: &str = "SELECT a, COUNT(*), COUNT(DISTINCT d) FROM (
+        SELECT json_extract(m.signals, '$.authserv') AS a, lower(substr(m.from_addr, instr(m.from_addr, '@') + 1)) AS d
+        FROM messages m
+        WHERE m.mailbox_id = (SELECT id FROM mailboxes WHERE account_id = ?1 AND role = 'inbox' LIMIT 1) AND m.signals IS NOT NULL
         ORDER BY COALESCE(m.received_at, m.date) DESC LIMIT 500)
      WHERE a IS NOT NULL GROUP BY a ORDER BY 2 DESC";
 
@@ -1030,15 +1099,76 @@ fn check_integrity(path: &Path) -> Result<()> {
             return Err(Error::Db(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT), Some(report))));
         }
     }
-    tracing::info!("database checked after a damage report: sound");
+    // The commonest damage, an index out of step with its table, is not seen by quick_check:
+    // every index is built again from its table. While the unique index on (folder, UID) was
+    // wrong, the sync could add a second row for a message: the later copies go first (read
+    // from the table itself, not through that index), or REINDEX would refuse. Whatever still
+    // fails is damage: the set-aside offer, never a start that fails for good.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    // A passing failure (a full disk, a busy file) is said as such, the marker left to check again
+    // at the next start; anything else is damage, offered to be set aside.
+    let rebuilt = drop_duplicate_copies(&conn).and_then(|()| conn.execute_batch("REINDEX;")).map_err(|e| {
+        tracing::error!("database check failed (indexes not rebuilt): {e}");
+        use rusqlite::ErrorCode::*;
+        let passing = e.sqlite_error_code().is_some_and(|c| {
+            matches!(c, DiskFull | DatabaseBusy | DatabaseLocked | ReadOnly | PermissionDenied | CannotOpen | SystemIoFailure | OutOfMemory | OperationInterrupted)
+        });
+        if passing {
+            Error::Db(e)
+        } else {
+            Error::Db(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT), Some(e.to_string())))
+        }
+    });
+    rebuilt?;
+    tracing::info!("database checked after a damage report: sound, indexes rebuilt");
     Ok(())
+}
+
+/// The later copies of a message the sync added twice (while the unique index on folder and UID
+/// was wrong), read from the table itself. With what hangs on them (bodies, labels, references):
+/// a bare connection has foreign keys off, and a new message reusing a freed id would show a
+/// deleted copy's body.
+fn drop_duplicate_copies(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         BEGIN;
+         INSERT INTO handled_quiet VALUES (1);
+         DELETE FROM messages WHERE uid IS NOT NULL AND id NOT IN (SELECT MIN(id) FROM messages NOT INDEXED WHERE uid IS NOT NULL GROUP BY mailbox_id, uid);
+         DELETE FROM handled_quiet;
+         COMMIT;",
+    )
+    .inspect_err(|_| {
+        let _ = conn.execute_batch("ROLLBACK;");
+    })
 }
 
 /// Rows deleted per transaction when many go (a folder, an account): the writer is free between.
 const STEP_ROWS: usize = 2000;
+/// Raw bytes a step of the body index rebuild reads at most (one message beyond it is still read).
+const BODY_STEP_BYTES: usize = 32 << 20;
+
+/// The next stored bodies after `after`, as many as fit in `budget` bytes (one at least).
+fn body_step(db: &Connection, after: i64, budget: usize) -> Result<Vec<i64>> {
+    let mut st = db.prepare_cached("SELECT message_id, length(raw) FROM bodies WHERE message_id > ?1 ORDER BY message_id LIMIT 200")?;
+    let mut total = 0usize;
+    let mut ids = Vec::new();
+    for row in st.query_map([after], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
+        let (id, len) = row?;
+        total += len.max(0) as usize;
+        if total > budget && !ids.is_empty() {
+            break;
+        }
+        ids.push(id);
+    }
+    Ok(ids)
+}
 
 /// Set after a damage report: the full-text index is checked once facteur has started.
 const SEARCH_INDEX_CHECK: &str = "search_index_check";
+const SET_SETTING: &str = "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value";
+
+/// Where a rebuild of the search index stands (see `Store::rebuild_search_index`).
+const SEARCH_INDEX_REBUILD: &str = "search_index_rebuild";
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
@@ -1077,6 +1207,13 @@ impl Store {
     /// After a damage report, the full-text index checked, and built again from the messages when
     /// damaged. Whether it was.
     pub fn check_search_index(&self) -> Result<bool> {
+        // A rebuild cut short (a quit, an error) goes on: the part done passes the check below,
+        // the rest would never be indexed.
+        if self.setting(SEARCH_INDEX_REBUILD)?.is_some() {
+            self.rebuild_search_index()?;
+            self.db().execute("DELETE FROM settings WHERE key = ?1", [SEARCH_INDEX_CHECK])?;
+            return Ok(true);
+        }
         if self.setting(SEARCH_INDEX_CHECK)?.is_none() {
             return Ok(false);
         }
@@ -1086,12 +1223,99 @@ impl Store {
             Ok(r) if r.eq_ignore_ascii_case("ok") => false,
             found => {
                 tracing::warn!("search index damaged ({found:?}): built again");
-                self.db().execute("INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')", [])?;
+                self.set_setting(SEARCH_INDEX_REBUILD, "headers:0")?;
+                self.rebuild_search_index()?;
                 true
             }
         };
         self.db().execute("DELETE FROM settings WHERE key = ?1", [SEARCH_INDEX_CHECK])?;
         Ok(rebuilt)
+    }
+
+    /// The search index built again from the messages and their bodies, its own content not
+    /// trusted (FTS5's 'rebuild' reads it back, keeping what it lost). In steps, the writer let
+    /// go between them; where it stands is kept in [`SEARCH_INDEX_REBUILD`] (`headers:<id>` or
+    /// `bodies:<id>`), so a quit resumes it at the next start. Messages synced meanwhile index
+    /// themselves: a step only adds rows still missing, of messages still there.
+    fn rebuild_search_index(&self) -> Result<()> {
+        let (phase, mut after) = match self.setting(SEARCH_INDEX_REBUILD)?.as_deref().and_then(|v| v.split_once(':')) {
+            Some((phase, at)) => (phase.to_string(), at.parse::<i64>().unwrap_or(0)),
+            None => ("headers".to_string(), 0),
+        };
+        if phase == "headers" && after == 0 {
+            // Made anew, in one transaction (its content may be what is damaged, which a DELETE
+            // would need to read). The same table as the first migration's.
+            let mut db = self.db();
+            let tx = db.transaction()?;
+            tx.execute_batch(
+                "DROP TABLE IF EXISTS messages_fts;
+                 CREATE VIRTUAL TABLE messages_fts USING fts5 (subject, sender, recipients, body, tokenize = 'unicode61 remove_diacritics 2');",
+            )?;
+            tx.commit()?;
+        }
+        if phase == "headers" {
+            loop {
+                // id, subject, sender's name and address, To and Cc.
+                type Row = (i64, String, Option<String>, Option<String>, String, String);
+                let rows: Vec<Row> = {
+                    let db = self.read();
+                    let mut st = db.prepare_cached(
+                        "SELECT id, subject, from_name, from_addr, to_list, cc_list FROM messages WHERE id > ?1 ORDER BY id LIMIT ?2",
+                    )?;
+                    st.query_map(params![after, STEP_ROWS as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
+                        .collect::<std::result::Result<_, _>>()?
+                };
+                let Some(last) = rows.last().map(|r| r.0) else { break };
+                let mut db = self.db();
+                let tx = db.transaction()?;
+                {
+                    let mut st = tx.prepare_cached(
+                        "INSERT INTO messages_fts (rowid, subject, sender, recipients, body) SELECT ?1, ?2, ?3, ?4, ''
+                         WHERE EXISTS (SELECT 1 FROM messages WHERE id = ?1) AND NOT EXISTS (SELECT 1 FROM messages_fts WHERE rowid = ?1)",
+                    )?;
+                    for (id, subject, from_name, from_addr, to, cc) in &rows {
+                        let sender = from_addr.as_ref().map(|email| format_address(&Address { name: from_name.clone(), email: email.clone() })).unwrap_or_default();
+                        let list = |json: &str| serde_json::from_str::<Vec<Address>>(json).unwrap_or_default();
+                        let recipients = list(to).iter().chain(&list(cc)).map(format_address).collect::<Vec<_>>().join(" ");
+                        st.execute(params![id, subject, sender, recipients])?;
+                    }
+                }
+                tx.execute(SET_SETTING, params![SEARCH_INDEX_REBUILD, format!("headers:{last}")])?;
+                tx.commit()?;
+                after = last;
+            }
+            after = 0;
+        }
+        // Then each stored body's text, as when it was downloaded.
+        loop {
+            let (last, texts) = {
+                let db = self.read();
+                let step = body_step(&db, after, BODY_STEP_BYTES)?;
+                let Some(&last) = step.last() else { break };
+                // One raw message in memory at a time: only its text is kept.
+                let mut st = db.prepare_cached("SELECT raw FROM bodies WHERE message_id = ?1")?;
+                let mut texts: Vec<(i64, String)> = Vec::with_capacity(step.len());
+                for id in step {
+                    if let Some(raw) = st.query_row([id], |r| r.get::<_, Vec<u8>>(0)).optional()? {
+                        texts.push((id, crate::mime::body_info(&raw).text));
+                    }
+                }
+                (last, texts)
+            };
+            let mut db = self.db();
+            let tx = db.transaction()?;
+            {
+                let mut st = tx.prepare_cached("UPDATE messages_fts SET body = ?2 WHERE rowid = ?1")?;
+                for (id, text) in &texts {
+                    st.execute(params![id, text])?;
+                }
+            }
+            tx.execute(SET_SETTING, params![SEARCH_INDEX_REBUILD, format!("bodies:{last}")])?;
+            tx.commit()?;
+            after = last;
+        }
+        self.db().execute("DELETE FROM settings WHERE key = ?1", [SEARCH_INDEX_REBUILD])?;
+        Ok(())
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -1113,7 +1337,14 @@ impl Store {
         }
         // Query planner statistics, without waiting (time-limited).
         conn.execute_batch("PRAGMA optimize = 0x10002;")?;
-        Ok(Store { conn: Mutex::new(conn), readers: Vec::new(), next_reader: Default::default(), last_shrink: Default::default() })
+        Ok(Store {
+            conn: Mutex::new(conn),
+            readers: Vec::new(),
+            next_reader: Default::default(),
+            last_shrink: Default::default(),
+            flag_marks: Default::default(),
+            flag_clock: Default::default(),
+        })
     }
 
     /// Run now and then (after a sync): SQLite refreshes its statistics if the tables changed a lot.
@@ -1303,17 +1534,15 @@ impl Store {
                 break;
             }
         }
+        // Their counts again, from the mail left (as `contacts` counts: a message from them, or
+        // one sent to them, is seen; the latter written), or gone with nothing left. In the same
+        // transaction as the account's own row: cut before, the removal is tried again whole.
+        let written_to = self.written_to()?;
         let mut db = self.db();
         let tx = db.transaction()?;
         tx.execute("DELETE FROM accounts WHERE id = ?1", [id])?;
         tx.execute("DELETE FROM settings WHERE key IN ('sync_every:' || ?1, 'screener_release:' || ?1, 'single_connection:' || ?1, 'single_connection_offer:' || ?1)", [id])?;
-        tx.commit()?;
-        drop(db);
-        // Their counts again, from the mail left (as `contacts` counts: a message from them, or
-        // one sent to them, is seen; the latter written), or gone with nothing left.
-        let written_to = self.written_to()?;
-        let mut db = self.db();
-        let tx = db.transaction()?;
+        tx.execute("DELETE FROM settings WHERE substr(key, 1, length('restore_folder:' || ?1 || ':')) = 'restore_folder:' || ?1 || ':'", [id])?;
         {
             let mut from = tx.prepare_cached("SELECT COUNT(*), MAX(date) FROM messages WHERE lower(from_addr) = ?1")?;
             let mut forget = tx.prepare_cached("DELETE FROM contacts WHERE email = ?1")?;
@@ -1328,9 +1557,8 @@ impl Store {
                 }
             }
         }
+        tx.execute("DELETE FROM settings WHERE key = 'removing_contacts:' || ?1", [id])?;
         tx.commit()?;
-        drop(db);
-        self.delete_setting(&format!("removing_contacts:{id}"))?;
         Ok(())
     }
 
@@ -1350,13 +1578,15 @@ impl Store {
     /// Those every account wrote to: how many times, and the latest.
     fn written_to(&self) -> Result<HashMap<String, (i64, i64)>> {
         let db = self.read();
-        let mut st = db.prepare(
+        // A Sent folder's, or (Gmail) labelled Sent.
+        let sent = in_folder_where("m", "rb.role = 'sent'");
+        let mut st = db.prepare(&format!(
             "SELECT email, COUNT(*), MAX(date) FROM (
-                 SELECT lower(json_extract(j.value, '$.email')) AS email, m.date AS date FROM messages m JOIN mailboxes b ON b.id = m.mailbox_id, json_each(m.to_list) j WHERE b.role = 'sent'
+                 SELECT lower(json_extract(j.value, '$.email')) AS email, m.date AS date FROM messages m, json_each(m.to_list) j WHERE {sent}
                  UNION ALL
-                 SELECT lower(json_extract(j.value, '$.email')), m.date FROM messages m JOIN mailboxes b ON b.id = m.mailbox_id, json_each(m.cc_list) j WHERE b.role = 'sent'
-             ) WHERE email IS NOT NULL GROUP BY email",
-        )?;
+                 SELECT lower(json_extract(j.value, '$.email')), m.date FROM messages m, json_each(m.cc_list) j WHERE {sent}
+             ) WHERE email IS NOT NULL GROUP BY email"
+        ))?;
         let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?))))?.collect::<Result<_, _>>()?;
         Ok(rows)
     }
@@ -1364,13 +1594,13 @@ impl Store {
     /// Addresses of an account's mail: its senders, and those it wrote to.
     fn correspondents(&self, account_id: i64) -> Result<HashSet<String>> {
         let db = self.read();
-        let mut st = db.prepare(
+        let sent = in_folder_where("m", "rb.account_id = ?1 AND rb.role = 'sent'");
+        let mut st = db.prepare(&format!(
             "SELECT lower(from_addr) FROM messages WHERE account_id = ?1 AND from_addr IS NOT NULL
-             UNION SELECT lower(json_extract(j.value, '$.email')) FROM messages m JOIN mailboxes b ON b.id = m.mailbox_id, json_each(m.to_list) j
-                   WHERE b.role = 'sent' AND m.account_id = ?1
-             UNION SELECT lower(json_extract(j.value, '$.email')) FROM messages m JOIN mailboxes b ON b.id = m.mailbox_id, json_each(m.cc_list) j
-                   WHERE b.role = 'sent' AND m.account_id = ?1",
-        )?;
+             UNION SELECT lower(json_extract(j.value, '$.email')) FROM messages m, json_each(m.to_list) j WHERE m.account_id = ?1 AND {sent}
+             UNION SELECT lower(json_extract(j.value, '$.email')) FROM messages m, json_each(m.cc_list) j WHERE m.account_id = ?1 AND {sent}
+             UNION SELECT email FROM correspondents WHERE account_id = ?1"
+        ))?;
         let rows = st.query_map([account_id], |r| r.get::<_, Option<String>>(0))?.filter_map(|r| r.transpose()).collect::<Result<_, _>>()?;
         Ok(rows)
     }
@@ -1449,12 +1679,31 @@ impl Store {
             ),
             params![account_id, inbox_only],
         )?;
+        // Noted before the write, as for `set_flags_local`: a flag read under way does not make
+        // them unread again.
+        let places: Vec<(i64, u32)> = {
+            let mut st = tx.prepare(&format!(
+                "SELECT mailbox_id, uid FROM messages WHERE account_id = ?1 AND seen = 0 AND uid IS NOT NULL AND (?2 = 0 OR {inbox})"
+            ))?;
+            st.query_map(params![account_id, inbox_only], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
+        };
+        self.note_flag_changes(&places);
         tx.execute(
             &format!("UPDATE messages SET seen = 1 WHERE account_id = ?1 AND seen = 0 AND (?2 = 0 OR {inbox})"),
             params![account_id, inbox_only],
         )?;
         tx.commit()?;
         Ok(boxes)
+    }
+
+    /// UIDs in All Mail (`all`) of the unread messages labelled inbox (Gmail's labels).
+    pub fn unread_inbox_uids(&self, account_id: i64, all: i64) -> Result<Vec<u32>> {
+        let db = self.read();
+        let mut st = db.prepare(&format!(
+            "SELECT uid FROM messages WHERE mailbox_id = ?2 AND seen = 0 AND uid IS NOT NULL AND {} ORDER BY uid",
+            in_folder_where("messages", "rb.account_id = ?1 AND rb.role = 'inbox'")
+        ))?;
+        Ok(st.query_map(params![account_id, all], |r| r.get(0))?.collect::<Result<_, _>>()?)
     }
 
     pub fn account_stats(&self, account_id: i64, email: &str, now: i64) -> Result<AccountStats> {
@@ -1600,6 +1849,10 @@ impl Store {
         role: Option<Role>,
         selectable: bool,
     ) -> Result<i64> {
+        let was_selectable: Option<bool> = self
+            .read()
+            .query_row("SELECT selectable FROM mailboxes WHERE account_id = ?1 AND name = ?2", params![account_id, name], |r| r.get(0))
+            .optional()?;
         let db = self.db();
         db.execute(
             "INSERT INTO mailboxes (account_id, name, delimiter, role, selectable)
@@ -1609,11 +1862,15 @@ impl Store {
                 WHERE (delimiter, role, selectable) IS NOT (excluded.delimiter, excluded.role, excluded.selectable)",
             params![account_id, name, delimiter, role.map(Role::as_str), selectable],
         )?;
-        Ok(db.query_row(
-            "SELECT id FROM mailboxes WHERE account_id = ?1 AND name = ?2",
-            params![account_id, name],
-            |r| r.get(0),
-        )?)
+        let id = db.query_row("SELECT id FROM mailboxes WHERE account_id = ?1 AND name = ?2", params![account_id, name], |r| r.get(0))?;
+        drop(db);
+        // Deleted on the server while it held subfolders: only its name is left (\Noselect), its
+        // messages are gone. Selectable again some day, it starts over.
+        if was_selectable == Some(true) && !selectable {
+            self.clear_mailbox(id)?;
+            self.db().execute("UPDATE mailboxes SET uidvalidity = NULL, uidnext = NULL WHERE id = ?1", [id])?;
+        }
+        Ok(id)
     }
 
     /// Folders as stored, by IMAP name: (id, delimiter, role, selectable). Lets the sync write
@@ -1895,6 +2152,32 @@ impl Store {
         Ok(true)
     }
 
+    /// Gmail account whose All Mail is no longer listed (hidden from IMAP in Gmail's settings): its
+    /// labels go back to being folders, synced from the start (their copies were dropped as labels).
+    /// Converted again once All Mail is back.
+    pub fn revert_labels_model(&self, account_id: i64) -> Result<bool> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        let gone: bool = tx.query_row(
+            "SELECT labels_model = 1 AND NOT EXISTS (SELECT 1 FROM mailboxes WHERE account_id = ?1 AND role = 'all') FROM accounts WHERE id = ?1",
+            [account_id],
+            |r| r.get(0),
+        )?;
+        if !gone {
+            return Ok(false);
+        }
+        tx.execute("DELETE FROM labels WHERE mailbox_id IN (SELECT id FROM mailboxes WHERE account_id = ?1)", [account_id])?;
+        tx.execute(
+            "UPDATE mailboxes SET is_label = 0, server_count = NULL, count_base = NULL, server_unseen = NULL, uidvalidity = NULL,
+             uidnext = NULL, highestmodseq = NULL, sync_from_uid = NULL, checked_list_at = NULL, checked_flags_at = NULL
+             WHERE account_id = ?1 AND is_label = 1",
+            [account_id],
+        )?;
+        tx.execute("UPDATE accounts SET labels_model = 0 WHERE id = ?1", [account_id])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// The folder's unread count on the server when it was last synced (STATUS UNSEEN).
     pub fn server_unseen(&self, mailbox_id: i64) -> Result<Option<u32>> {
         Ok(self
@@ -1997,10 +2280,21 @@ impl Store {
 
     /// The labels the server gives these messages of `mailbox_id` (by UID, as label folder ids),
     /// except those whose labels are still being changed here (`keep`). Whether any changed.
-    pub fn set_server_labels(&self, mailbox_id: i64, labels: &[(u32, Vec<i64>)], keep: &HashSet<u32>) -> Result<bool> {
+    pub fn set_server_labels(&self, mailbox_id: i64, labels: &[(u32, Vec<i64>)], keep: &HashSet<u32>, since: u64) -> Result<bool> {
         let mut db = self.db();
+        let keep: HashSet<u32> = keep.union(&self.flags_touched(mailbox_id, since)).copied().collect();
+        let keep = &keep;
         let tx = db.transaction()?;
         let mut changed = false;
+        // Labelled Sent from now on (sent from Gmail or another client): its recipients are written
+        // to, as a Sent folder's.
+        let sent: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM mailboxes WHERE role = 'sent' AND account_id = (SELECT account_id FROM mailboxes WHERE id = ?1)",
+                [mailbox_id],
+                |r| r.get(0),
+            )
+            .optional()?;
         {
             let mut find = tx.prepare_cached("SELECT id FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
             let mut current = tx.prepare_cached("SELECT mailbox_id FROM labels WHERE message_id = ?1 ORDER BY mailbox_id")?;
@@ -2022,6 +2316,16 @@ impl Store {
                 clear.execute([id])?;
                 for b in &wanted {
                     add.execute(params![b, id])?;
+                }
+                if let Some(sent) = sent
+                    && wanted.contains(&sent)
+                    && !have.contains(&sent)
+                {
+                    let (account_id, to, cc, date): (i64, String, String, i64) = tx
+                        .prepare_cached("SELECT account_id, to_list, cc_list, date FROM messages WHERE id = ?1")?
+                        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+                    let list = |json: &str| serde_json::from_str::<Vec<Address>>(json).unwrap_or_default();
+                    note_written(&tx, account_id, list(&to).iter().chain(&list(&cc)), date)?;
                 }
             }
         }
@@ -2107,6 +2411,16 @@ impl Store {
     pub fn relabel(&self, labels: &[(i64, Vec<i64>)]) -> Result<()> {
         let mut db = self.db();
         let tx = db.transaction()?;
+        // Noted, as flags are: a label read under way does not put the old ones back.
+        let places: Vec<(i64, u32)> = {
+            let mut st = tx.prepare_cached("SELECT mailbox_id, uid FROM messages WHERE id = ?1 AND uid IS NOT NULL")?;
+            let mut out = Vec::new();
+            for (id, _) in labels {
+                out.extend(st.query_row([id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?);
+            }
+            out
+        };
+        self.note_flag_changes(&places);
         replace_labels(&tx, labels)?;
         tx.commit()?;
         Ok(())
@@ -2279,7 +2593,7 @@ impl Store {
     /// operation no longer counts: it will not run unless the user retries it, and the messages
     /// must come back meanwhile.
     pub fn in_flight_uids(&self, account_id: i64, mailbox: &str) -> Result<HashSet<u32>> {
-        self.op_uids(account_id, mailbox, "('move', 'move_set', 'delete', 'delete_set')")
+        self.op_uids(account_id, mailbox, "('move', 'move_set', 'delete', 'delete_set', 'save_draft')")
     }
 
     /// Message-IDs of the drafts a queued `delete_draft` (not failed) takes out of this folder:
@@ -2287,13 +2601,18 @@ impl Store {
     /// The sync must not fetch them back (a sent draft reopened and sent twice). A save of the
     /// same draft queued after it (a cancelled send) puts the draft back: not counted then.
     pub fn pending_draft_deletes(&self, account_id: i64, mailbox: &str) -> Result<HashSet<String>> {
+        // With Gmail's labels, drafts are read through All Mail but deleted from the Drafts label.
+        let drafts = match self.labels_model(account_id)? && self.mailbox_by_role(account_id, Role::All)?.is_some_and(|a| a.name == mailbox) {
+            true => self.mailbox_by_role(account_id, Role::Drafts)?.map(|d| d.name),
+            false => None,
+        };
         let db = self.read();
         let mut st = db.prepare(
-            "SELECT kind, op FROM pending_ops WHERE account_id = ?1 AND mailbox = ?2 AND failed = 0
+            "SELECT kind, op FROM pending_ops WHERE account_id = ?1 AND mailbox IN (?2, ?3) AND failed = 0
                AND kind IN ('delete_draft', 'save_draft') ORDER BY id",
         )?;
         let mut out = HashSet::new();
-        for row in st.query_map(params![account_id, mailbox], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+        for row in st.query_map(params![account_id, mailbox, drafts], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
             let (kind, op) = row?;
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&op) else { continue };
             let Some(mid) = v["message_id"].as_str() else { continue };
@@ -2443,11 +2762,11 @@ impl Store {
     pub fn insert_headers_held(&self, account_id: i64, mailbox_id: i64, batch: &[(u32, HeaderInfo, ServerFlags, u32)], hold: bool) -> Result<Vec<(i64, bool)>> {
         let mut db = self.db();
         let tx = db.transaction()?;
-        let sent = tx
-            .query_row("SELECT role = 'sent' FROM mailboxes WHERE id = ?1", [mailbox_id], |r| r.get::<_, Option<bool>>(0))
-            .optional()?
-            .flatten()
-            .unwrap_or(false);
+        let role: Option<String> = tx.query_row("SELECT role FROM mailboxes WHERE id = ?1", [mailbox_id], |r| r.get(0)).optional()?.flatten();
+        let sent = role.as_deref() == Some("sent");
+        // Spam and refused senders never become suggestions: a phisher sending often would come
+        // first when typing a name in To.
+        let unwanted = matches!(role.as_deref(), Some("junk" | "refused"));
         let mut ids = Vec::with_capacity(batch.len());
         for (uid, h, flags, size) in batch {
             let (id, new) = insert_header_tx(&tx, account_id, mailbox_id, *uid, h, *flags, *size)?;
@@ -2459,28 +2778,35 @@ impl Store {
                 tx.prepare_cached("UPDATE messages SET unscreened = 1 WHERE id = ?1")?.execute([id])?;
             }
             // Address book: the sender, and the recipients of what the user sends.
-            let mut contact = tx.prepare_cached(
-                "INSERT INTO contacts (email, name, written, seen, last) VALUES (lower(?1), NULLIF(?2, ''), ?3, 1, ?4)
-                 ON CONFLICT (email) DO UPDATE SET
-                    name = COALESCE(excluded.name, contacts.name),
-                    written = contacts.written + excluded.written,
-                    seen = contacts.seen + 1,
-                    last = MAX(contacts.last, excluded.last)",
-            )?;
-            if let Some(from) = &h.from {
-                contact.execute(params![from.email, from.name, 0, h.date])?;
+            if let Some(from) = h.from.as_ref().filter(|_| !unwanted) {
+                tx.prepare_cached(CONTACT_SEEN)?.execute(params![from.email, from.name, 0, h.date])?;
             }
             if sent {
-                let mut st = tx.prepare_cached("INSERT OR IGNORE INTO correspondents (account_id, email) VALUES (?1, lower(?2))")?;
-                for a in h.to.iter().chain(&h.cc) {
-                    st.execute(params![account_id, a.email])?;
-                    contact.execute(params![a.email, a.name, 1, h.date])?;
-                }
+                note_written(&tx, account_id, h.to.iter().chain(&h.cc), h.date)?;
             }
         }
         tx.commit()?;
         Ok(ids)
     }
+}
+
+/// A contact seen once more: (address, name, written, date).
+const CONTACT_SEEN: &str = "INSERT INTO contacts (email, name, written, seen, last) VALUES (lower(?1), NULLIF(?2, ''), ?3, 1, ?4)
+     ON CONFLICT (email) DO UPDATE SET
+        name = COALESCE(excluded.name, contacts.name),
+        written = contacts.written + excluded.written,
+        seen = contacts.seen + 1,
+        last = MAX(contacts.last, excluded.last)";
+
+/// The recipients of a message the account sent: correspondents, and written to in the address book.
+fn note_written<'a>(tx: &Connection, account_id: i64, recipients: impl Iterator<Item = &'a Address>, date: i64) -> Result<()> {
+    let mut correspondent = tx.prepare_cached("INSERT OR IGNORE INTO correspondents (account_id, email) VALUES (?1, lower(?2))")?;
+    let mut contact = tx.prepare_cached(CONTACT_SEEN)?;
+    for a in recipients {
+        correspondent.execute(params![account_id, a.email])?;
+        contact.execute(params![a.email, a.name, 1, date])?;
+    }
+    Ok(())
 }
 
 /// A new message's category: the user's choice for this sender, else "people" if the account
@@ -2745,8 +3071,45 @@ fn insert_header_tx(
 impl Store {
     /// Flags reported by the server. `keep`: UIDs with a local change waiting to leave, not to be
     /// overwritten with the server's still-old state.
-    pub fn update_flags(&self, mailbox_id: i64, updates: &[(u32, ServerFlags)], keep: &HashSet<u32>) -> Result<usize> {
+    /// Flags changed here on these (folder, UID): a merge of the server's flags read before now
+    /// leaves them alone. Called under the writer, before the change is written.
+    fn note_flag_changes(&self, places: &[(i64, u32)]) {
+        let tick = self.flag_clock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let mut marks = self.flag_marks.lock().unwrap();
+        // Old marks dropped once per folder and call: a whole account marked read names thousands.
+        let mut pruned = HashSet::new();
+        let now = std::time::Instant::now();
+        for (mailbox_id, uid) in places {
+            let folder = marks.entry(*mailbox_id).or_default();
+            if folder.len() > 1000 && pruned.insert(*mailbox_id) {
+                folder.retain(|_, (_, at)| at.elapsed() < FLAG_MARKS_KEPT);
+            }
+            folder.insert(*uid, (tick, now));
+        }
+    }
+
+    /// The folder's UIDs whose flags or labels changed here after `since`. Read under the writer.
+    fn flags_touched(&self, mailbox_id: i64, since: u64) -> HashSet<u32> {
+        self.flag_marks
+            .lock()
+            .unwrap()
+            .get(&mailbox_id)
+            .map(|marks| marks.iter().filter(|(_, (tick, _))| *tick > since).map(|(uid, _)| *uid).collect())
+            .unwrap_or_default()
+    }
+
+    /// Now, for [`Store::update_flags`]: taken before the server's flags are asked for.
+    pub fn flags_tick(&self) -> u64 {
+        self.flag_clock.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `since`: the tick taken before the server's flags were read; a flag changed here after it
+    /// (marked read while the FETCH ran, or just before this write) is not put back to the older
+    /// value. Checked while holding the writer, which every local change takes too.
+    pub fn update_flags(&self, mailbox_id: i64, updates: &[(u32, ServerFlags)], keep: &HashSet<u32>, since: u64) -> Result<usize> {
         let mut db = self.db();
+        let keep: HashSet<u32> = keep.union(&self.flags_touched(mailbox_id, since)).copied().collect();
+        let keep = &keep;
         let tx = db.transaction()?;
         let mut changed = 0;
         {
@@ -2844,6 +3207,9 @@ impl Store {
         offset: usize,
     ) -> Result<Vec<ThreadSummary>> {
         let db = self.read();
+        // One snapshot for every statement: a sync committing between the page and its messages
+        // would leave blank rows, or show held mail.
+        let _snapshot = db.unchecked_transaction()?;
         let boxes = Boxes::of(&db, mailbox_ids)?;
         let mut conds: Vec<String> = Vec::new();
         match filter {
@@ -3002,6 +3368,7 @@ impl Store {
             t.mailbox_id = mailbox_id;
         }
         drop(st);
+        threads.retain(|t| t.latest_id != 0);
         // Gmail's All Mail: the labels its messages carry, as Gmail shows them (the inbox and the
         // user's folders; Gmail's own system folders, the bin and facteur's folders left out).
         let all_mail: bool = db.query_row(
@@ -3108,6 +3475,22 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// The contacts kept of an address book whose ids start with `prefix` (a CardDAV book's
+    /// path): what to keep of a book that failed to answer this time.
+    pub fn address_book_under(&self, account_id: i64, prefix: &str) -> Result<Vec<crate::contacts::Contact>> {
+        let db = self.read();
+        let mut st = db.prepare("SELECT remote_id, name, email FROM address_book WHERE account_id = ?1 AND substr(remote_id, 1, length(?2)) = ?2 ORDER BY remote_id")?;
+        let mut out: Vec<crate::contacts::Contact> = Vec::new();
+        for row in st.query_map(params![account_id, prefix], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?)))? {
+            let (remote_id, name, email) = row?;
+            match out.last_mut().filter(|c| c.remote_id == remote_id) {
+                Some(c) => c.emails.push(email),
+                None => out.push(crate::contacts::Contact { remote_id, name, emails: vec![email] }),
+            }
+        }
+        Ok(out)
     }
 
     /// `synced`: the address book was just replaced.
@@ -3597,11 +3980,17 @@ impl Store {
         if let Some(text) = c.body.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             // Every word must appear in the body (prefix match, like the search box). Gmail keeps
             // one body for several copies of a message: the copies match too.
-            let query = text
+            // A token without a letter or digit (« : », « - », « € ») is an empty phrase to FTS5,
+            // which an explicit AND turns into no match at all.
+            let words: Vec<String> = text
                 .split_whitespace()
+                .filter(|w| w.chars().any(char::is_alphanumeric))
                 .map(|w| format!("body:\"{}\"*", w.replace('"', "\"\"")))
-                .collect::<Vec<_>>()
-                .join(" AND ");
+                .collect();
+            if words.is_empty() {
+                cond.push("0".into());
+            }
+            let query = if words.is_empty() { "\"\"".to_string() } else { words.join(" AND ") };
             cond.push(
                 "(m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)
                   OR (m.message_id IS NOT NULL AND (m.account_id, m.message_id) IN (
@@ -3730,10 +4119,7 @@ impl Store {
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
-        self.db().execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )?;
+        self.db().execute(SET_SETTING, params![key, value])?;
         Ok(())
     }
 
@@ -3786,9 +4172,9 @@ impl Store {
         // sits there; the other folders only when it says nothing.
         // The winner must come from several sender domains: one sender alone, sending enough
         // messages with a planted verdict, does not teach it.
-        let mut st = db.prepare(USUAL_AUTHSERV)?;
-        for inbox_only in [true, false] {
-            let counts: Vec<(String, i64, i64)> = st.query_map(params![account_id, inbox_only], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+        for sql in [USUAL_AUTHSERV_INBOX, USUAL_AUTHSERV] {
+            let mut st = db.prepare_cached(sql)?;
+            let counts: Vec<(String, i64, i64)> = st.query_map([account_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
             let total: i64 = counts.iter().map(|(_, n, _)| n).sum();
             if let Some((a, ..)) = counts.into_iter().next().filter(|(_, n, domains)| *n >= 5 && n * 100 >= total * 60 && *domains >= 3) {
                 return Ok(Some(a));
@@ -4164,10 +4550,7 @@ impl Store {
         let fts: String = q
             .words
             .iter()
-            .map(|w| {
-                let star = if w.chars().filter(|c| c.is_alphanumeric()).count() < 2 { "" } else { "*" };
-                format!("\"{}\"{star}", w.replace('"', "\"\""))
-            })
+            .map(|w| fts_word(w))
             .collect::<Vec<_>>()
             .join(" ");
         let from = if fts.is_empty() {
@@ -4260,6 +4643,13 @@ impl Store {
                 _ => None,
             };
             let mut starred = starred.map(|sql| tx.prepare(sql)).transpose()?;
+            let mut place = tx.prepare("SELECT mailbox_id, uid FROM messages WHERE id = ?1 AND uid IS NOT NULL")?;
+            let mut places = Vec::new();
+            for id in ids {
+                places.extend(place.query_row([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, u32>(1)?))).optional()?);
+            }
+            // Noted before the write, under the writer: a sync's merge after it sees it.
+            self.note_flag_changes(&places);
             for id in ids {
                 set.execute(params![id, value])?;
                 keep.execute(params![id, if value { "true" } else { "false" }])?;
@@ -4450,8 +4840,7 @@ impl Store {
     /// A move into this folder is still waiting to leave (or to finish).
     pub fn moves_pending_into(&self, mailbox_id: i64) -> Result<bool> {
         Ok(self.read().query_row(
-            "SELECT EXISTS (SELECT 1 FROM pending_ops p JOIN mailboxes b ON b.account_id = p.account_id AND b.name = p.dest
-                            WHERE b.id = ?1 AND p.failed = 0)",
+            &format!("SELECT {MOVE_PENDING_INTO}"),
             [mailbox_id],
             |r| r.get(0),
         )?)
@@ -4474,9 +4863,7 @@ impl Store {
         let tx = db.transaction()?;
         let orphans: Vec<i64> = {
             let mut st = tx.prepare(
-                "SELECT id FROM messages WHERE mailbox_id = ?1 AND uid IS NULL
-                   AND NOT EXISTS (SELECT 1 FROM pending_ops p JOIN mailboxes b ON b.account_id = p.account_id AND b.name = p.dest
-                                   WHERE b.id = ?1 AND p.failed = 0)",
+                &format!("SELECT id FROM messages WHERE mailbox_id = ?1 AND uid IS NULL AND NOT {MOVE_PENDING_INTO}"),
             )?;
             st.query_map([mailbox_id], |r| r.get(0))?.collect::<Result<_, _>>()?
         };
@@ -4907,17 +5294,13 @@ impl Store {
     /// `offline`: it never reached the server (counted apart, see [`Store::outgoing_tries`]).
     pub fn outgoing_failed(&self, id: i64, error: &str, retry_at: Option<i64>, offline: bool) -> Result<()> {
         self.db().execute(
-            "UPDATE outbox SET attempts = attempts + (?4 = 0), offline = offline + (?4 = 1), error = ?2,
+            "UPDATE outbox SET attempts = attempts + (?4 = 0), offline = offline + (?4 = 1), tried = MAX(tried, ?4 = 0), error = ?2,
                     state = CASE WHEN ?3 IS NULL THEN 'failed' ELSE 'pending' END,
                     send_at = COALESCE(?3, send_at)
              WHERE id = ?1",
             params![id, error, retry_at, offline],
         )?;
         Ok(())
-    }
-
-    pub fn outgoing_attempts(&self, id: i64) -> Result<i64> {
-        Ok(self.outgoing_tries(id)?.0)
     }
 
     /// (attempts the server saw, tries that never reached it).
@@ -4936,18 +5319,19 @@ impl Store {
     }
 
     /// Takes a message out of the outbox to edit it; impossible once it is sending.
-    pub fn take_outgoing(&self, id: i64) -> Result<Option<Draft>> {
-        let draft: Option<String> = self
+    /// The message taken back, and whether it may have reached the server already.
+    pub fn take_outgoing(&self, id: i64) -> Result<Option<(Draft, bool)>> {
+        let row: Option<(String, bool)> = self
             .db()
-            .query_row("DELETE FROM outbox WHERE id = ?1 AND state != 'sending' RETURNING draft", [id], |r| r.get(0))
+            .query_row("DELETE FROM outbox WHERE id = ?1 AND state != 'sending' RETURNING draft, tried", [id], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
-        draft.map(|d| Ok(serde_json::from_str(&d)?)).transpose()
+        row.map(|(d, tried)| Ok((serde_json::from_str(&d)?, tried))).transpose()
     }
 
     /// Brings the send forward ("Send now", "Retry").
     pub fn reschedule_outgoing(&self, id: i64, send_at: i64) -> Result<bool> {
         Ok(self.db().execute(
-            "UPDATE outbox SET send_at = ?2, state = 'pending', attempts = 0, error = NULL
+            "UPDATE outbox SET send_at = ?2, state = 'pending', attempts = 0, offline = 0, error = NULL
              WHERE id = ?1 AND state != 'sending'",
             params![id, send_at],
         )? > 0)
@@ -4959,7 +5343,7 @@ impl Store {
     /// language of the moment.
     pub fn interrupted_outgoing(&self) -> Result<usize> {
         Ok(self.db().execute(
-            "UPDATE outbox SET state = 'failed', error = 'interrupted' WHERE state = 'sending'",
+            "UPDATE outbox SET state = 'failed', error = 'interrupted', tried = 1 WHERE state = 'sending'",
             [],
         )?)
     }
@@ -5059,7 +5443,10 @@ impl Store {
         // Three indexed lookups: the sent message's thread, In-Reply-To, References.
         // Not the sent message itself (its Sent copy arrives after `sent_at`), nor anything
         // written from the account or one of its aliases.
+        // Nor an automatic message (an out-of-office reply, a bounce): sent back at once, it answers
+        // nothing.
         let others = "(m.received_at > ?3 OR (m.received_at IS NULL AND m.date > ?3))
+                      AND m.bulk = 0
                       AND COALESCE(m.message_id, '') != ?2
                       AND lower(COALESCE(m.from_addr, '')) != (SELECT lower(email) FROM accounts WHERE id = ?1)
                       AND lower(COALESCE(m.from_addr, '')) NOT IN (
@@ -5293,6 +5680,8 @@ impl Store {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&op?) else { continue };
             out.extend(v["uid"].as_u64().map(|u| u as u32));
             out.extend(v["uids"].as_array().into_iter().flatten().filter_map(|u| u.as_u64()).map(|u| u as u32));
+            // The old copy a draft save replaces (one without a Message-ID).
+            out.extend(v["source"][0].as_u64().map(|u| u as u32));
         }
         Ok(out)
     }
@@ -5522,6 +5911,16 @@ impl Store {
         Ok(())
     }
 
+    /// Queued deletions of a draft (failed ones too): a save of it queued afterwards replaces them.
+    pub fn drop_pending_draft_deletes(&self, account_id: i64, message_id: &str) -> Result<()> {
+        self.db().execute(
+            "DELETE FROM pending_ops WHERE account_id = ?1 AND kind = 'delete_draft'
+               AND instr(op, '\"message_id\":\"' || ?2 || '\"') > 0",
+            params![account_id, message_id],
+        )?;
+        Ok(())
+    }
+
     /// Payloads of the queued saves of a draft (failed ones too), oldest first.
     pub fn pending_draft_saves(&self, account_id: i64, message_id: &str) -> Result<Vec<(String, bool)>> {
         let db = self.read();
@@ -5546,6 +5945,16 @@ impl Store {
             params![account_id, message_id],
             |r| r.get(0),
         )?)
+    }
+
+    /// The cached Drafts copies of a draft, by Message-ID.
+    pub fn draft_copies(&self, account_id: i64, message_id: &str) -> Result<Vec<i64>> {
+        let db = self.read();
+        let mut st = db.prepare(&format!(
+            "SELECT m.id FROM messages m WHERE m.account_id = ?1 AND m.message_id = ?2 AND {}",
+            in_folder_where("m", "rb.account_id = ?1 AND rb.role = 'drafts'")
+        ))?;
+        Ok(st.query_map(params![account_id, message_id], |r| r.get(0))?.collect::<Result<_, _>>()?)
     }
 
     /// Removes a message's local copies in a folder from the cache (draft sent or discarded).
@@ -5668,10 +6077,20 @@ fn assign_thread(tx: &Transaction, account_id: i64, id: i64, h: &HeaderInfo) -> 
     // after a delete, so a new message would join another's thread, maybe another account's.
     let mut thread_id = None;
     if !keys.is_empty() {
-        let placeholders = vec!["?"; keys.len()].join(",");
+        let placeholders = (3..3 + keys.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+        // A message it names, or one naming the same ancestors: two replies to an original never
+        // received (older than the window, or before one was added) are one conversation. A
+        // thread Gmail decided is only joined through the messages themselves.
+        let not_gmail = "NOT EXISTS (SELECT 1 FROM gmail_threads g WHERE g.account_id = ?1 AND g.thread_id = m.thread_id)";
         let sql = format!(
-            "SELECT thread_id FROM messages WHERE account_id = ? AND id != ? AND message_id IN ({placeholders})
-             ORDER BY date LIMIT 1"
+            "SELECT thread_id FROM (
+                 SELECT m.thread_id, m.date FROM messages m WHERE m.account_id = ?1 AND m.id != ?2 AND m.message_id IN ({placeholders})
+                 UNION ALL
+                 SELECT m.thread_id, m.date FROM message_refs r JOIN messages m ON m.id = r.message_id
+                 WHERE r.account_id = ?1 AND r.ref IN ({placeholders}) AND m.id != ?2 AND {not_gmail}
+                 UNION ALL
+                 SELECT m.thread_id, m.date FROM messages m WHERE m.account_id = ?1 AND m.id != ?2 AND m.in_reply_to IN ({placeholders}) AND {not_gmail}
+             ) ORDER BY date LIMIT 1"
         );
         let mut args: Vec<&dyn rusqlite::ToSql> = vec![&account_id, &id];
         args.extend(keys.iter().map(|k| k as &dyn rusqlite::ToSql));
@@ -6078,6 +6497,9 @@ impl Store {
         if !enabled {
             tx.execute("UPDATE calendars SET ctag = NULL, synced_at = NULL, error = NULL WHERE id = ?1", [id])?;
             tx.execute("DELETE FROM calendar_events WHERE calendar_id = ?1", [id])?;
+            // Its events gone, nothing of it is known any more: shown again, it is read whole.
+            tx.execute("DELETE FROM caldav_etags WHERE calendar_id = ?1", [id])?;
+            tx.execute("DELETE FROM settings WHERE key = 'caldav_whole:' || ?1", [id])?;
         }
         tx.commit()?;
         Ok(account_id)
@@ -6212,16 +6634,20 @@ impl Store {
             return Ok(false);
         }
         let present: HashSet<&str> = listed.iter().map(|(h, _)| h.as_str()).collect();
+        // What came back keeps its row (and id: a form left open on it still saves), as with
+        // `replace_calendar_events`.
+        let back: HashSet<(&str, &str)> = events.iter().map(|e| (e.uid.as_str(), e.instance.as_str())).collect();
         let mut changed = false;
         {
             // Rows of objects gone or read again, and rows without an object (written locally
-            // before the server named them).
-            let mut st = tx.prepare("SELECT id, href FROM calendar_events WHERE calendar_id = ?1")?;
+            // before the server named them), unless the reading gave them again.
+            let mut st = tx.prepare("SELECT id, href, uid, instance FROM calendar_events WHERE calendar_id = ?1")?;
             let stale: Vec<i64> = st
-                .query_map([calendar_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))?
+                .query_map([calendar_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))?
                 .filter_map(|r| r.ok())
-                .filter(|(_, href)| href.as_deref().is_none_or(|h| !present.contains(h) || fetched.contains(h)))
-                .map(|(id, _)| id)
+                .filter(|(_, href, ..)| href.as_deref().is_none_or(|h| !present.contains(h) || fetched.contains(h)))
+                .filter(|(_, _, uid, instance)| !back.contains(&(uid.as_str(), instance.as_str())))
+                .map(|(id, ..)| id)
                 .collect();
             let mut delete = tx.prepare("DELETE FROM calendar_events WHERE id = ?1")?;
             for id in stale {
@@ -6541,6 +6967,118 @@ mod tests {
     }
 
     #[test]
+    fn indexes_that_cannot_be_rebuilt_offer_to_set_the_database_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("facteur.db");
+        drop(Store::open(&path).unwrap());
+        // An index facteur cannot build again (here: on a function only another connection knew).
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.create_scalar_function("odd", 1, rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC, |c| c.get::<i64>(0)).unwrap();
+            conn.execute_batch("CREATE TABLE extra (x INTEGER); CREATE INDEX extra_odd ON extra (odd(x)); INSERT INTO extra VALUES (1);").unwrap();
+        }
+        std::fs::write(damage_marker(&path), b"").unwrap();
+        let err = Store::open(&path).err().expect("refused");
+        assert!(err.is_damaged_db(), "the set-aside dialog, not a start that fails for good: {err:?}");
+    }
+
+    #[test]
+    fn a_search_index_rebuild_cut_short_resumes_and_tolerates_the_sync() {
+        let (s, acc, inbox, _) = setup();
+        let a = s.insert_header(acc, inbox, 1, &header("a@x", None, "Devis", 1), FLAGS, 10).unwrap();
+        let b = s.insert_header(acc, inbox, 2, &header("b@x", None, "Facture", 2), FLAGS, 10).unwrap();
+        let raw = b"Subject: Facture\r\n\r\nLe chantier commence lundi";
+        s.store_body(b, raw, &crate::mime::body_info(raw)).unwrap();
+        let indexed = |word: &str| s.read().query_row("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?1", [word], |r| r.get::<_, i64>(0)).unwrap();
+        // Cut after its first message's header: the rest is missing, yet the table is sound.
+        s.db().execute_batch(&format!("DELETE FROM messages_fts WHERE rowid != {a}")).unwrap();
+        s.set_setting(SEARCH_INDEX_REBUILD, &format!("headers:{a}")).unwrap();
+        assert_eq!(indexed("facture"), 0);
+        // Resumed at the next start, without trusting the integrity check.
+        assert!(s.check_search_index().unwrap());
+        assert_eq!((indexed("facture"), indexed("chantier"), indexed("devis")), (1, 1, 1));
+        assert_eq!(s.setting(SEARCH_INDEX_REBUILD).unwrap(), None);
+        // A message the sync indexed meanwhile is no conflict.
+        s.set_setting(SEARCH_INDEX_REBUILD, "headers:0").unwrap();
+        s.db().execute_batch("DELETE FROM messages_fts").unwrap();
+        s.db().execute(&format!("INSERT INTO messages_fts (rowid, subject, sender, recipients, body) VALUES ({b}, 'Facture', '', '', '')"), []).unwrap();
+        s.set_setting(SEARCH_INDEX_REBUILD, &format!("headers:{}", a - 1)).unwrap();
+        assert!(s.check_search_index().unwrap());
+        assert_eq!(indexed("devis"), 1);
+    }
+
+    #[test]
+    fn a_failed_search_index_rebuild_leaves_the_writer_usable() {
+        let (s, ..) = setup();
+        // A leftover table under an FTS5 shadow table's name: the CREATE fails after the DROP.
+        s.db().execute_batch("DROP TABLE messages_fts; CREATE TABLE messages_fts_config (k PRIMARY KEY, v);").unwrap();
+        s.set_setting(SEARCH_INDEX_REBUILD, "headers:0").unwrap();
+        assert!(s.check_search_index().is_err());
+        assert!(s.db().is_autocommit(), "no transaction left open on the writer");
+        s.set_setting("x", "1").unwrap();
+    }
+
+    #[test]
+    fn body_rebuild_steps_are_bounded_by_size() {
+        let (s, acc, inbox, _) = setup();
+        let mut ids = Vec::new();
+        for uid in 1..=5 {
+            let id = s.insert_header(acc, inbox, uid, &header(&format!("{uid}@x"), None, "Devis", 1), FLAGS, 10).unwrap();
+            let raw = format!("Subject: Devis\r\n\r\nmot{uid} {}", "x".repeat(1 << 20));
+            s.store_body(id, raw.as_bytes(), &crate::mime::body_info(raw.as_bytes())).unwrap();
+            ids.push(id);
+        }
+        let step = body_step(&s.read(), 0, 2 << 20).unwrap();
+        assert!(!step.is_empty() && step.len() <= 2, "{step:?}");
+        assert_eq!(body_step(&s.read(), 0, 1).unwrap().len(), 1, "always one, however large");
+        s.set_setting(SEARCH_INDEX_REBUILD, "headers:0").unwrap();
+        assert!(s.check_search_index().unwrap());
+        let indexed = s.read().query_row("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'mot5'", [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(indexed, 1);
+    }
+
+    #[test]
+    fn marking_many_unread_read_is_not_quadratic() {
+        let (s, _, inbox, _) = setup();
+        let started = std::time::Instant::now();
+        s.note_flag_changes(&(1..=60_000u32).map(|u| (inbox, u)).collect::<Vec<_>>());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
+        assert_eq!(s.flags_touched(inbox, 0).len(), 60_000);
+    }
+
+    #[test]
+    fn duplicate_cleanup_takes_what_hangs_on_the_copies() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, mailbox_id INTEGER, uid INTEGER);
+             CREATE TABLE bodies (message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE, raw BLOB);
+             CREATE TABLE labels (mailbox_id INTEGER, message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE);
+             CREATE TABLE handled_quiet (on_ INTEGER NOT NULL);
+             INSERT INTO messages VALUES (1, 5, 7), (2, 5, 7);
+             INSERT INTO bodies VALUES (1, 'a'), (2, 'b');
+             INSERT INTO labels VALUES (9, 1), (9, 2);",
+        )
+        .unwrap();
+        drop_duplicate_copies(&conn).unwrap();
+        let orphans = |table: &str| conn.query_row(&format!("SELECT COUNT(*) FROM {table} WHERE message_id NOT IN (SELECT id FROM messages)"), [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!((orphans("bodies"), orphans("labels")), (0, 0));
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM handled_quiet", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_busy_database_at_the_check_is_no_damage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("facteur.db");
+        drop(Store::open(&path).unwrap());
+        let other = Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        std::fs::write(damage_marker(&path), b"").unwrap();
+        let err = Store::open(&path).err().expect("busy");
+        assert!(!err.is_damaged_db(), "{err}");
+        assert!(damage_marker(&path).exists(), "checked again next time");
+    }
+
+    #[test]
     fn damage_found_while_running_is_checked_at_the_next_start() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("facteur.db");
@@ -6556,13 +7094,35 @@ mod tests {
         assert!(!s.check_search_index().unwrap(), "sound");
         assert!(s.setting(SEARCH_INDEX_CHECK).unwrap().is_none());
         // A damaged index is found on a reader, then built again.
+        let srv = ServerConfig { host: "localhost".into(), port: 143, security: Security::None };
+        let acc = s
+            .insert_account(&NewAccount {
+                auth: NewAuth::default(),
+                name: "Y".into(), email: "y@example.org".into(), username: "y".into(), password: String::new(),
+                imap: srv.clone(), smtp: srv,
+            })
+            .unwrap();
+        let inbox = s.upsert_mailbox(acc, "INBOX", Some("/"), Some(Role::Inbox), true).unwrap();
+        let id = s.insert_header(acc, inbox, 1, &header("d@x", None, "Devis", 1), FLAGS, 10).unwrap();
+        let raw = b"Subject: Devis\r\n\r\nLe chantier commence lundi";
+        s.store_body(id, raw, &crate::mime::body_info(raw)).unwrap();
         s.set_setting(SEARCH_INDEX_CHECK, "1").unwrap();
-        s.db().execute_batch("INSERT INTO messages_fts(rowid, subject, sender, recipients, body) VALUES (1, 'a', 'b', 'c', 'd'); DELETE FROM messages_fts_content;").unwrap();
+        s.db().execute_batch("DELETE FROM messages_fts_content;").unwrap();
         assert!(s.check_search_index().unwrap(), "rebuilt");
         assert_eq!(s.read().query_row("PRAGMA integrity_check(messages_fts)", [], |r| r.get::<_, String>(0)).unwrap(), "ok");
+        // Rebuilt from the messages: a message whose indexed text was lost is found again.
+        let indexed = |word: &str| s.read().query_row("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?1", [word], |r| r.get::<_, i64>(0)).unwrap();
+        assert!(indexed("devis") > 0, "found again by its subject");
+        assert!(indexed("chantier") > 0, "found again by its body");
         drop(s);
 
-        // A page really damaged: the start reports a damaged database (the set-aside dialog).
+        // A page really damaged: the start reports a damaged database (the set-aside dialog). On
+        // a database of its own: the search index, rebuilt above, now lies in the first pages.
+        let path = dir.path().join("other.db");
+        let fresh = Store::open(&path).unwrap();
+        fresh.db().execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        drop(fresh);
+        let marker = damage_marker(&path);
         let mut bytes = std::fs::read(&path).unwrap();
         let page = 4096;
         for b in &mut bytes[page..page * 3] {
@@ -6667,6 +7227,30 @@ mod tests {
     }
 
     #[test]
+    fn a_message_restored_from_the_bin_into_a_label_waits_in_all_mail() {
+        let (s, acc, _, _) = setup();
+        let all = s.upsert_mailbox(acc, "[Gmail]/All Mail", Some("/"), Some(Role::All), true).unwrap();
+        assert!(s.convert_to_labels(acc).unwrap());
+        let id = s.insert_header(acc, all, 9, &header("back@x", None, "Retour", 5), FLAGS, 10).unwrap();
+        s.db().execute("UPDATE messages SET uid = NULL WHERE id = ?1", [id]).unwrap();
+        s.push_op(acc, r#"{"kind":"move_set","mailbox":"[Gmail]/Trash","uids":[3],"dest":"INBOX"}"#, "", None).unwrap();
+        assert!(s.moves_pending_into(all).unwrap(), "a move into the inbox label lands in All Mail");
+        s.drop_orphan_placeholders(all, false).unwrap();
+        assert!(s.location(id).is_ok(), "kept while the move waits");
+    }
+
+    #[test]
+    fn gmail_drafts_deleted_from_their_label_are_known_to_the_all_mail_sync() {
+        let (s, acc, _, _) = setup();
+        s.upsert_mailbox(acc, "[Gmail]/All Mail", Some("/"), Some(Role::All), true).unwrap();
+        s.upsert_mailbox(acc, "[Gmail]/Drafts", Some("/"), Some(Role::Drafts), true).unwrap();
+        s.push_op(acc, r#"{"kind":"delete_draft","mailbox":"[Gmail]/Drafts","message_id":"d@x"}"#, "", None).unwrap();
+        assert!(s.pending_draft_deletes(acc, "[Gmail]/All Mail").unwrap().is_empty(), "folders: Drafts only");
+        s.db().execute("UPDATE accounts SET labels_model = 1 WHERE id = ?1", [acc]).unwrap();
+        assert_eq!(s.pending_draft_deletes(acc, "[Gmail]/All Mail").unwrap(), HashSet::from(["d@x".to_string()]));
+    }
+
+    #[test]
     fn a_gmail_conversion_goes_in_steps_and_resumes() {
         let (s, acc, inbox, _) = setup();
         let all = s.upsert_mailbox(acc, "[Gmail]/All Mail", Some("/"), Some(Role::All), true).unwrap();
@@ -6718,9 +7302,78 @@ mod tests {
         assert_eq!(listed.iter().map(|t| (t.latest_id, t.mailbox_id)).collect::<Vec<_>>(), vec![(a, inbox)]);
 
         // The server's labels then replace them, except while a change is on its way.
-        assert!(s.set_server_labels(all, &[(1, vec![mairie])], &HashSet::new()).unwrap());
-        assert!(!s.set_server_labels(all, &[(1, vec![inbox])], &HashSet::from([1])).unwrap());
+        assert!(s.set_server_labels(all, &[(1, vec![mairie])], &HashSet::new(), s.flags_tick()).unwrap());
+        assert!(!s.set_server_labels(all, &[(1, vec![inbox])], &HashSet::from([1]), s.flags_tick()).unwrap());
         assert_eq!(s.message_labels(&[a]).unwrap()[&a], vec![mairie]);
+    }
+
+    #[test]
+    fn a_folder_left_as_a_bare_name_on_the_server_loses_its_messages() {
+        let (s, acc, ..) = setup();
+        let clients = s.upsert_mailbox(acc, "Clients", Some("/"), None, true).unwrap();
+        s.insert_header(acc, clients, 1, &header("c@x", None, "Devis", 5), FLAGS, 10).unwrap();
+        // Deleted elsewhere while « Clients/2024 » remains: listed \Noselect.
+        assert_eq!(s.upsert_mailbox(acc, "Clients", Some("/"), None, false).unwrap(), clients);
+        assert!(s.mailbox_message_ids(clients).unwrap().is_empty());
+        assert_eq!(s.mailbox_state(clients).unwrap().uidvalidity, None);
+    }
+
+    #[test]
+    fn a_failed_recount_keeps_the_account_for_a_retry() {
+        let (s, acc, inbox, _) = setup();
+        s.insert_header(acc, inbox, 1, &header("m@x", None, "Devis", 5), FLAGS, 10).unwrap();
+        s.db().execute_batch("CREATE TRIGGER block BEFORE DELETE ON contacts BEGIN SELECT RAISE(ABORT, 'x'); END;").unwrap();
+        assert!(s.delete_account(acc).is_err());
+        assert!(s.list_accounts().unwrap().iter().any(|a| a.id == acc), "still there: removed again later");
+        s.db().execute_batch("DROP TRIGGER block;").unwrap();
+        s.delete_account(acc).unwrap();
+        assert!(s.search_contacts("example.org", &[], 10).unwrap().is_empty(), "the people of its first steps forgotten too");
+        assert_eq!(s.setting(&format!("removing_contacts:{acc}")).unwrap(), None);
+    }
+
+    #[test]
+    fn a_gmail_account_without_all_mail_goes_back_to_folders() {
+        let (s, acc, inbox, sent) = setup();
+        let all = s.upsert_mailbox(acc, "[Gmail]/All Mail", Some("/"), Some(Role::All), true).unwrap();
+        let mairie = s.upsert_mailbox(acc, "Mairie", Some("/"), None, true).unwrap();
+        s.insert_header(acc, all, 1, &header("a@x", None, "Façade", 5), FLAGS, 10).unwrap();
+        s.insert_header(acc, inbox, 5, &header("a@x", None, "Façade", 5), FLAGS, 10).unwrap();
+        let mut state = s.mailbox_state(inbox).unwrap();
+        (state.uidvalidity, state.uidnext) = (Some(1), Some(6));
+        s.save_mailbox_state(&state).unwrap();
+        assert!(s.convert_to_labels(acc).unwrap());
+        assert!(!s.revert_labels_model(acc).unwrap(), "All Mail still there");
+
+        // All Mail hidden from IMAP (a Gmail setting): the folders hold the mail again.
+        s.retain_mailboxes(acc, &[inbox, sent, mairie]).unwrap();
+        assert!(s.revert_labels_model(acc).unwrap());
+        assert!(!s.labels_model(acc).unwrap());
+        let state = s.mailbox_state(inbox).unwrap();
+        assert!(!state.is_label && !s.mailbox_state(mairie).unwrap().is_label);
+        assert_eq!((state.uidvalidity, state.uidnext), (None, None), "read again from the start");
+        assert!(!s.revert_labels_model(acc).unwrap());
+    }
+
+    #[test]
+    fn a_gmail_sent_label_makes_correspondents() {
+        let (s, acc, _, sent) = setup();
+        let all = s.upsert_mailbox(acc, "[Gmail]/All Mail", Some("/"), Some(Role::All), true).unwrap();
+        s.set_label_folder(sent, true).unwrap();
+        let to = vec![Address { name: Some("Fournisseur".into()), email: "supplier@ex.org".into() }];
+        let mine = HeaderInfo { from: Some(Address { name: None, email: "y@example.org".into() }), to, ..header("s@x", None, "Commande", 5) };
+        s.insert_header(acc, all, 7, &mine, FLAGS, 10).unwrap();
+        let written = || s.read().query_row("SELECT written FROM contacts WHERE email = 'supplier@ex.org'", [], |r| r.get::<_, i64>(0)).optional().unwrap();
+        assert_eq!(written(), None);
+        assert!(s.set_server_labels(all, &[(7, vec![sent])], &HashSet::new(), s.flags_tick()).unwrap());
+        assert!(s.correspondents(acc).unwrap().contains("supplier@ex.org"));
+        assert_eq!(written(), Some(1));
+        // The same labels read again count nothing twice.
+        s.set_server_labels(all, &[(7, vec![sent])], &HashSet::new(), s.flags_tick()).unwrap();
+        assert_eq!(written(), Some(1));
+
+        // Removing the account takes them away.
+        s.delete_account(acc).unwrap();
+        assert_eq!(written(), None);
     }
 
     #[test]
@@ -7026,6 +7679,72 @@ mod tests {
     }
 
     #[test]
+    fn spam_senders_are_never_suggested() {
+        let (s, acc, inbox, _) = setup();
+        let junk = s.upsert_mailbox(acc, "Junk", Some("/"), Some(Role::Junk), true).unwrap();
+        let from = |email: &str, id: &str| HeaderInfo { from: Some(Address { name: Some("Banque".into()), email: email.into() }), ..header(id, None, "Alerte", 1) };
+        for i in 0..5 {
+            s.insert_header(acc, junk, i + 1, &from("secure@evil.example", &format!("{i}@x")), FLAGS, 10).unwrap();
+        }
+        s.insert_header(acc, inbox, 1, &from("conseiller@banque.example", "ok@x"), FLAGS, 10).unwrap();
+        let found: Vec<String> = s.search_contacts("banque", &[], 10).unwrap().into_iter().map(|a| a.email).collect();
+        assert_eq!(found, ["conseiller@banque.example"]);
+    }
+
+    #[test]
+    fn a_book_that_failed_keeps_its_contacts() {
+        use crate::contacts::Contact;
+        let (s, acc, _, _) = setup();
+        let card = |id: &str, email: &str| Contact { remote_id: id.into(), name: Some("X".into()), emails: vec![email.into()] };
+        // Stored under their absolute URL, as `caldav::parse_cards` gives them.
+        let (work, home) = ("https://dav.example.org/ab/work/", "https://dav.example.org/ab/home/");
+        let other = card("https://dav.example.org/ab/work2/c9.vcf", "x@ex.org");
+        s.replace_address_book(acc, "y@example.org", &[card(&format!("{work}c1.vcf"), "w@ex.org"), card(&format!("{home}c2.vcf"), "h@ex.org"), other]).unwrap();
+        // The work book failed this time: its contacts go on with the home book's new ones.
+        let mut now = vec![card(&format!("{home}c3.vcf"), "n@ex.org")];
+        now.extend(s.address_book_under(acc, work).unwrap());
+        s.replace_address_book(acc, "y@example.org", &now).unwrap();
+        let mut left: Vec<String> = s.search_contacts("ex.org", &[], 10).unwrap().into_iter().map(|a| a.email).collect();
+        left.sort();
+        assert_eq!(left, ["n@ex.org", "w@ex.org"]);
+    }
+
+    #[test]
+    fn a_one_letter_last_piece_is_never_a_prefix() {
+        assert_eq!(fts_word("facture"), "\"facture\"*");
+        assert_eq!(fts_word("paul@g"), "\"paul@g\"", "the star would apply to `g` alone");
+        assert_eq!(fts_word("rendez-v"), "\"rendez-v\"");
+        assert_eq!(fts_word("paul@gm"), "\"paul@gm\"*");
+        assert_eq!(fts_word("x"), "\"x\"");
+        assert_eq!(fts_word("a\"b"), "\"a\"\"b\"", "no FTS5 syntax through quotes");
+    }
+
+    #[test]
+    fn a_flag_changed_while_the_server_flags_are_read_is_not_put_back() {
+        let (s, acc, inbox, _) = setup();
+        let id = s.insert_header(acc, inbox, 1, &header("a@x", None, "a", 1), FLAGS, 10).unwrap();
+        // The sync asks for the flags; meanwhile the message is pinned here, and its change
+        // already left the queue.
+        let since = s.flags_tick();
+        s.set_flags_local(&[id], FlagKind::Flagged, true).unwrap();
+        s.update_flags(inbox, &[(1, ServerFlags { flagged: false, ..FLAGS })], &HashSet::new(), since).unwrap();
+        assert!(s.summary(id).unwrap().flags.flagged, "the older answer does not unpin it");
+        // The next read, asked after the change, is the server's word.
+        s.update_flags(inbox, &[(1, ServerFlags { flagged: false, ..FLAGS })], &HashSet::new(), s.flags_tick()).unwrap();
+        assert!(!s.summary(id).unwrap().flags.flagged);
+    }
+
+    #[test]
+    fn mark_all_read_during_a_flag_read_is_not_undone() {
+        let (s, acc, inbox, _) = setup();
+        let id = s.insert_header(acc, inbox, 1, &header("a@x", None, "a", 1), FLAGS, 10).unwrap();
+        let since = s.flags_tick();
+        s.mark_account_seen(acc, false).unwrap();
+        s.update_flags(inbox, &[(1, FLAGS)], &HashSet::new(), since).unwrap();
+        assert!(s.summary(id).unwrap().flags.seen, "the older answer does not make it unread again");
+    }
+
+    #[test]
     fn flag_changed_during_a_move_reaches_the_server() {
         let (s, acc, inbox, _) = setup();
         let archive = s.upsert_mailbox(acc, "Archive", Some("/"), Some(Role::Archive), true).unwrap();
@@ -7051,9 +7770,9 @@ mod tests {
         s.set_flag(id, FlagKind::Seen, false).unwrap();
         // The server does not know yet: it says read.
         let keep: HashSet<u32> = [1].into();
-        s.update_flags(inbox, &[(1, ServerFlags { seen: true, ..FLAGS })], &keep).unwrap();
+        s.update_flags(inbox, &[(1, ServerFlags { seen: true, ..FLAGS })], &keep, s.flags_tick()).unwrap();
         assert!(!s.summary(id).unwrap().flags.seen, "the local change stays");
-        s.update_flags(inbox, &[(1, ServerFlags { seen: true, ..FLAGS })], &HashSet::new()).unwrap();
+        s.update_flags(inbox, &[(1, ServerFlags { seen: true, ..FLAGS })], &HashSet::new(), s.flags_tick()).unwrap();
         assert!(s.summary(id).unwrap().flags.seen);
     }
 
@@ -7098,6 +7817,14 @@ mod tests {
         s.drop_orphan_placeholders(inbox, false).unwrap();
         let handled: i64 = s.read().query_row("SELECT COUNT(*) FROM handled WHERE thread_id = ?1", [thread], |r| r.get(0)).unwrap();
         assert_eq!(handled, 0);
+    }
+
+    #[test]
+    fn queued_draft_saves_keep_their_old_copy_out() {
+        let (s, acc, _, _) = setup();
+        s.push_op(acc, r#"{"kind":"save_draft","mailbox":"Drafts","message_id":"a@x","raw":"","source":[7,null]}"#, "", None).unwrap();
+        assert_eq!(s.in_flight_uids(acc, "Drafts").unwrap(), HashSet::from([7]), "not fetched back while the save waits");
+        assert!(s.failed_op_uids(acc, "Drafts").unwrap().is_empty());
     }
 
     #[test]
@@ -7430,8 +8157,33 @@ mod tests {
         // cannot tell whether it went.
         assert!(interrupted.error.unwrap().contains("destinataire"));
 
-        assert_eq!(s.take_outgoing(later).unwrap().unwrap().to, ["a@x"]);
+        assert_eq!(s.take_outgoing(later).unwrap().unwrap().0.to, ["a@x"]);
         assert_eq!(s.outbox().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_send_that_may_have_gone_stays_tried_through_retry() {
+        let (s, acc, _, _) = setup();
+        let draft = Draft { account_id: acc, to: vec!["a@x".into()], subject: "Devis".into(), ..Default::default() };
+        // Cut by a quit while sending, then retried and failing offline.
+        let cut = s.queue_outgoing(&draft, 100, false, None).unwrap();
+        s.claim_outgoing(150).unwrap().unwrap();
+        s.interrupted_outgoing().unwrap();
+        assert!(s.reschedule_outgoing(cut, 200).unwrap());
+        s.claim_outgoing(250).unwrap().unwrap();
+        s.outgoing_failed(cut, "offline", Some(9000), true).unwrap();
+        assert!(s.take_outgoing(cut).unwrap().unwrap().1, "edited, it gets a new Message-ID");
+        // Offline only, never reached a server: the same Message-ID is fine.
+        let offline = s.queue_outgoing(&draft, 100, false, None).unwrap();
+        s.claim_outgoing(150).unwrap().unwrap();
+        s.outgoing_failed(offline, "offline", Some(9000), true).unwrap();
+        assert!(!s.take_outgoing(offline).unwrap().unwrap().1);
+        // Retry starts the offline count again too.
+        let again = s.queue_outgoing(&draft, 100, false, None).unwrap();
+        s.claim_outgoing(150).unwrap().unwrap();
+        s.outgoing_failed(again, "offline", Some(9000), true).unwrap();
+        s.reschedule_outgoing(again, 200).unwrap();
+        assert_eq!(s.outgoing_tries(again).unwrap(), (0, 0));
     }
 
     #[test]
@@ -7443,6 +8195,18 @@ mod tests {
         assert_eq!(s.message_ids(id).unwrap(), (Some("b@x".to_string()), vec!["a@x".to_string()]));
         let root = s.insert_header(acc, inbox, 2, &header("r@x", None, "x", 5), FLAGS, 10).unwrap();
         assert_eq!(s.message_ids(root).unwrap(), (Some("r@x".to_string()), Vec::new()));
+    }
+
+    #[test]
+    fn an_automatic_reply_does_not_resolve_a_follow_up() {
+        let (s, acc, inbox, sent) = setup();
+        let mine = HeaderInfo { from: Some(Address { name: None, email: "Y@example.org".into() }), ..header("devis@x", None, "Devis", 1_000) };
+        s.insert_header(acc, sent, 1, &mine, FLAGS, 10).unwrap();
+        s.add_reminder(acc, "devis@x", "Devis", &["f@example.org".into()], 1_000, 2_000).unwrap();
+        let away = b"Message-ID: <ooo@x>\r\nFrom: f@example.org\r\nIn-Reply-To: <devis@x>\r\nReferences: <devis@x>\r\nAuto-Submitted: auto-replied\r\nSubject: Absence\r\nDate: Thu, 1 Jan 1970 00:20:00 +0000\r\n\r\nJe suis absente.";
+        let away = HeaderInfo { received_at: Some(1_200), ..crate::mime::parse_headers(away, 1_200) };
+        s.insert_header(acc, inbox, 2, &away, FLAGS, 10).unwrap();
+        assert_eq!(s.check_reminders(2_500).unwrap().len(), 1, "an out-of-office reply is no answer");
     }
 
     #[test]
@@ -7963,6 +8727,22 @@ mod tests {
     }
 
     #[test]
+    fn replies_to_an_original_never_received_are_one_thread() {
+        let (s, acc, inbox, _) = setup();
+        let r1 = s.insert_header(acc, inbox, 1, &header("r1@x", Some("root@x"), "Re: Devis", 10), FLAGS, 10).unwrap();
+        let r2 = s.insert_header(acc, inbox, 2, &header("r2@x", Some("root@x"), "Re: Devis", 20), FLAGS, 10).unwrap();
+        let thread = |id: i64| s.read().query_row("SELECT thread_id FROM messages WHERE id = ?1", [id], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(thread(r1), thread(r2));
+        // In-Reply-To alone, no References.
+        let mut bare = header("r3@x", Some("root@x"), "Re: Devis", 30);
+        bare.references.clear();
+        let r3 = s.insert_header(acc, inbox, 3, &bare, FLAGS, 10).unwrap();
+        assert_eq!(thread(r3), thread(r1));
+        let other = s.insert_header(acc, inbox, 4, &header("o@x", Some("elsewhere@x"), "Autre", 40), FLAGS, 10).unwrap();
+        assert_ne!(thread(other), thread(r1));
+    }
+
+    #[test]
     fn sender_lookups_use_the_address_indexes() {
         let (s, ..) = setup();
         let plan = |sql: &str| -> String {
@@ -8036,6 +8816,9 @@ mod tests {
         // Words of the message text, in any order, prefixes accepted.
         assert_eq!(by(SimilarCriteria { body: Some("membres promo".into()), ..Default::default() }).ids, [a]);
         assert_eq!(by(SimilarCriteria { body: Some("membre\"".into()), ..Default::default() }).ids, [a], "quotes are harmless");
+        assert_eq!(by(SimilarCriteria { body: Some("promo : membres".into()), ..Default::default() }).ids, [a], "standalone punctuation is ignored");
+        assert_eq!(by(SimilarCriteria { body: Some("membres - €".into()), ..Default::default() }).ids, [a]);
+        assert!(by(SimilarCriteria { body: Some(" : ".into()), ..Default::default() }).ids.is_empty(), "no word: nothing, never everything");
         assert!(by(SimilarCriteria { body: Some("absent".into()), ..Default::default() }).ids.is_empty());
         assert_eq!(by(SimilarCriteria { from_domain: Some("shop.example".into()), ..Default::default() }).count, 2, "subdomain included");
         assert_eq!(by(SimilarCriteria { subject: Some("SOLDES".into()), ..Default::default() }).count, 2);
@@ -8572,11 +9355,16 @@ mod tests {
         let (s, ..) = setup();
         let db = s.db();
         let mut st = db.prepare(&format!("EXPLAIN QUERY PLAN {USUAL_AUTHSERV}")).unwrap();
-        let plan = st.query_map(params![1, true], |r| r.get::<_, String>(3)).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>().join(" | ");
+        let plan = st.query_map([1], |r| r.get::<_, String>(3)).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>().join(" | ");
         // No sort of the whole account: the 500 latest are read in index order.
         assert!(plan.contains("messages_account_arrival") && !plan.contains("SCAN m"), "{plan}");
         let inner = plan.split("SCAN (subquery").next().unwrap();
         assert!(!inner.contains("TEMP B-TREE"), "only the 500 rows' grouping sorts: {plan}");
+        // The inbox pass reads the inbox's rows, not every arrival of the account.
+        let mut st = db.prepare(&format!("EXPLAIN QUERY PLAN {USUAL_AUTHSERV_INBOX}")).unwrap();
+        let plan = st.query_map([1], |r| r.get::<_, String>(3)).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>().join(" | ");
+        let inner = plan.split("SCAN (subquery").next().unwrap();
+        assert!(inner.contains("messages_box_arrival") && !inner.contains("SCAN m") && !inner.contains("TEMP B-TREE"), "the 500 latest in index order: {plan}");
     }
 
     #[test]
@@ -8775,11 +9563,26 @@ mod tests {
         let after = s.calendar_events(0, 1000).unwrap();
         assert_eq!(after[0].id, before[0].1, "a untouched");
         assert_eq!((after[1].summary.as_str(), after[1].start), ("b (moved)", 250));
+        assert_eq!(after[1].id, before[1].1, "b read again keeps its row: a form open on it still saves");
         // a deleted on the server: no longer listed, its events go.
         let listed = vec![(b.clone(), "\"2\"".to_string())];
         assert!(s.update_calendar_objects(c, acc, "https://dav.example/c/", &listed, &HashSet::new(), &[], None).unwrap());
         assert_eq!(s.calendar_events(0, 1000).unwrap().iter().map(|e| e.uid.as_str()).collect::<Vec<_>>(), ["b"]);
         assert_eq!(s.caldav_etags(c).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_caldav_calendar_shown_again_is_read_whole() {
+        use crate::calendar::RemoteCalendar;
+        let (s, acc, _, _) = setup();
+        let cal = RemoteCalendar { remote_id: "https://dav.example/c/".into(), name: "c".into(), color: None, read_only: false, enabled: true, ctag: None };
+        let c = s.sync_calendar_list(acc, CalendarSource::Caldav, &[cal]).unwrap().0[0].id;
+        let listed = vec![("https://dav.example/c/a.ics".to_string(), "\"1\"".to_string())];
+        s.update_calendar_objects(c, acc, "https://dav.example/c/", &listed, &HashSet::new(), &[], None).unwrap();
+        s.set_setting(&format!("caldav_whole:{c}"), "1792800000").unwrap();
+        s.set_calendar_enabled(c, false).unwrap();
+        assert!(s.caldav_etags(c).unwrap().is_empty(), "no ETag left to skip its unchanged objects");
+        assert_eq!(s.setting(&format!("caldav_whole:{c}")).unwrap(), None);
     }
 
     #[test]

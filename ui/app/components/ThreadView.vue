@@ -3,6 +3,7 @@ import { confirm } from '~/composables/useConfirm'
 import { createReusableTemplate, useEventListener, useMediaQuery } from '@vueuse/core'
 import type { DropdownMenuItem } from '@nuxt/ui'
 import type { FoundEvent, Mailbox, MessageDetail, MessageSummary, Outgoing } from '~/utils/types'
+import type { Leaving } from '~/utils/listRows'
 
 const props = withDefaults(
   defineProps<{ accountId: number, threadId: number, mailboxId: number, shortcuts?: boolean, doneMode?: boolean, restoreMode?: boolean }>(),
@@ -55,6 +56,9 @@ const invitationLabel = computed(() => {
   }
 })
 const latest = computed(() => messages.value.at(-1))
+/** The latest of the folder's copies: marked unread or pinned, it is what the list row shows
+ *  (the reply sent from here sits in Sent). */
+const latestHere = computed(() => latestIn(messages.value, props.mailboxId))
 
 const { order } = useThreadOrder()
 /** Unread when the thread was opened: they stay unfolded once marked read. */
@@ -160,7 +164,11 @@ function flushPendingRead() {
   if (!pendingRead.size || !onScreen()) return
   const ids = [...pendingRead]
   pendingRead.clear()
-  api.setFlag(ids, 'seen', true).catch(showError)
+  markRead(ids)
+}
+/** Read on the server, and in the list's rows (those past its first page are not reread). */
+function markRead(ids: number[]) {
+  api.setFlag(ids, 'seen', true).then(() => listStale.markSeen(ids, true), showError)
 }
 useEventListener(window, 'focus', flushPendingRead)
 useEventListener(document, 'visibilitychange', flushPendingRead)
@@ -190,7 +198,15 @@ async function load(reset: boolean) {
   const arrived = wasReset ? [] : list.filter(m => !knownIds.has(m.id))
   knownIds.clear()
   for (const m of list) knownIds.add(m.id)
-  messages.value = list
+  // Unchanged messages keep their object, and an unchanged thread is not assigned: every card
+  // would render again at each sync tick.
+  const old = new Map(messages.value.map(m => [m.id, m]))
+  const sign = (m: MessageSummary) => JSON.stringify(m)
+  const kept = list.map((m) => {
+    const was = old.get(m.id)
+    return was && sign(was) === sign(m) ? was : m
+  })
+  if (wasReset || kept.length !== messages.value.length || kept.some((m, i) => m !== messages.value[i])) messages.value = kept
   if (wasReset) {
     resetPending.value = false
     details.clear()
@@ -207,7 +223,7 @@ async function load(reset: boolean) {
     const firstUnread = list.find(m => !m.flags.seen)
     scrollTo(order.value === 'newest' ? (lastUnread ?? list.at(-1))?.id : (firstUnread ?? list.at(-1))?.id)
     const unread = list.filter(m => !m.flags.seen).map(m => m.id)
-    if (unread.length) api.setFlag(unread, 'seen', true).catch(showError)
+    if (unread.length) markRead(unread)
   } else if (hadHere && !here.value.length && !leaving) {
     // Its messages left this folder from elsewhere (dragged to a folder, another device):
     // nothing left to act on here.
@@ -237,35 +253,36 @@ watch(() => props.threadId, () => {
  *  read again: seconds in all. Meanwhile it shows here, from the outbox, and stays once sent
  *  until its real message arrives (a minute at most). */
 const outbox = useOutbox()
-interface Leaving { item: Outgoing, sentAt: number | null }
 const leaving_ = ref<Leaving[]>([])
 const clock = ref(Date.now())
 let clockTimer: ReturnType<typeof setInterval> | undefined
 onBeforeUnmount(() => clearInterval(clockTimer))
-const threadIds = computed(() => new Set(messages.value.map(m => m.id)))
-watch([() => outbox.items.value, threadIds], ([items, ids]) => {
+const threadIds = computed<Set<number>>((before) => {
+  const ids = new Set(messages.value.map(m => m.id))
+  return before && before.size === ids.size && [...ids].every(i => before.has(i)) ? before : ids
+})
+function reconcile(items: Outgoing[], ids: Set<number>) {
   const now = Date.now()
-  const present = new Map(items.map(o => [o.id, o]))
-  const next: Leaving[] = []
-  // Those still in the outbox, updated; those gone from it, sent: kept, timed.
-  for (const l of leaving_.value) {
-    const o = present.get(l.item.id)
-    next.push(o ? { item: o, sentAt: null } : { item: l.item, sentAt: l.sentAt ?? now })
-  }
-  for (const o of items) {
-    if (!o.scheduled && o.in_reply_to !== null && ids.has(o.in_reply_to) && !next.some(l => l.item.id === o.id)) next.push({ item: o, sentAt: null })
-  }
+  const { next, clock: waiting } = reconcileLeaving(leaving_.value, items, ids, now)
   leaving_.value = next
-  clearInterval(clockTimer)
-  if (next.some(l => l.sentAt !== null)) clockTimer = setInterval(() => (clock.value = Date.now()), 2000)
-}, { immediate: true })
+  clock.value = now
+  // Kept running while a sent reply waits (restarted at every change, it would never tick), and
+  // stopped once none does.
+  if (!waiting) {
+    clearInterval(clockTimer)
+    clockTimer = undefined
+  } else if (!clockTimer) {
+    clockTimer = setInterval(() => reconcile(outbox.items.value, threadIds.value), 2000)
+  }
+}
+watch([() => outbox.items.value, threadIds], ([items, ids]) => reconcile(items, ids), { immediate: true })
 watch(() => props.threadId, () => {
   leaving_.value = []
 })
 /** Shown: on its way, or sent and not yet arrived (a message of mine in the conversation since). */
 const pendingReplies = computed(() => leaving_.value.filter((l) => {
   if (l.sentAt === null) return true
-  if (clock.value - l.sentAt > 60_000) return false
+  if (clock.value - l.sentAt > SENT_SHOWN) return false
   const since = l.item.send_at - 60
   return !messages.value.some(m => m.date >= since && isMine(m.from?.email, props.accountId))
 }))
@@ -346,24 +363,39 @@ watch(covered, (now) => {
 const { done } = useUndo()
 
 /** `label`: the action can be undone, its toast offers it. */
-async function run(action: () => Promise<number | null | void>, leaves = true, label?: string, icon?: string) {
+/** The thread a leaving action is under way on: a second one on it (a double `e`) would act on
+ *  the same messages. Another thread opened meanwhile is free. */
+let acting: number | null = null
+/** `thread`: the thread acted on, when taken before a picker (another may be shown by then). */
+async function run(action: () => Promise<number | null | void>, leaves = true, label?: string, icon?: string, thread = props.threadId) {
+  if (leaves && acting === thread) return
+  // Another thread opened meanwhile is not the one left: the list does not move past it.
   try {
-    if (leaves) leaving = true
+    if (leaves) {
+      leaving = true
+      acting = thread
+    }
     const token = await action()
-    if (leaves) emit('done')
+    if (leaves && props.threadId === thread) emit('done')
     if (label && typeof token === 'number') done(token, label, icon)
   } catch (e) {
     leaving = false
     showError(e)
+  } finally {
+    if (leaves && acting === thread) acting = null
   }
 }
+
+/** The thread's row in the list, taken before an action awaits: another may be open by then. */
+const place = () => ({ account_id: props.accountId, thread_id: props.threadId, mailbox_id: props.mailboxId })
 
 function onHere(action: (ids: number[]) => Promise<number | null | void>, label?: string, icon?: string) {
   const ids = here.value
   if (!ids.length) return Promise.resolve()
+  const row = place()
   return run(async () => {
     const token = await action(ids)
-    listStale.bump({ account_id: props.accountId, thread_id: props.threadId, mailbox_id: props.mailboxId })
+    listStale.bump(row)
     return token
   }, true, label, icon)
 }
@@ -427,7 +459,11 @@ const archive = () => (props.restoreMode
 const inTrash = computed(() => mailboxes.value.find(m => m.id === props.mailboxId)?.role === 'trash')
 const trash = () => onHere(ids => api.trash(ids, inTrash.value), t('mail.threadView.deleted'), 'i-lucide-trash-2')
 const markUnread = () => run(async () => {
-  if (latest.value && !resetPending.value) await api.setFlag([latest.value.id], 'seen', false)
+  if (latestHere.value && !resetPending.value) {
+    const id = latestHere.value.id
+    await api.setFlag([id], 'seen', false)
+    listStale.markSeen([id], false)
+  }
   emit('close')
 }, false)
 const { ask } = useWhenPicker()
@@ -436,17 +472,29 @@ async function snooze() {
   // Taken before the picker: the thread shown may change while it is open.
   const ids = here.value
   if (!ids.length) return
+  const row = place()
   const until = await ask({ kind: 'snooze', title: t('mail.threadView.snoozeUntil') })
   if (until === null) return
-  await run(() => api.snooze(ids, until), true, t('mail.threadView.backOn', { when: untilLabel(until) }), 'i-lucide-alarm-clock')
+  await run(async () => {
+    const token = await api.snooze(ids, until)
+    listStale.bump(row)
+    return token
+  }, true, t('mail.threadView.backOn', { when: untilLabel(until) }), 'i-lucide-alarm-clock', row.thread_id)
 }
-const unsnooze = () => (resetPending.value ? undefined : run(() => api.unsnooze(props.accountId, props.threadId)))
+const unsnooze = () => {
+  if (resetPending.value) return
+  const row = place()
+  return run(async () => {
+    await api.unsnooze(row.account_id, row.thread_id)
+    listStale.bump(row)
+  })
+}
 // Pin marks the latest message; unpin clears every pinned message of the thread (the pin may
 // sit on an older one, e.g. pinned before a reply arrived).
 const toggleFlag = () => resetPending.value ? undefined : run(() => {
   emit('pinned')
   if (flagged.value) return api.setFlag(messages.value.filter(m => m.flags.flagged).map(m => m.id), 'flagged', false)
-  return latest.value ? api.setFlag([latest.value.id], 'flagged', true) : Promise.resolve()
+  return latestHere.value ? api.setFlag([latestHere.value.id], 'flagged', true) : Promise.resolve()
 }, false)
 
 const inJunk = computed(() => mailboxes.value.find(m => m.id === props.mailboxId)?.role === 'junk')
@@ -558,7 +606,15 @@ async function blockSender(email: string) {
     title: t('mail.threadView.blockTitle'),
     kind: 'warning'
   })
-  if (ok) await run(() => api.blockSender(email))
+  // Its inbox messages go to the junk folder: the thread leaves the list only when shown from the
+  // inbox, and the rows past the first page go too.
+  const leaves = mailboxes.value.find(m => m.id === props.mailboxId)?.role === 'inbox' && here.value.length > 0
+  if (ok) {
+    await run(async () => {
+      await api.blockSender(email)
+      listStale.bump()
+    }, leaves)
+  }
 }
 
 const moveItems = computed<DropdownMenuItem[]>(() =>
@@ -838,7 +894,7 @@ useEventListener('keydown', (e: KeyboardEvent) => {
               :expanded="expanded.has(row.message.id)"
               :loading="loadingIds.has(row.message.id)"
               :latest="row.message.id === replyTarget?.id"
-              @toggle="toggle(row.message.id)"
+              @toggle="toggle"
             />
           </div>
           <button

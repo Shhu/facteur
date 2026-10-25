@@ -158,7 +158,7 @@ export interface NewAccount {
   auth: NewAuth
 }
 
-export type Role = 'inbox' | 'sent' | 'drafts' | 'trash' | 'junk' | 'archive' | 'all' | 'flagged' | 'snoozed' | 'screener' | 'refused'
+export type Role = 'inbox' | 'sent' | 'drafts' | 'trash' | 'junk' | 'archive' | 'all' | 'flagged' | 'important' | 'snoozed' | 'screener' | 'refused'
 
 export interface Mailbox {
   id: number

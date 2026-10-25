@@ -7,6 +7,8 @@ export function useReloader(load: () => Promise<unknown>, interval = 2000) {
   let pending = false
   let last = 0
   let timer: ReturnType<typeof setTimeout> | undefined
+  /** The screen is gone: a load finishing after it schedules nothing more. */
+  let disposed = false
 
   async function run() {
     clearTimeout(timer)
@@ -18,11 +20,12 @@ export function useReloader(load: () => Promise<unknown>, interval = 2000) {
       await load()
     } finally {
       running--
-      if (pending && !running) schedule()
+      if (pending && !running && !disposed) schedule()
     }
   }
 
   function schedule() {
+    if (disposed) return
     if (running) {
       pending = true
       return
@@ -31,6 +34,9 @@ export function useReloader(load: () => Promise<unknown>, interval = 2000) {
     timer = setTimeout(run, Math.max(0, last + interval - Date.now()))
   }
 
-  onScopeDispose(() => clearTimeout(timer))
+  onScopeDispose(() => {
+    disposed = true
+    clearTimeout(timer)
+  })
   return { schedule, now: run }
 }

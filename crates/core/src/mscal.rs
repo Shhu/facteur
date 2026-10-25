@@ -167,7 +167,9 @@ fn written(json: &serde_json::Value) -> Result<Instance> {
 /// `key`: Graph's `transactionId`, so that a creation sent again after an uncertain answer is not
 /// made twice.
 /// `repeat`: a series (its first occurrence the draft's times).
-pub async fn create(token: &str, calendar_id: &str, key: &str, changes: &EventChanges, repeat: Option<&crate::repeat::Repeat>) -> Result<Instance> {
+/// `retry`: this form's key was sent before: Graph may give back the event that try created,
+/// which then takes the version sent now.
+pub async fn create(token: &str, calendar_id: &str, key: &str, changes: &EventChanges, repeat: Option<&crate::repeat::Repeat>, retry: bool) -> Result<Instance> {
     let mut body = body(changes)?;
     if let (Some(repeat), Some((start, end, all_day))) = (repeat, changes.times) {
         let day = crate::calendar::first_day(start, end, all_day, changes.zone.as_deref());
@@ -175,7 +177,17 @@ pub async fn create(token: &str, calendar_id: &str, key: &str, changes: &EventCh
     }
     body["transactionId"] = key.into();
     let req = client()?.post(url(&["me", "calendars", calendar_id, "events"])?).header("Content-Type", "application/json").body(serde_json::to_vec(&body)?);
-    written(&write(req, token).await?)
+    let made = write(req, token).await?;
+    // Graph gives back the event an earlier try of this form created: it takes the version sent
+    // now (edited since). Known from this facteur having sent the key, not from the clock.
+    if retry && let Some(id) = made["id"].as_str() {
+        if let Some(fields) = body.as_object_mut() {
+            fields.remove("transactionId");
+        }
+        let req = client()?.patch(url(&["me", "events", id])?).header("Content-Type", "application/json").body(serde_json::to_vec(&body)?);
+        return written(&write(req, token).await?);
+    }
+    written(&made)
 }
 
 pub async fn update(token: &str, event_id: &str, changes: &EventChanges) -> Result<Instance> {

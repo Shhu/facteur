@@ -24,7 +24,15 @@ fn mailbox(s: &str) -> Result<Mailbox> {
     if !exact {
         return Err(Error::Smtp(crate::tr!("adresse ambiguë « {s} » : mettez le nom entre guillemets", "ambiguous address “{s}”: put the name in quotes")));
     }
-    Ok(m)
+    // An accented domain in its ASCII form (IDNA): delivered by every server, where the
+    // accented one needs SMTPUTF8.
+    let domain = m.email.domain();
+    if domain.is_ascii() {
+        return Ok(m);
+    }
+    let ascii = idna::domain_to_ascii(domain).map_err(|e| Error::Smtp(crate::tr!("adresse invalide « {s} » : {e}", "invalid address “{s}”: {e}")))?;
+    let email = lettre::Address::new(m.email.user(), ascii).map_err(|e| Error::Smtp(crate::tr!("adresse invalide « {s} » : {e}", "invalid address “{s}”: {e}")))?;
+    Ok(Mailbox::new(m.name, email))
 }
 
 /// Also returns the raw bytes, for the Sent folder. `as_draft`: keeps Bcc recipients. A draft is
@@ -292,7 +300,9 @@ async fn send_with(account: &Account, credential: &Credential, message: &Message
     // message it has not received, so a failure there is retried.
     let connect = async {
         let tls = |host: &str| TlsParameters::new(host.to_string()).map_err(smtp_err);
-        let hello = ClientId::default();
+        // An address literal, as Thunderbird says it: the machine's name would reach every
+        // recipient in the server's Received header.
+        let hello = ClientId::Ipv4(std::net::Ipv4Addr::LOCALHOST);
         // The address that answers first (one dropped by the network, IPv6 on some, would take
         // the whole time), handed to lettre: one connection for the whole exchange.
         let tcp = match tokio::time::timeout(Duration::from_secs(30), crate::imap::tcp_connect(&s.host, s.port)).await {
@@ -559,6 +569,16 @@ mod tests {
         assert!(html.contains("<p>data:image/png;base64,!!</p>") && html.contains("cid:img1@facteur"));
     }
 
+    #[test]
+    fn an_accented_recipient_domain_is_sent_in_ascii() {
+        let draft = Draft { to: vec!["Contact <contact@société.fr>".into()], subject: "x".into(), body: "y".into(), ..Default::default() };
+        let (message, raw) = build_outgoing(&account(), &draft, None, &[]).unwrap();
+        let to: Vec<String> = message.envelope().to().iter().map(ToString::to_string).collect();
+        assert_eq!(to, ["contact@xn--socit-esab.fr"]);
+        let head = String::from_utf8_lossy(&raw);
+        assert!(head.lines().find(|l| l.starts_with("To:")).is_some_and(str::is_ascii), "{head}");
+    }
+
     fn account() -> Account {
         let srv = ServerConfig { host: "localhost".into(), port: 25, security: Security::None };
         Account {
@@ -667,6 +687,8 @@ mod tests {
                         }
                         let verb = line.split([' ', ':']).next().unwrap_or("").to_ascii_uppercase();
                         let reply: String = match verb.as_str() {
+                            // The machine's name never reaches the server (nor the Received headers).
+                            "EHLO" if line != "EHLO [127.0.0.1]" => "501 hello reveals the hostname\r\n".into(),
                             "EHLO" => "250-localhost\r\n250 8BITMIME\r\n".into(),
                             "MAIL" => format!("{}\r\n", mail_reply.unwrap_or("250 ok")),
                             "RCPT" => format!("{}\r\n", rcpt_reply.unwrap_or("250 ok")),

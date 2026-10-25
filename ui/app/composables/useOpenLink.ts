@@ -36,13 +36,27 @@ export function linkText(link: Element): { text: string, doubtful: boolean } {
     hidden.set(el, result)
     return result
   }
-  const walker = doc.createTreeWalker(link, NodeFilter.SHOW_TEXT)
+  const walker = doc.createTreeWalker(link, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT)
   let text = ''
+  let alts = ''
   for (let n = walker.nextNode(); n; n = walker.nextNode()) {
-    if (!isHidden(n.parentElement)) text += n.nodeValue ?? ''
+    if (n.nodeType === Node.TEXT_NODE) {
+      if (!isHidden(n.parentElement)) text += n.nodeValue ?? ''
+    } else if ((n as Element).tagName === 'IMG' && !isHidden(n as Element)) {
+      // A blocked image shows its alt text in its place; one shown hides it. After the text:
+      // never ahead of a domain the user reads.
+      const img = n as HTMLImageElement
+      if (!img.getAttribute('src') || (img.complete && img.naturalWidth === 0)) alts += ` ${img.getAttribute('alt') ?? ''}`
+    }
   }
-  const doubtful = [link, ...link.querySelectorAll('*')].some(el =>
-    generatedText(view.getComputedStyle(el, '::before').content) || generatedText(view.getComputedStyle(el, '::after').content))
+  text += alts
+  // Text a style writes, or shows in another order than written (`<bdo>`, bidi overrides):
+  // what is read is not what is seen. A right-to-left mail's direction alone is no reordering.
+  const doubtful = [link, ...link.querySelectorAll('*')].some((el) => {
+    const s = view.getComputedStyle(el)
+    return el.tagName === 'BDO' || /override|plaintext/.test(s.unicodeBidi)
+      || generatedText(view.getComputedStyle(el, '::before').content) || generatedText(view.getComputedStyle(el, '::after').content)
+  })
   return { text: text.trim(), doubtful }
 }
 

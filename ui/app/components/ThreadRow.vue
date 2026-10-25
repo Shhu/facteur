@@ -7,8 +7,9 @@ const props = defineProps<{
   opened: number | null
   selected: Set<string>
   selecting: boolean
-  /** Key of the hovered row: only it carries the action buttons. */
-  hovered: string | null
+  /** The row under the pointer: only it carries the action buttons. A boolean, so that moving
+   *  the pointer re-renders the two rows concerned, not every row. */
+  hovered: boolean
   actions: (item: ListItem) => { kind: ListAction, icon: string, label: string }[]
   /** DOM id of the row, the list's `aria-activedescendant` when it is the open thread. */
   rowId: string
@@ -100,7 +101,7 @@ const preview = computed(() => {
           {{ item.count }}
         </span>
 
-        <span v-if="hovered !== item.key" class="ms-auto flex shrink-0 items-center gap-1.5 ps-1 text-xs">
+        <span v-if="!hovered" class="ms-auto flex shrink-0 items-center gap-1.5 ps-1 text-xs">
           <UIcon v-if="item.attachments" name="i-lucide-paperclip" class="size-3.5 text-muted" />
           <UIcon v-if="item.flagged" name="i-lucide-pin" class="size-3.5 text-primary" />
           <!-- Snoozed: the due time replaces the date. Back from snooze: an alarm icon says so. -->

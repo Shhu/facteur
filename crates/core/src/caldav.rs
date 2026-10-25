@@ -380,14 +380,17 @@ impl Client {
         }
     }
 
-    /// A new event in `calendar`, under a name of its own.
     /// A new event in `calendar`, under a name made of its UID: sent again after an uncertain
-    /// answer, the server refuses the copy (412), which counts as done.
+    /// answer (or edited in the form still open after a failure), the server holds it already
+    /// (412). That one is facteur's own, under this form's UID: it takes the version sent now,
+    /// or a correction made meanwhile would be lost while the guests are told of it.
     pub async fn create(&self, calendar: &Url, uid: &str, ics: &str) -> Result<Url> {
         let base = if calendar.path().ends_with('/') { calendar.clone() } else { Url::parse(&format!("{calendar}/")).map_err(|e| Error::Other(e.to_string()))? };
         let href = base.join(&format!("{uid}.ics")).map_err(|e| Error::Other(e.to_string()))?;
         let answer = self.put(&href, ics, Some(("If-None-Match", "*"))).await?;
-        if answer.status != StatusCode::PRECONDITION_FAILED {
+        if answer.status == StatusCode::PRECONDITION_FAILED {
+            checked(self.put(&href, ics, None).await?)?;
+        } else {
             checked(answer)?;
         }
         Ok(href)

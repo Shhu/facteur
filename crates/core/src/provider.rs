@@ -225,6 +225,7 @@ pub fn gmail_label(name: &str, role: Option<Role>) -> String {
         Some(Role::Sent) => return "\\Sent".into(),
         Some(Role::Drafts) => return "\\Draft".into(),
         Some(Role::Flagged) => return "\\Starred".into(),
+        Some(Role::Important) => return "\\Important".into(),
         _ => {}
     }
     let leaf = name.rsplit('/').next().unwrap_or(name);
@@ -359,6 +360,7 @@ mod tests {
         assert_eq!(gmail_label("INBOX", Some(Role::Inbox)), "\\Inbox");
         assert_eq!(gmail_label("[Gmail]/Messages envoy&AOk-s", Some(Role::Sent)), "\\Sent");
         assert_eq!(gmail_label("[Gmail]/Important", None), "\\Important");
+        assert_eq!(gmail_label("[Gmail]/Wichtig", Some(Role::Important)), "\\Important", "whatever the language");
         assert_eq!(gmail_label("L&AOk-o &AOk-cole", None), "\"L&AOk-o &AOk-cole\"");
         assert_eq!(gmail_label("Boutiques/\"Amazon\"", None), "\"Boutiques/\\\"Amazon\\\"\"");
         assert_eq!(gmail_label_search("INBOX", Some(Role::Inbox)), "X-GM-LABELS \"\\\\Inbox\"");

@@ -107,25 +107,50 @@ pub async fn discover(email: &str) -> Result<Discovered> {
     }
 }
 
+const AUTOCONFIG_MAX: usize = 256 * 1024;
+
 fn http_client() -> Result<reqwest::Client> {
     // reqwest is built without a default crypto provider: install the engine's.
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(3))
         .timeout(HTTP_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::limited(3))
+        // An https answer redirected to plain http is no https answer: someone on the network
+        // could have written it, and it would be trusted ahead of the others.
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 3 {
+                attempt.error("too many redirects")
+            } else if downgrades(attempt.previous(), attempt.url()) {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        }))
         .user_agent("facteur")
         .build()
         .map_err(|e| Error::Other(e.to_string()))
 }
 
+/// A redirect from https to plain http.
+fn downgrades(previous: &[reqwest::Url], next: &reqwest::Url) -> bool {
+    next.scheme() != "https" && previous.iter().any(|u| u.scheme() == "https")
+}
+
+/// Asked over https, answered over plain http in the end.
+fn ended_plain(asked: &str, scheme: &str) -> bool {
+    asked.starts_with("https:") && scheme != "https"
+}
+
 async fn fetch_config(http: &reqwest::Client, url: &str, email: &str) -> Option<Discovered> {
     let resp = http.get(url).send().await.ok()?;
-    if !resp.status().is_success() {
+    // An https answer that ended on plain http is none (see `http_client`); plain http that
+    // ended on https is no worse than it began.
+    if !resp.status().is_success() || ended_plain(url, resp.url().scheme()) {
         return None;
     }
-    let text = resp.text().await.ok()?;
-    let found = parse_autoconfig(&text, email);
+    // A configuration is a few kilobytes: a hostile domain's endless answer is not read whole.
+    let body = crate::http::read_capped(resp, AUTOCONFIG_MAX).await.ok()?;
+    let found = parse_autoconfig(&String::from_utf8_lossy(&body), email);
     if found.is_some() {
         debug!(url, "autoconfig found");
     }
@@ -485,6 +510,16 @@ pub(crate) fn urlencode(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_https_answer_redirected_to_http_is_not_followed() {
+        let url = |u: &str| reqwest::Url::parse(u).unwrap();
+        assert!(downgrades(&[url("https://example.org/.well-known/autoconfig/mail/config-v1.1.xml")], &url("http://www.example.org/")));
+        assert!(!downgrades(&[url("https://example.org/a")], &url("https://www.example.org/b")));
+        assert!(!downgrades(&[url("http://autoconfig.example.org/a")], &url("http://example.org/b")), "plain from the start: checked apart");
+        assert!(ended_plain("https://example.org/a", "http"));
+        assert!(!ended_plain("http://autoconfig.example.org/a", "https"), "plain that ended on https is kept");
+    }
+
     const XML: &str = r#"<?xml version="1.0"?>
 <clientConfig version="1.1">
   <emailProvider id="example.com">
@@ -511,6 +546,26 @@ mod tests {
         assert_eq!(d.smtp.security, Security::Tls);
         assert_eq!(d.username, "jean");
         assert_eq!(d.provider.as_deref(), Some("Exemple"));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_autoconfig_answer_is_ignored() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            for body in [format!("{XML}{}", " ".repeat(1 << 20)), XML.to_string()] {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let _ = sock.read(&mut request).await;
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/mail/config-v1.1.xml");
+        assert!(fetch_config(&http_client().unwrap(), &url, "jean@example.com").await.is_none(), "too large to be a configuration");
+        assert!(fetch_config(&http_client().unwrap(), &url, "jean@example.com").await.is_some());
     }
 
     #[test]

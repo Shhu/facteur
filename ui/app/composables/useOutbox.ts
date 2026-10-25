@@ -29,7 +29,9 @@ const QUIT_SEND_WAIT = 30_000
  *  QUIT_SEND_WAIT, what has not started stays in the outbox, but a transfer under way is still
  *  waited for: the engine's SMTP timeouts bound it, and closing again quits at once. */
 export async function flushOutboxBeforeQuit(onWait?: (count: number) => void): Promise<void> {
-  const leaving = (await api.outbox().catch(() => [] as Outgoing[])).filter(o => !o.scheduled && o.state !== 'failed')
+  // Every transfer under way, a scheduled message's included (due while facteur was off, sent at
+  // launch); and those still in their undo delay, sent now.
+  const leaving = (await api.outbox().catch(() => [] as Outgoing[])).filter(o => o.state === 'sending' || (!o.scheduled && o.state === 'pending'))
   if (!leaving.length) return
   onWait?.(leaving.length)
   const ids = new Set(leaving.map(o => o.id))

@@ -20,6 +20,8 @@ html-escape = "0.3.0"
 # Already there through idna: NFD, for searches that ignore accents (`store::fold`).
 icu_normalizer = { version = "2.3", default-features = false, features = ["compiled_data"] }
 idna = "1.1"
+# Already there through png and mail-auth: a PDF's compressed objects read for active content.
+flate2 = "1.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "ico", "bmp"] }
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "webpki-roots", "hostname"] }
 # `full_encoding`: multibyte charsets (Shift_JIS, GBK, Big5, EUC-KR, ISO-2022-JP), not left to

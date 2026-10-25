@@ -219,6 +219,8 @@ async function markAllRead(a: Account, unread: number) {
   if (!ok) return
   try {
     await api.markAccountRead(a.id)
+    // Rows past the list's first page are not reread by its usual refresh.
+    useListStale().bump()
   } catch (e) {
     showError(e)
   }

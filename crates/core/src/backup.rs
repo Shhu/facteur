@@ -73,6 +73,10 @@ pub struct BackupStats {
     /// Messages still on the server that it did not send (refused, a bandwidth limit reached):
     /// not saved this time, the next backup asks for them again.
     pub failed: usize,
+    /// Folders listed but that the server will not open (shared without the read right): left
+    /// out, named in the log, not counted as failed (it will not change by asking again).
+    #[serde(default)]
+    pub unreadable_folders: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -154,6 +158,8 @@ pub async fn backup_account(
 ) -> Result<BackupStats> {
     let mut stats = BackupStats::default();
     let mut folders = Vec::new();
+    // The disk as it was before this run: files a failed one left unindexed differ from it.
+    let before = signature(root).ok();
     let listed: Vec<_> = imap::list_mailboxes(lease.session()).await?.into_iter().filter(|l| l.selectable).collect();
     std::fs::create_dir_all(root)?;
     let sep = info_sep(root);
@@ -196,15 +202,24 @@ pub async fn backup_account(
             "{n} message(s) could not be saved (refused by the server): the next backup will ask for them again"
         )));
     }
-    // The index followed every file written: a catalog already read in this session does not
-    // need to read the whole backup again because of this run.
-    if let Ok(mut known) = refreshed().lock()
-        && known.contains_key(root)
-        && let Ok(sig) = signature(root)
-    {
-        known.insert(root.to_path_buf(), sig);
-    }
+    mark_current(root, before);
     Ok(stats)
+}
+
+/// After a run whose index followed every file it wrote: a catalog already read in this session
+/// need not read the whole backup again for it, unless the disk had changed before it (files a
+/// failed run left unindexed), which the next catalog then reads.
+fn mark_current(root: &Path, before: Option<u64>) {
+    let Ok(mut known) = refreshed().lock() else { return };
+    let Some(cached) = known.get(root).copied() else { return };
+    match signature(root) {
+        Ok(sig) if before == Some(cached) => {
+            known.insert(root.to_path_buf(), sig);
+        }
+        _ => {
+            known.remove(root);
+        }
+    }
 }
 
 /// Backup directory of each folder (relative to the account's directory). Two IMAP folders
@@ -223,18 +238,21 @@ fn unique_paths(root: &Path, folders: &[(&str, Option<&str>)]) -> Vec<PathBuf> {
         groups.entry(key(p)).or_default().push(i);
     }
     let mut out = plain.clone();
-    for members in groups.values().filter(|m| m.len() > 1) {
+    for members in groups.values() {
         let saved: Option<String> = std::fs::read(root.join(&plain[members[0]]).join(FOLDER_FILE))
             .ok()
             .and_then(|b| serde_json::from_slice::<FolderInfo>(&b).ok())
             .map(|info| info.name);
-        let owner = members
-            .iter()
-            .copied()
-            .find(|i| saved.as_deref() == Some(folders[*i].0))
-            .or_else(|| members.iter().copied().min_by_key(|i| folders[*i].0))
-            .expect("non-empty group");
-        for &i in members.iter().filter(|i| **i != owner) {
+        // The directory stays its saver's, even once that folder is gone from the server: a twin
+        // taking it over would mix the old folder's mail into its own (and restore it there).
+        let owner = match saved {
+            Some(saved) => members.iter().copied().find(|i| saved == folders[*i].0),
+            None => members.iter().copied().min_by_key(|i| folders[*i].0),
+        };
+        if members.len() == 1 && owner.is_some() {
+            continue;
+        }
+        for &i in members.iter().filter(|i| Some(**i) != owner) {
             let mut p = plain[i].clone();
             let leaf = p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
             p.set_file_name(format!("{leaf}~{:06x}", fnv1a(folders[i].0.as_bytes()) & 0xff_ffff));
@@ -310,7 +328,28 @@ async fn backup_folder(
     // Every exchange is bounded: a connection dead during an automatic backup (sleep) must not
     // leave it "in progress" until a restart.
     let what = crate::tr!("sauvegarde", "backup");
-    let mb = bounded(120, &what, async { Ok(lease.session().examine(name).await?) }).await?;
+    // A folder listed but not readable (shared without the read right): counted as failed, the
+    // other folders still saved.
+    let mb = match bounded(120, &what, async { Ok(lease.session().examine(name).await?) }).await {
+        // Refused for good (no read right, gone): noted apart, so the backup is not retried every
+        // hour for it. For a while (locked, busy, throttled): failed, tried again soon.
+        Err(Error::Imap(async_imap::error::Error::No(why))) => {
+            tracing::warn!("backup: folder {name} refused: {why}");
+            let upper = why.to_ascii_uppercase();
+            if ["[NOPERM]", "[NONEXISTENT]", "[NOACCESS]"].iter().any(|c| upper.contains(c)) {
+                stats.unreadable_folders.push(utf7::decode(name));
+            } else {
+                stats.failed += 1;
+            }
+            let mut held = 0;
+            for entry in std::fs::read_dir(dir.join("cur"))? {
+                let entry = entry?;
+                held += usize::from(index::is_message_file(&entry, &entry.file_name().to_string_lossy()));
+            }
+            return Ok(held);
+        }
+        mb => mb?,
+    };
     let validity = mb.uid_validity.unwrap_or(0);
     let mut have: HashMap<u32, String> = HashMap::new();
     let mut total_files = 0;
@@ -365,6 +404,8 @@ async fn backup_folder(
         if i > 0 && lease.give_way().await? {
             let again = bounded(120, &what, async { Ok(lease.session().examine(name).await?) }).await?;
             if again.uid_validity != mb.uid_validity {
+                // Not saved: the backup is incomplete, tried again within the hour.
+                stats.failed += missing.len().saturating_sub(i * CHUNK);
                 return Ok(total_files);
             }
         }
@@ -696,6 +737,41 @@ pub async fn restore(
     for item in selection.items {
         groups.entry(item.folder.clone()).or_default().push(item);
     }
+    // Back where they were: a message moved since the backup is on the server in another folder,
+    // and must not come back twice. Read once from the other folders (not the bin or junk, whose
+    // messages are on their way out).
+    let (mut elsewhere, mut elsewhere_anon) = (HashSet::new(), HashSet::new());
+    if matches!(target, RestoreTarget::Original) {
+        let restored: HashSet<&str> = groups.keys().filter_map(|f| selection.folders.get(f)).map(|i| i.name.as_str()).collect();
+        // Gmail: All Mail holds every other folder's messages already.
+        let all = listed.iter().find(|l| l.selectable && l.role == Some(crate::model::Role::All));
+        let others: Vec<&imap::ListedMailbox> = match all {
+            Some(all) => vec![all],
+            None => listed
+                .iter()
+                .filter(|l| l.selectable && !matches!(l.role, Some(crate::model::Role::Trash | crate::model::Role::Junk)) && !restored.contains(l.name.as_str()))
+                .collect(),
+        };
+        for other in &others {
+            match message_ids(lease.session(), &other.name).await {
+                Ok((ids, anon)) => {
+                    elsewhere.extend(ids);
+                    elsewhere_anon.extend(anon);
+                }
+                Err(e) => return Err(interrupted(e, &stats)),
+            }
+        }
+        if !others.is_empty()
+            && let Err(e) = bounded(60, &what, async { Ok(lease.session().close().await?) }).await
+        {
+            return Err(interrupted(e, &stats));
+        }
+    }
+    // Sent in this run (Message-ID, size): a message saved twice, in two folders too, goes back
+    // once. The size tells apart two versions of a draft sharing a Message-ID.
+    let mut appended: HashSet<(String, i64)> = HashSet::new();
+    // Without a Message-ID: (arrival date, size), on the server or sent in this run.
+    let mut appended_anon: HashSet<(i64, i64)> = HashSet::new();
     // APPENDs refused before the continuation, one after the other.
     let mut refused_in_row = 0;
     for (folder, items) in groups {
@@ -747,11 +823,6 @@ pub async fn restore(
         let label = utf7::decode(&info.name);
         let total = items.len();
         let dir = root.join(&folder);
-        // Sent in this run (Message-ID, size): a message saved twice goes back once. The size
-        // tells apart two versions of a draft sharing a Message-ID.
-        let mut appended: HashSet<(String, i64)> = HashSet::new();
-        // Without a Message-ID: (arrival date, size), on the server or sent in this run.
-        let mut appended_anon: HashSet<(i64, i64)> = HashSet::new();
         for (i, item) in items.iter().enumerate() {
             // The connection may go to another between two: back, it may have a folder selected
             // (an EXISTS before APPEND's continuation fails the message), closed again. Examined
@@ -768,8 +839,8 @@ pub async fn restore(
             let session = lease.session();
             let again = item.message_id.as_ref().is_some_and(|m| appended.contains(&(m.clone(), item.size)));
             let anon = anon_key(item);
-            let anon_there = anon.is_some_and(|k| present_anon.contains(&k) || appended_anon.contains(&k));
-            if again || anon_there || item.message_id.as_ref().is_some_and(|m| present.contains(m)) {
+            let anon_there = anon.is_some_and(|k| present_anon.contains(&k) || elsewhere_anon.contains(&k) || appended_anon.contains(&k));
+            if again || anon_there || item.message_id.as_ref().is_some_and(|m| present.contains(m) || elsewhere.contains(m)) {
                 stats.skipped += 1;
             } else if let Some(path) = index::find_file(&dir, &item.file) {
                 let raw = match std::fs::read(path) {
@@ -1196,6 +1267,9 @@ mod tests {
         assert_eq!(paths[1], PathBuf::from("Projet_A"));
         assert!(paths[0].to_string_lossy().starts_with("Projet_A~"));
         assert_eq!(fnv1a(b"a"), 0xe40c_292c, "the reference FNV-1a: the same suffix on every version");
+        // Its saver deleted on the server: the twin keeps its own directory, not the saver's.
+        let alone = unique_paths(root.path(), &[("Projet:A", Some("/"))]);
+        assert!(alone[0].to_string_lossy().starts_with("Projet_A~"), "{:?}", alone[0]);
     }
 
     #[test]
@@ -1234,6 +1308,25 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         write_synced(&dir.join("cur").join("6.U2V1.facteur:2,"), b"Message-ID: <b@x>\r\n\r\ny").unwrap();
         assert_ne!(signature(root.path()).unwrap(), sig, "a new file changes the signature");
+        assert_eq!(catalog(root.path(), &RestoreFilter::default(), 10, 0).unwrap().matching, 2);
+    }
+
+    #[test]
+    fn a_backup_does_not_hide_files_a_failed_run_left_unindexed() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("INBOX");
+        for sub in ["cur", "new", "tmp"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        write_atomic(&dir.join(FOLDER_FILE), &serde_json::to_vec(&FolderInfo { name: "INBOX".into(), delimiter: None }).unwrap()).unwrap();
+        write_synced(&dir.join("cur").join("5.U1V1.facteur:2,S"), b"Message-ID: <a@x>\r\n\r\nx").unwrap();
+        assert_eq!(catalog(root.path(), &RestoreFilter::default(), 10, 0).unwrap().matching, 1);
+        // A run cut after writing a file, before indexing it.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_synced(&dir.join("cur").join("6.U2V1.facteur:2,"), b"Message-ID: <b@x>\r\n\r\ny").unwrap();
+        // The next run succeeds.
+        let before = signature(root.path()).ok();
+        mark_current(root.path(), before);
         assert_eq!(catalog(root.path(), &RestoreFilter::default(), 10, 0).unwrap().matching, 2);
     }
 
@@ -1377,6 +1470,33 @@ mod tests {
         assert_eq!(message_ids(&mut deleted, "INBOX").await.unwrap().0, HashSet::from(["a@x".to_string()]));
     }
 
+    #[tokio::test]
+    async fn a_folder_the_server_refuses_to_open_does_not_stop_the_backup() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("Partage");
+        let place = Place { root: root.path(), dir: &dir, rel: "Partage", sep: info_sep(root.path()) };
+        let mut session = scripted(vec!["{tag} NO [NOPERM] no read right"]).await;
+        let mut stats = BackupStats::default();
+        let saved = backup_folder(&mut session, "Partage", Some("/"), &place, &mut stats, &mut |_| {}).await.unwrap();
+        assert_eq!((saved, stats.failed), (0, 0), "no message refused: not retried every hour");
+        assert_eq!(stats.unreadable_folders, ["Partage"], "named, the next folders still saved");
+    }
+
+    #[tokio::test]
+    async fn a_folder_refused_for_a_while_is_a_failed_backup() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("INBOX");
+        std::fs::create_dir_all(dir.join("cur")).unwrap();
+        std::fs::write(dir.join("cur").join("1.U4V1.facteur!2,S"), b"Subject: x\r\n\r\ny").unwrap();
+        let place = Place { root: root.path(), dir: &dir, rel: "INBOX", sep: info_sep(root.path()) };
+        let mut session = scripted(vec!["{tag} NO [INUSE] Mailbox is locked"]).await;
+        let mut stats = BackupStats::default();
+        let saved = backup_folder(&mut session, "INBOX", Some("/"), &place, &mut stats, &mut |_| {}).await.unwrap();
+        assert_eq!(saved, 1, "what the backup already holds still counts");
+        assert!(stats.failed >= 1, "tried again soon, not in a day");
+        assert!(stats.unreadable_folders.is_empty());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_message_saved_in_another_folder_is_copied_not_downloaded() {
         let root = tempfile::tempdir().unwrap();
@@ -1455,6 +1575,32 @@ mod tests {
         let sep = info_sep(root.path());
         assert_eq!(sep, if cfg!(windows) { '!' } else { ':' });
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0, "the probe leaves nothing behind");
+    }
+
+    #[tokio::test]
+    async fn a_message_moved_since_the_backup_does_not_come_back_twice() {
+        let root = tempfile::tempdir().unwrap();
+        let cur = root.path().join("INBOX").join("cur");
+        std::fs::create_dir_all(&cur).unwrap();
+        std::fs::write(cur.join("100.U1V1.facteur:2,"), b"Message-ID: <m@x>\r\n\r\nx").unwrap();
+        let item = Item { folder: "INBOX".into(), file: "100.U1V1.facteur:2,".into(), received: 100, flags: String::new(), message_id: Some("m@x".into()), size: 22, subject: String::new() };
+        let folders = HashMap::from([("INBOX".to_string(), FolderInfo { name: "INBOX".into(), delimiter: Some("/".into()) })]);
+        let mut session = scripted(vec![
+            "* LIST () \"/\" INBOX\r\n* LIST () \"/\" Archive\r\n{tag} OK done",
+            "{tag} OK",
+            // Archive, where it was moved meanwhile.
+            "* 1 EXISTS\r\n* OK [UIDVALIDITY 1] ok\r\n{tag} OK [READ-ONLY] done",
+            "* SEARCH 9\r\n{tag} OK done",
+            "{tag} OK",
+            "* 1 FETCH (UID 9 RFC822.SIZE 22 INTERNALDATE \"01-Jan-1970 00:01:40 +0000\" ENVELOPE (NIL NIL NIL NIL NIL NIL NIL NIL NIL \"<m@x>\"))\r\n{tag} OK done",
+            "{tag} OK closed",
+            // INBOX, empty.
+            "* 0 EXISTS\r\n* OK [UIDVALIDITY 1] ok\r\n{tag} OK [READ-ONLY] done",
+            "{tag} OK closed",
+        ])
+        .await;
+        let stats = restore(&mut session, root.path(), Selection { items: vec![item], folders }, RestoreTarget::Original, "", |_| {}).await.unwrap();
+        assert_eq!((stats.messages, stats.skipped), (0, 1), "on the server already, in Archive");
     }
 
     #[tokio::test]

@@ -65,12 +65,17 @@ const descriptionLocked = computed(() => !!props.event && calendars.value.find(c
 
 const weekdayOf = (d: Date) => (d.getDay() + 6) % 7
 const blankRepeat = (): RepeatForm => ({ kind: 'none', interval: 1, weekdays: [], byWeekday: false, end: 'never', until: '', count: 10 })
+/** A weekly series whose rule names no day repeats on its first day's, which the form shows
+ *  from the occurrence opened (in the computer's zone, maybe another day, or an occurrence moved
+ *  alone): left unnamed when unchanged, or the series would be rebuilt on that day. */
+let implicitWeekday: number | null = null
 function toRepeat(f: RepeatForm): Repeat | null {
   if (f.kind === 'none' || f.kind === 'custom') return null
+  const unnamed = f.kind === 'weekly' && implicitWeekday !== null && f.weekdays.length === 1 && f.weekdays[0] === implicitWeekday
   return {
     freq: f.kind,
     interval: Math.max(1, Math.round(f.interval || 1)),
-    weekdays: f.kind === 'weekly' ? [...f.weekdays] : [],
+    weekdays: f.kind === 'weekly' && !unnamed ? [...f.weekdays] : [],
     by_weekday: f.kind === 'monthly' && f.byWeekday,
     until: f.end === 'until' && f.until ? f.until : null,
     count: f.end === 'count' ? Math.max(1, Math.round(f.count || 1)) : null
@@ -162,7 +167,9 @@ async function loadRepeat() {
     const r = await api.eventRepeat(e)
     if (asked !== repeatAsked) return
     seriesRepeat.value = r
-    repeat.value = fromRepeat(r, new Date(e.start * 1000))
+    const start = new Date(e.start * 1000)
+    implicitWeekday = r.repeat?.freq === 'weekly' && !r.repeat.weekdays.length ? weekdayOf(start) : null
+    repeat.value = fromRepeat(r, start)
   } catch (err) {
     if (asked === repeatAsked) error.value = String(err)
   } finally {
@@ -201,6 +208,7 @@ function fill() {
   repeatAsked++
   loadingRepeat.value = false
   seriesRepeat.value = null
+  implicitWeekday = null
   repeat.value = blankRepeat()
   guests.value = (props.event?.attendees ?? []).filter(a => !a.organizer).map(a => addressFull({ name: a.name ?? null, email: a.email }))
   createKey = newKey()

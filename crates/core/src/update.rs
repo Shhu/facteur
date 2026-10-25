@@ -155,9 +155,78 @@ fn newer(a: &str, b: &str) -> bool {
     matches!((parse(a), parse(b)), (Some(a), Some(b)) if a > b)
 }
 
+/// Replaces the exe at `exe` with `bytes`, then starts it (`launch`). The previous one stays
+/// as `.exe.old` while it runs, and comes back when the new one cannot be put in place or
+/// started (an antivirus quarantining it at launch): never left without an exe. `denied` words
+/// a failure to write in its folder.
+pub fn swap_and_launch(
+    exe: &std::path::Path,
+    bytes: &[u8],
+    launch: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+    denied: impl Fn(std::io::Error) -> Error,
+) -> Result<()> {
+    use std::io::Write as _;
+    let new = exe.with_extension("exe.new");
+    let old = exe.with_extension("exe.old");
+    // Synced before the renames: a crash right after them must not leave a truncated exe.
+    let written = std::fs::File::create(&new).and_then(|mut file| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&new);
+        return Err(denied(e));
+    }
+    let _ = std::fs::remove_file(&old);
+    // The running exe can be renamed, not overwritten.
+    if let Err(e) = std::fs::rename(exe, &old) {
+        let _ = std::fs::remove_file(&new);
+        return Err(denied(e));
+    }
+    if let Err(e) = std::fs::rename(&new, exe) {
+        let _ = std::fs::rename(&old, exe);
+        let _ = std::fs::remove_file(&new);
+        return Err(denied(e));
+    }
+    if let Err(e) = launch(exe) {
+        tracing::error!("update: restart failed: {e}");
+        // The previous exe back: the next launch is the version that worked.
+        let _ = std::fs::remove_file(exe);
+        if std::fs::rename(&old, exe).is_ok() {
+            return Err(Error::Other(crate::tr!(
+                "mise à jour non installée : la nouvelle version n'a pas pu démarrer ({e})",
+                "update not installed: the new version could not start ({e})"
+            )));
+        }
+        return Err(Error::Other(crate::tr!(
+            "mise à jour installée, mais le redémarrage a échoué ({e}) : relancez facteur",
+            "update installed, but the restart failed ({e}): start facteur again"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_restart_puts_the_previous_exe_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("facteur.exe");
+        std::fs::write(&exe, b"old").unwrap();
+        let denied = |e: std::io::Error| Error::Other(e.to_string());
+        // Quarantined by an antivirus as it starts.
+        let quarantined = |p: &std::path::Path| {
+            std::fs::remove_file(p)?;
+            Err(std::io::Error::other("blocked"))
+        };
+        assert!(swap_and_launch(&exe, b"new", quarantined, denied).is_err());
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old");
+        assert!(!exe.with_extension("exe.old").exists());
+        swap_and_launch(&exe, b"new", |_| Ok(()), denied).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new");
+    }
 
     #[test]
     fn signed_files_only() {

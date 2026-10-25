@@ -257,10 +257,13 @@ export function useMail() {
     if (!fresh.length) return
     const ids = new Set(fresh.map(l => l.id))
     const known = new Set(accounts.value.map(a => a.id))
-    mailboxes.value = [
+    // Read again every second or so during a sync: unchanged folders keep their objects, and an
+    // unchanged list is not assigned (the sidebar and the move menus would be rebuilt whole).
+    const next = keptById(mailboxes.value, [
       ...mailboxes.value.filter(m => !ids.has(m.account_id) && known.has(m.account_id)),
       ...fresh.flatMap(l => l.list)
-    ]
+    ])
+    if (next !== mailboxes.value) mailboxes.value = next
   }
 
   function mailboxByRole(role: Mailbox['role'], account = accountId.value) {

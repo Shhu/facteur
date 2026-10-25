@@ -174,13 +174,14 @@ async function readAll(request: number, key: string) {
 async function merge(request: number, key: string) {
   const page = await fetchThreads(PAGE)
   if (request !== loadRequest) return
-  if (page.length < PAGE) {
-    threads.value = page
-    complete.value = true
-    return
-  }
   const old = threads.value
   const id = (t: ThreadSummary) => `${t.account_id}-${t.thread_id}`
+  // The whole list fits in a page: taken as it is, its unchanged rows kept.
+  if (page.length < PAGE) {
+    complete.value = true
+    assignKept(page, old, id)
+    return
+  }
   // Rows after the page's last row stay valid; earlier rows missing from the page left the list
   // (archived, read under "unread"...).
   const last = id(page.at(-1)!)
@@ -191,14 +192,33 @@ async function merge(request: number, key: string) {
   if (old.slice(0, at).filter(t => !fresh.has(id(t))).length > MERGE_MISSING) return readAll(request, key)
   // Rows unchanged keep their object, and an unchanged list is not assigned: every row, its date
   // group and its labels would be built again for nothing at each sync tick.
+  assignKept([...page, ...old.slice(at + 1).filter(t => !fresh.has(id(t)))], old, id)
+}
+
+/** `next` as the list, each row unchanged since `old` keeping its object, and nothing assigned
+ *  when no row changed: every row, its date group and its labels would be built again for
+ *  nothing at each sync tick. */
+function assignKept(next: ThreadSummary[], old: ThreadSummary[], id: (t: ThreadSummary) => string) {
   const before = new Map(old.map(t => [id(t), t]))
-  const kept = page.map(t => {
+  const kept = next.map((t) => {
     const was = before.get(id(t))
     return was && rowSignature(was) === rowSignature(t) ? was : t
   })
-  const next = [...kept, ...old.slice(at + 1).filter(t => !fresh.has(id(t)))]
-  if (next.length !== old.length || next.some((t, i) => t !== old[i])) threads.value = next
+  if (kept.length !== old.length || kept.some((t, i) => t !== old[i])) threads.value = kept
 }
+
+/** Read or unread changed from here or the reading pane: the rows past the first page (which
+ *  the usual refresh does not reread) follow at once. `ids`: the messages that changed. */
+function patchSeen(ids: number[], seen: boolean) {
+  const next = seenPatched(threads.value, ids, seen)
+  if (next !== threads.value) threads.value = next
+  // A read in flight, from before the change, would put the rows past the first page back as
+  // they were: the next one reads them all.
+  if (inflight) fullNext = true
+}
+watch(useListStale().seen, (change) => {
+  if (change) patchSeen(change.ids, change.seen)
+})
 
 /** What a row shows of its thread. */
 function rowSignature(t: ThreadSummary): string {
@@ -292,7 +312,12 @@ async function runSearch(request: number, quiet: boolean) {
   const targets = unified.value ? accounts.value.map(a => a.id) : accountId.value !== null ? [accountId.value] : []
   try {
     const lists = await Promise.all(targets.map(id => api.search(id, q, searchBins.value)))
-    if (request === searchRequest) results.value = lists.flat().filter(m => !departed.has(m.id)).sort((a, b) => b.date - a.date)
+    if (request !== searchRequest) return
+    const next = lists.flat().filter(m => !departed.has(m.id)).sort((a, b) => b.date - a.date)
+    // The same hits, unchanged: not assigned, or every row is built again at each sync tick.
+    const sign = (m: MessageSummary) => JSON.stringify(m)
+    const old = results.value
+    if (!old || old.length !== next.length || next.some((m, i) => sign(m) !== sign(old[i]!))) results.value = next
   } catch (e) {
     if (request === searchRequest && !quiet) showError(e)
   }
@@ -374,7 +399,25 @@ const items = computed<ListItem[]>(() => {
       labels: m.labels?.map(id => labelNames.value.get(id)).filter((l): l is string => !!l)
     }))
   }
-  return threads.value.map(t => ({
+  // A row's item kept while its thread is: only the rows that changed render again.
+  const cache = threadItems.value
+  return threads.value.map((t) => {
+    const kept = cache.get(t)
+    if (kept) return kept
+    const item = threadItem(t)
+    cache.set(t, item)
+    return item
+  })
+})
+
+/** Built again when anything a row shows besides its thread changes. */
+const threadItems = computed(() => {
+  void [unified.value, accountCount.value, outgoing.value, labelNames.value, intlLocale(), accountColor(0), accountNameOf(0), ownSet(0)]
+  return new WeakMap<ThreadSummary, ListItem>()
+})
+
+function threadItem(t: ThreadSummary): ListItem {
+  return {
     key: `t${t.thread_id}`,
     accountId: t.account_id,
     mailboxId: t.mailbox_id,
@@ -396,8 +439,8 @@ const items = computed<ListItem[]>(() => {
     snoozedUntil: t.snoozed_until,
     woken: t.woken,
     labels: t.labels?.map(id => labelNames.value.get(id)).filter((l): l is string => !!l)
-  }))
-})
+  }
+}
 
 /** Label names by folder id, built once per folder list rather than looked up per thread. */
 /** Kept while the names stay the same: the folder list is read again often during a sync. */
@@ -452,7 +495,7 @@ function listQuery(): Record<string, string | string[]> {
  *  rows (home link, filter change). */
 function open(item: Pick<ListItem, 'threadId' | 'accountId' | 'mailboxId' | 'latestId'> | null) {
   // In Drafts, a click resumes writing instead of showing the message.
-  if (item && mailbox.value?.role === 'drafts') {
+  if (item && mailboxes.value.find(m => m.id === item.mailboxId)?.role === 'drafts') {
     resume(item.latestId)
     return
   }
@@ -477,16 +520,15 @@ function open(item: Pick<ListItem, 'threadId' | 'accountId' | 'mailboxId' | 'lat
 
 /** The open thread left this folder (ThreadView) while another screen covers the list: closing
  *  it now would navigate away from that screen. Done once the list shows again, if still open. */
-let pendingClose: number | null = null
-function onThreadClose() {
-  if (covered.value) pendingClose = threadId.value
-  else open(null)
-}
+/** The same for going on to the next one, after an action that took it out of the folder. */
+const closeLater = whileCovered()
+const nextLater = whileCovered()
+const onThreadClose = () => closeLater.ask(covered.value, threadId.value, () => open(null))
+const onThreadDone = () => nextLater.ask(covered.value, threadId.value, next)
 watch(covered, (now) => {
-  if (now || pendingClose === null) return
-  const id = pendingClose
-  pendingClose = null
-  if (threadId.value === id) open(null)
+  if (now) return
+  closeLater.uncovered(threadId.value, () => open(null))
+  nextLater.uncovered(threadId.value, next)
 })
 
 /** Follow-up (Sent only): opened in its own folder, not the one shown. */
@@ -568,7 +610,10 @@ function next(step = 1, skip: Set<number> = new Set()) {
   const list = items.value
   const current = openedItem.value
   const at = current ? list.indexOf(current) : -1
-  const usable = (t: ListItem) => t.threadId !== threadId.value && !skip.has(t.threadId)
+  // A draft among search hits is only resumed when clicked: stepping (j/k, after an action)
+  // goes to the next conversation, not into the composer. In Drafts itself, every row is one.
+  const inDrafts = (t: ListItem) => mailboxes.value.find(m => m.id === t.mailboxId)?.role === 'drafts'
+  const usable = (t: ListItem) => t.threadId !== threadId.value && !skip.has(t.threadId) && (mailbox.value?.role === 'drafts' || !inDrafts(t))
   if (at === -1) {
     if (threadId.value !== null && openedAt >= 0) {
       // The open thread left the list (a filter, archived elsewhere): step from where its row
@@ -639,6 +684,19 @@ const undone = (restore: () => void) => () => {
   refreshSearch()
 }
 
+/** Threads that left the list, maybe from below its first page, which the usual refresh rereads
+ *  alone: their rows go at once, then the first page is merged (rereading every row of a long
+ *  scrolled list after each action stalls triage). Undone, the list is read again in full. */
+function dropRows(targets: ListItem[]) {
+  // A search hit is one message: its thread's row stays while others of it remain.
+  const { rows, kept } = rowsLeft(threads.value, targets)
+  threads.value = rows
+  // A read in flight, from before the action, would bring the rows back; a row kept counts
+  // messages gone, maybe below the first page.
+  if (inflight || kept) fullNext = true
+  refresh()
+}
+
 async function act(kind: ListAction, targets: ListItem[]) {
   if (!targets.length) return
   const ids = targets.flatMap(t => t.ids)
@@ -647,13 +705,7 @@ async function act(kind: ListAction, targets: ListItem[]) {
   // Threads leave the list, maybe from below its first page, which the usual refresh rereads
   // alone: their rows go at once, then the first page is merged (rereading every row of a long
   // scrolled list after each action stalls triage). Undone, the list is read again in full.
-  const left = () => {
-    const gone = new Set(targets.map(t => `${t.accountId}-${t.threadId}-${t.mailboxId}`))
-    threads.value = threads.value.filter(t => !gone.has(`${t.account_id}-${t.thread_id}-${t.mailbox_id}`))
-    // A read in flight, from before the action, would bring the rows back.
-    if (inflight) fullNext = true
-    refresh()
-  }
+  const left = () => dropRows(targets)
   try {
     switch (kind) {
       case 'snooze': {
@@ -693,8 +745,14 @@ async function act(kind: ListAction, targets: ListItem[]) {
       }
       case 'read':
         // Any unread in the batch: mark all read. Otherwise the latest message becomes unread again.
-        if (targets.some(t => t.unread)) await setFlag(ids, 'seen', true)
-        else await setFlag(targets.map(t => t.latestId), 'seen', false)
+        if (targets.some(t => t.unread)) {
+          await setFlag(ids, 'seen', true)
+          patchSeen(newlySeen(targets), true)
+        } else {
+          const latest = targets.map(t => t.latestId)
+          await setFlag(latest, 'seen', false)
+          patchSeen(latest, false)
+        }
         break
       case 'flag':
         // Pinned threads sit first: the thread moves, possibly past the first page.
@@ -752,6 +810,7 @@ const moveItems = computed<DropdownMenuItem[]>(() =>
         const restore = leave(targets)
         try {
           done(await api.moveTo(targets.flatMap(t => t.ids), m.id, mailboxId.value), t('mail.page.movedTo', { folder: m.role ? roleLabels[m.role] : m.display_name }), 'i-lucide-folder-input', undone(restore))
+          dropRows(targets)
           selected.value = new Set()
         } catch (e) {
           restore()
@@ -1054,7 +1113,7 @@ function resizeTouch(e: TouchEvent, grip: Record<string, unknown>) {
     :restore-mode="doneView"
     :shortcuts="selected.size === 0 && !covered"
     @close="onThreadClose"
-    @done="next()"
+    @done="onThreadDone"
     @pinned="onPinned"
   />
   <UDashboardPanel v-else id="empty" class="hidden lg:flex">

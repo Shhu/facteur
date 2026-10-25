@@ -135,9 +135,12 @@ pub async fn connect(server: &ServerConfig, username: &str, credential: &Credent
 }
 
 async fn connect_inner(server: &ServerConfig, username: &str, credential: &Credential) -> Result<Session> {
+    // Not even connected (offline, name not found, nothing answering): no session the server
+    // dropped, which would count towards offering the single-connection mode.
     let tcp = tokio::time::timeout(std::time::Duration::from_secs(20), tcp_connect(&server.host, server.port))
         .await
-        .map_err(|_| Error::Other(crate::tr!("délai dépassé en se connectant à {}", "timed out connecting to {}", server.host)))??;
+        .map_err(|_| Error::Unreachable(crate::tr!("délai dépassé en se connectant à {}", "timed out connecting to {}", server.host)))?
+        .map_err(|e| Error::Unreachable(format!("{}: {e}", server.host)))?;
     keepalive(&tcp);
 
     let mut client = match server.security {
@@ -388,6 +391,7 @@ pub async fn list_with_status(session: &mut Session, status: Option<&str>) -> Re
                 NameAttribute::Archive => Some(Role::Archive),
                 NameAttribute::All => Some(Role::All),
                 NameAttribute::Flagged => Some(Role::Flagged),
+                NameAttribute::Extension(e) if e.eq_ignore_ascii_case("\\Important") => Some(Role::Important),
                 _ => None,
             });
             // `\NonExistent` (RFC 5258) implies `\NoSelect`: Gmail sends it for its `[Gmail]` container
@@ -566,8 +570,12 @@ fn assign_roles(listed: Vec<(String, Option<String>, Option<Role>, bool)>) -> Ve
     listed
         .into_iter()
         .map(|(name, delimiter, role, selectable)| {
+            // With an All Mail (Gmail), archiving is taking the inbox label off: a user label named
+            // "Archive" is a label like any other, not where archived mail goes.
             let role = role.or_else(|| {
-                guess_role(&name).filter(|r| *r == Role::Inbox || (!declared.contains(r) && guessed.insert(*r)))
+                guess_role(&name)
+                    .filter(|r| !(*r == Role::Archive && declared.contains(&Role::All)))
+                    .filter(|r| *r == Role::Inbox || (!declared.contains(r) && guessed.insert(*r)))
             });
             ListedMailbox { name, delimiter, role, selectable }
         })
@@ -651,6 +659,29 @@ pub fn uid_sets(uids: &[u32], max: usize) -> Vec<String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn a_gmail_label_named_archive_is_no_archive_folder() {
+        let listed = |all: bool| {
+            let mut l = vec![("INBOX".to_string(), Some("/".to_string()), None, true), ("Archive".to_string(), Some("/".to_string()), None, true)];
+            if all {
+                l.push(("[Gmail]/All Mail".to_string(), Some("/".to_string()), Some(Role::All), true));
+            }
+            assign_roles(l).into_iter().find(|m| m.name == "Archive").unwrap().role
+        };
+        assert_eq!(listed(true), None, "Gmail: archived means out of the inbox, in All Mail");
+        assert_eq!(listed(false), Some(Role::Archive), "elsewhere, the folder of that name");
+    }
+
+    #[tokio::test]
+    async fn failing_to_connect_at_all_is_no_dropped_session() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let server = ServerConfig { host: "127.0.0.1".into(), port, security: Security::None };
+        let Err(e) = connect(&server, "u", &Credential::Password("p".into())).await else { panic!("nothing listens") };
+        assert!(matches!(e, Error::Unreachable(_)) && !e.is_connection_drop(), "{e:?}");
+    }
 
     #[test]
     fn long_uid_sets_are_cut() {
@@ -869,6 +900,7 @@ pub(crate) mod tests {
             "* LIST () \"/\" INBOX".to_string(),
             "* STATUS INBOX (MESSAGES 3 UIDNEXT 9 UIDVALIDITY 7 HIGHESTMODSEQ 41)".to_string(),
             "* LIST (\\HasChildren \\NonExistent) \"/\" \"[Gmail]\"".to_string(),
+            "* LIST (\\HasNoChildren \\Important) \"/\" \"[Gmail]/Wichtig\"".to_string(),
         ];
         // More than the 100 unsolicited answers async-imap keeps: none is lost.
         for i in 0..150 {
@@ -879,8 +911,9 @@ pub(crate) mod tests {
         let reply: &'static str = Box::leak(lines.join("\r\n").into_boxed_str());
         let mut session = scripted(vec![(reply, false), ("{tag} OK", false)]).await;
         let (listed, status) = list_with_status(&mut session, Some("STATUS (MESSAGES UIDNEXT UIDVALIDITY HIGHESTMODSEQ)")).await.unwrap();
-        assert_eq!(listed.len(), 152);
+        assert_eq!(listed.len(), 153);
         assert!(!listed.iter().find(|l| l.name == "[Gmail]").unwrap().selectable, "\\NonExistent cannot be selected");
+        assert_eq!(listed.iter().find(|l| l.name == "[Gmail]/Wichtig").unwrap().role, Some(Role::Important), "Important in German");
         assert_eq!(status.len(), 151);
         assert_eq!(status["INBOX"], FolderStatus { messages: Some(3), uidnext: Some(9), uidvalidity: Some(7), highestmodseq: Some(41), unseen: None });
         assert_eq!(status["Label 149"].messages, Some(149));

@@ -257,7 +257,11 @@ pub async fn create(token: &str, calendar_id: &str, key: &str, changes: &EventCh
     body["id"] = key.into();
     let req = client()?.post(write_url(calendar_id, None)?).header("Content-Type", "application/json").body(serde_json::to_vec(&body)?);
     match send_raw(req, token).await? {
-        (reqwest::StatusCode::CONFLICT, _) => written(&get(&client()?, token, events_url(calendar_id, Some(key))?).await?),
+        // Created by an earlier try of this form: it takes the version sent now (edited since).
+        (reqwest::StatusCode::CONFLICT, _) => {
+            let req = client()?.patch(write_url(calendar_id, Some(key))?).header("Content-Type", "application/json").body(serde_json::to_vec(&body)?);
+            written(&send(req, token).await?)
+        }
         (status, body) => written(&json_of(status, &body)?),
     }
 }

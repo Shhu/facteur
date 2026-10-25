@@ -1453,6 +1453,7 @@ dependencies = [
  "chrono-tz",
  "encoding_rs",
  "facteur-whisper",
+ "flate2",
  "futures",
  "hickory-resolver",
  "html-escape",

@@ -142,7 +142,7 @@ pub fn link_domains(content: &str) -> Vec<(String, usize)> {
 
 /// The original HTML if there is one, else the text.
 fn link_source(msg: &mail_parser::Message) -> String {
-    html_body(msg).or_else(|| joined_text(msg.text_bodies())).unwrap_or_default()
+    html_body(msg).or_else(|| joined_text(msg.raw_message(), msg.text_bodies())).unwrap_or_default()
 }
 
 /// The HTML body, from every part of `html_bodies` in order: Apple Mail and iOS put an
@@ -161,8 +161,8 @@ fn html_body(msg: &mail_parser::Message) -> Option<String> {
     let mut out = String::new();
     for part in msg.html_bodies() {
         let piece = match &part.body {
-            PartType::Html(h) => h.to_string(),
-            PartType::Text(t) => text_to_html(t),
+            PartType::Html(h) => redecoded(msg.raw_message(), part, h, true).into_owned(),
+            PartType::Text(t) => text_to_html(&redecoded(msg.raw_message(), part, t, false)),
             // An inline image between the parts, shown where it was through the usual `cid:`
             // inlining, unless an HTML part already shows it. Anything else stays an attachment.
             _ => match cid_of(part) {
@@ -185,19 +185,21 @@ fn html_body(msg: &mail_parser::Message) -> Option<String> {
 
 /// Every text part of `parts` in order (see `html_body`), the HTML ones through our
 /// `html_to_text` (mail-parser's puts no line breaks between blocks). None without any.
-fn joined_text<'a>(parts: impl Iterator<Item = &'a mail_parser::MessagePart<'a>>) -> Option<String> {
+fn joined_text<'a>(raw: &[u8], parts: impl Iterator<Item = &'a mail_parser::MessagePart<'a>>) -> Option<String> {
     let texts: Vec<String> = parts
         .filter_map(|p| match &p.body {
             PartType::Text(t) => {
+                let t = redecoded(raw, p, t, false);
                 let ct = p.content_type();
                 let param = |name: &str, value: &str| ct.and_then(|c| c.attribute(name)).is_some_and(|v| v.trim().eq_ignore_ascii_case(value));
-                Some(if param("format", "flowed") { unflow(t, param("delsp", "yes")) } else { t.to_string() })
+                Some(if param("format", "flowed") { unflow(&t, param("delsp", "yes")) } else { t.into_owned() })
             }
-            PartType::Html(h) => Some(html_to_text(h)),
+            PartType::Html(h) => Some(html_to_text(&redecoded(raw, p, h, true))),
             _ => None,
         })
         .collect();
-    if texts.is_empty() {
+    // A blank text part (some mailers add one beside the real HTML) is no text: the HTML is read.
+    if texts.iter().all(|t| t.trim().is_empty()) {
         return None;
     }
     // The same budget as text drawn from HTML: what goes to the search index, the preview and the
@@ -429,7 +431,7 @@ pub fn body_info(raw: &[u8]) -> BodyInfo {
     };
     // The text parts, else ours from the HTML (mail-parser would make one up from the HTML,
     // with no line breaks between blocks).
-    let text = joined_text(msg.text_bodies()).or_else(|| joined_text(msg.html_bodies())).unwrap_or_default();
+    let text = joined_text(msg.raw_message(), msg.text_bodies()).or_else(|| joined_text(msg.raw_message(), msg.html_bodies())).unwrap_or_default();
     // Its first words only: the rest of the body is never walked for 200 characters.
     let preview: String = text
         .lines()
@@ -574,7 +576,7 @@ pub fn parse_body(raw: &[u8]) -> Result<ParsedBody> {
     let html_body = html_body(&msg);
     let cids = inline_cids(&msg, html_body.as_deref());
 
-    let text = joined_text(msg.text_bodies());
+    let text = joined_text(msg.raw_message(), msg.text_bodies());
     let (html, has_remote_content, is_plain, shown) = match html_body {
         // mail-parser makes up HTML from the text when there is none: ours is better.
         Some(h) => {
@@ -651,7 +653,7 @@ pub fn parse_draft(raw: &[u8]) -> Result<DraftParts> {
         cc: list(msg.cc()),
         bcc: list(msg.bcc()),
         subject: msg.subject().unwrap_or_default().to_string(),
-        body: joined_text(msg.text_bodies()).unwrap_or_default(),
+        body: joined_text(msg.raw_message(), msg.text_bodies()).unwrap_or_default(),
         html: rich.clone(),
         message_id: msg.message_id().map(str::to_string),
         in_reply_to,
@@ -712,6 +714,37 @@ pub fn mime_charset(mime: &str) -> Option<&str> {
 }
 
 /// Body of a part as sent, with only its Content-Transfer-Encoding undone.
+/// A text part's text, decoded again from its bytes when mail-parser had no charset to go by and
+/// the bytes were not UTF-8 (its lossy decoding leaves U+FFFD for every accent): the charset of an
+/// HTML `<meta>`, else Windows-1252 (see [`text_as_utf8`]).
+fn redecoded<'t>(raw: &[u8], part: &mail_parser::MessagePart, text: &'t str, html: bool) -> std::borrow::Cow<'t, str> {
+    use std::borrow::Cow;
+    // Named and known to mail-parser: it decoded the text. Otherwise (none, `unknown-8bit`, an
+    // empty or made-up name) it fell back to lossy UTF-8.
+    let decoded = part
+        .content_type()
+        .and_then(|c| c.attribute("charset"))
+        .is_some_and(|c| mail_parser::decoders::charsets::map::charset_decoder(c.trim().as_bytes()).is_some());
+    if !text.contains('\u{FFFD}') || decoded {
+        return Cow::Borrowed(text);
+    }
+    let Some(bytes) = original_bytes(raw, part) else { return Cow::Borrowed(text) };
+    let declared = if html { meta_charset(&bytes) } else { None };
+    match String::from_utf8(text_as_utf8(&bytes, declared.as_deref()).into_owned()) {
+        Ok(again) => Cow::Owned(again),
+        Err(_) => Cow::Borrowed(text),
+    }
+}
+
+/// The charset an HTML document declares in its head (`<meta charset=…>` or `http-equiv`).
+fn meta_charset(html: &[u8]) -> Option<String> {
+    let head = String::from_utf8_lossy(&html[..html.len().min(4096)]).to_ascii_lowercase();
+    let at = head.find("<meta")?;
+    let from = head[at..].find("charset=")? + at + "charset=".len();
+    let value: String = head[from..].trim_start_matches(['"', '\'', ' ']).chars().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.')).collect();
+    (!value.is_empty()).then_some(value)
+}
+
 fn original_bytes(raw: &[u8], part: &mail_parser::MessagePart) -> Option<Vec<u8>> {
     use mail_parser::Encoding;
     use mail_parser::decoders::{base64::base64_decode, quoted_printable::quoted_printable_decode};
@@ -826,7 +859,7 @@ fn sanitize_html_budgeted(html: &str, cids: HashMap<String, (usize, String)>) ->
                 Err(_) => None,
             }
         })
-        .clean(html)
+        .clean(&defused(html))
         .to_string();
     // <style> sheets can load resources too.
     let remote = remote.load(Ordering::Relaxed) || style_blocks(&clean).any(css_loads_remote);
@@ -959,6 +992,222 @@ pub fn text_to_html(text: &str) -> String {
     out
 }
 
+/// Formatting elements left open at once beyond which they are dropped, whatever follows.
+const MAX_OPEN_FORMATTING: i64 = 1000;
+/// Elements the parser would rebuild (open formatting elements times the tags after them).
+const MAX_REBUILT: i64 = 2_000_000;
+/// Elements open inside one another beyond which more are dropped: the parser walks the open ones
+/// at every tag, so each level costs as much as all those above it. Mail never nests this deep.
+const MAX_NESTING: usize = 1000;
+/// End tags matching nothing open beyond which they are dropped: each walks the open elements
+/// for nothing.
+const MAX_STRAY_ENDS: usize = 1000;
+
+/// A tag as the HTML parser reads it: `start..end` in the text, its name as written.
+struct Tag<'a> {
+    start: usize,
+    end: usize,
+    closing: bool,
+    name: &'a str,
+}
+
+/// The tags of `html`, in one pass, read as the parser does: a `<` inside a quoted attribute
+/// value, a comment, or the text of a script, style or title starts no tag.
+fn html_tags(html: &str) -> Vec<Tag<'_>> {
+    const RAW_TEXT: [&str; 9] = ["script", "style", "xmp", "iframe", "noembed", "noframes", "noscript", "title", "textarea"];
+    let b = html.as_bytes();
+    let find = |from: usize, needle: &[u8]| b.get(from..).and_then(|rest| rest.windows(needle.len()).position(|w| w == needle)).map(|p| from + p);
+    let mut tags = Vec::new();
+    let mut i = 0;
+    while let Some(at) = b.get(i..).and_then(|rest| rest.iter().position(|&c| c == b'<')).map(|p| i + p) {
+        let next = b.get(at + 1).copied();
+        // Comments, `<!…>` and `<?…>`: no tag, up to their end.
+        if b[at..].starts_with(b"<!--") {
+            i = match b.get(at + 4..) {
+                Some([b'>', ..]) => at + 5,
+                Some([b'-', b'>', ..]) => at + 6,
+                _ => find(at + 4, b"-->").map_or(b.len(), |e| e + 3),
+            };
+            continue;
+        }
+        let closing = next == Some(b'/');
+        let name_at = at + 1 + usize::from(closing);
+        if !b.get(name_at).is_some_and(u8::is_ascii_alphabetic) {
+            i = match (next, closing) {
+                (Some(b'!' | b'?'), _) | (_, true) => find(at, b">").map_or(b.len(), |e| e + 1),
+                _ => at + 1,
+            };
+            continue;
+        }
+        let stop = |c: &u8| c.is_ascii_whitespace() || matches!(c, b'/' | b'>');
+        let name_end = b[name_at..].iter().position(stop).map_or(b.len(), |p| name_at + p);
+        // Attributes, a quoted value read whole.
+        let mut j = name_end;
+        let end = loop {
+            while b.get(j).is_some_and(|c| c.is_ascii_whitespace() || *c == b'/') {
+                j += 1;
+            }
+            match b.get(j) {
+                None => break None,
+                Some(b'>') => break Some(j + 1),
+                _ => {}
+            }
+            j += 1;
+            while b.get(j).is_some_and(|c| !stop(c) && *c != b'=') {
+                j += 1;
+            }
+            while b.get(j).is_some_and(u8::is_ascii_whitespace) {
+                j += 1;
+            }
+            if b.get(j) != Some(&b'=') {
+                continue;
+            }
+            j += 1;
+            while b.get(j).is_some_and(u8::is_ascii_whitespace) {
+                j += 1;
+            }
+            match b.get(j) {
+                Some(&q @ (b'"' | b'\'')) => j = b[j + 1..].iter().position(|&c| c == q).map_or(b.len(), |p| j + 2 + p),
+                _ => {
+                    while b.get(j).is_some_and(|c| !c.is_ascii_whitespace() && *c != b'>') {
+                        j += 1;
+                    }
+                }
+            }
+        };
+        // Cut by the end of the text: the parser drops it.
+        let Some(end) = end else { break };
+        let name = &html[name_at..name_end];
+        tags.push(Tag { start: at, end, closing, name });
+        i = end;
+        // Their text runs to their own end tag.
+        if !closing && let Some(raw) = RAW_TEXT.iter().find(|r| r.eq_ignore_ascii_case(name)) {
+            let mut k = end;
+            i = loop {
+                let Some(e) = find(k, b"</") else { break b.len() };
+                let after = e + 2 + raw.len();
+                if b.get(e + 2..after).is_some_and(|n| n.eq_ignore_ascii_case(raw.as_bytes())) && b.get(after).is_none_or(stop) {
+                    break e;
+                }
+                k = e + 2;
+            };
+        } else if !closing && name.eq_ignore_ascii_case("plaintext") {
+            break;
+        }
+    }
+    tags
+}
+
+/// `html` without the tags crafted to blow up the parser, which only carry presentation:
+/// - formatting tags (b, i, font…), when too many are left open: the parser re-opens every
+///   formatting element still open at each piece of text after a block closed them, so a few
+///   hundred left open before thousands of paragraphs build hundreds of millions of elements
+///   (gigabytes) from 100 KB. The cost is those left open times what follows, not their number:
+///   ordinary mail closes them.
+/// - elements nested past [`MAX_NESTING`], and end tags matching nothing open past
+///   [`MAX_STRAY_ENDS`].
+fn defused(html: &str) -> std::borrow::Cow<'_, str> {
+    const FORMATTING: [&str; 14] = ["a", "b", "big", "code", "em", "font", "i", "nobr", "s", "small", "strike", "strong", "tt", "u"];
+    const VOID: [&str; 15] = ["area", "base", "br", "col", "embed", "hr", "img", "input", "keygen", "link", "meta", "param", "source", "track", "wbr"];
+    // Closed by the next of their kind or by their parent's end: never nested deep.
+    const IMPLIED: [&str; 18] =
+        ["p", "li", "dt", "dd", "option", "optgroup", "tr", "td", "th", "thead", "tbody", "tfoot", "caption", "colgroup", "rb", "rt", "rp", "rtc"];
+    // An end tag that does something even with nothing open.
+    const ALWAYS: [&str; 4] = ["p", "br", "body", "html"];
+    let is = |list: &[&str], name: &str| list.iter().any(|l| l.eq_ignore_ascii_case(name));
+    let tags = html_tags(html);
+    let mut dropped = vec![false; tags.len()];
+    // Formatting elements open at once at most, as the parser keeps them: three of a kind (same
+    // name and attributes) at most, the others forgotten (its "Noah's Ark" rule). Told by the tag
+    // as written, which can only count more.
+    let mut formatting: HashMap<String, Vec<String>> = HashMap::new();
+    let mut alike: HashMap<String, i64> = HashMap::new();
+    let (mut now, mut peak) = (0i64, 0i64);
+    // The other elements open, as the parser nests them, and those left out past the limit.
+    let mut stack: Vec<String> = Vec::new();
+    let mut open: HashMap<String, usize> = HashMap::new();
+    let mut skipped: HashMap<String, usize> = HashMap::new();
+    let mut stray = Vec::new();
+    let mut deep = false;
+    for (n, tag) in tags.iter().enumerate() {
+        let name = tag.name.to_ascii_lowercase();
+        if is(&FORMATTING, &name) {
+            let open = formatting.entry(name).or_default();
+            if tag.closing {
+                if let Some(key) = open.pop() {
+                    let count = alike.entry(key).or_default();
+                    *count -= 1;
+                    if *count < 3 {
+                        now -= 1;
+                    }
+                }
+            } else {
+                let key = html[tag.start..tag.end].to_ascii_lowercase();
+                let count = alike.entry(key.clone()).or_default();
+                if *count < 3 {
+                    now += 1;
+                    peak = peak.max(now);
+                }
+                *count += 1;
+                open.push(key);
+            }
+            continue;
+        }
+        if is(&VOID, &name) || is(&IMPLIED, &name) {
+            continue;
+        }
+        if !tag.closing {
+            if stack.len() >= MAX_NESTING {
+                dropped[n] = true;
+                deep = true;
+                *skipped.entry(name).or_default() += 1;
+            } else {
+                *open.entry(name.clone()).or_default() += 1;
+                stack.push(name);
+            }
+        } else if let Some(count) = skipped.get_mut(&name).filter(|c| **c > 0) {
+            *count -= 1;
+            dropped[n] = true;
+        } else if open.get(&name).is_some_and(|c| *c > 0) {
+            // Closes it, and whatever is still open inside it.
+            while let Some(top) = stack.pop() {
+                let done = top == name;
+                if let Some(c) = open.get_mut(&top) {
+                    *c -= 1;
+                }
+                if done {
+                    break;
+                }
+            }
+        } else if !is(&ALWAYS, &name) {
+            stray.push(n);
+        }
+    }
+    let crafted = peak > MAX_OPEN_FORMATTING || peak.saturating_mul(tags.len() as i64) > MAX_REBUILT;
+    if crafted {
+        for (n, tag) in tags.iter().enumerate() {
+            dropped[n] |= is(&FORMATTING, tag.name);
+        }
+    }
+    let strays = stray.len() > MAX_STRAY_ENDS;
+    if strays {
+        for n in stray {
+            dropped[n] = true;
+        }
+    }
+    if !crafted && !deep && !strays {
+        return std::borrow::Cow::Borrowed(html);
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut at = 0;
+    for (tag, _) in tags.iter().zip(&dropped).filter(|(_, d)| **d) {
+        out.push_str(&html[at..tag.start]);
+        at = tag.end;
+    }
+    out.push_str(&html[at..]);
+    std::borrow::Cow::Owned(out)
+}
+
 /// Plain-text version of HTML: the text/plain part of outgoing mail, the search index and the
 /// preview. Blocks and `<br>` become line breaks (a blank line between paragraphs), quotes get
 /// `> ` prefixes, list items keep a marker, and a link whose text is not its address gets the
@@ -974,7 +1223,7 @@ pub fn html_to_text(html: &str) -> String {
         .url_schemes(["http", "https", "mailto"].into())
         .link_rel(None)
         .clean_content_tags(["style", "script", "head", "title"].into())
-        .clean(html)
+        .clean(&defused(html))
         .to_string();
     let mut w = TextWriter::default();
     // Open lists: `None` for a bulleted one, the next number for a numbered one.
@@ -1501,6 +1750,101 @@ Subject: Votre compte\r\n\r\n.\r\n";
         assert!(info.preview.starts_with("Bonjour Marie, Voici le point : ligne deux - un"), "{}", info.preview);
         assert!(!info.preview.contains("plus ancien"));
         assert!(info.text.contains("ligne deux"));
+    }
+
+    #[test]
+    fn a_charset_given_only_in_the_html_or_not_at_all_is_read() {
+        let latin = |body: &[u8], ctype: &str| {
+            let mut raw = format!("From: a@example.org\r\nSubject: x\r\nMIME-Version: 1.0\r\nContent-Type: {ctype}\r\nContent-Transfer-Encoding: 8bit\r\n\r\n").into_bytes();
+            raw.extend_from_slice(body);
+            raw
+        };
+        let html = latin(b"<html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=iso-8859-1\"></head><body><p>\xc9t\xe9 \xe0 Paris</p></body></html>", "text/html");
+        let info = body_info(&html);
+        assert!(info.text.contains("Été à Paris"), "{:?}", info.text);
+        let plain = latin(b"D\xe9j\xe0 vu", "text/plain");
+        assert!(body_info(&plain).text.contains("Déjà vu"));
+        // Declared, it is left to mail-parser.
+        let utf8 = latin("Déjà vu".as_bytes(), "text/plain; charset=utf-8");
+        assert!(body_info(&utf8).text.contains("Déjà vu"));
+        // Named but unknown to it: read as if none were named.
+        let unknown = latin(b"D\xe9j\xe0 vu", "text/plain; charset=unknown-8bit");
+        assert!(body_info(&unknown).text.contains("Déjà vu"));
+        // A blank text part beside the HTML: the HTML is the text.
+        let raw = b"From: a@example.org\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\n \r\n\r\n--b\r\nContent-Type: text/html\r\n\r\n<p>Votre commande est partie</p>\r\n--b--\r\n";
+        assert!(body_info(raw).text.contains("commande est partie"));
+    }
+
+    #[test]
+    fn crafted_formatting_tags_do_not_blow_up_the_parser() {
+        let html = format!("{}{}", (0..5000).map(|i| format!("<b id={i}>")).collect::<String>(), "<p>x".repeat(20_000));
+        let started = std::time::Instant::now();
+        let text = html_to_text(&html);
+        let (shown, _) = sanitize_html(&html, HashMap::new());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+        assert!(text.contains('x') && shown.len() < 4 << 20, "{}", shown.len());
+        // An ordinary message keeps its formatting.
+        assert_eq!(defused("<b>gras</b> <a href=x>lien</a> <br>"), "<b>gras</b> <a href=x>lien</a> <br>");
+        assert!(!defused(&html).contains("<b"));
+        // Fewer left open, inside the first paragraph, before many more: still the same blowup.
+        let inside = format!("<p>{}{}", (0..999).map(|i| format!("<b id={i}>")).collect::<String>(), "<p>x".repeat(22_000));
+        let started = std::time::Instant::now();
+        let text = html_to_text(&inside);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+        assert!(text.contains('x'));
+        // A long newsletter that closes its tags keeps them.
+        let closed = "<p><b>Titre</b> <a href=\"https://x.example\">lien</a></p>".repeat(5000);
+        assert!(matches!(defused(&closed), std::borrow::Cow::Borrowed(_)));
+        // Formatting tags never closed by `>`: one pass, not one per tag.
+        let open = format!("{}{}", "<b>".repeat(1001), "<b ".repeat(1_000_000));
+        let started = std::time::Instant::now();
+        defused(&open);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn closing_tags_hidden_in_attributes_or_comments_are_not_counted() {
+        for open in ["<b id={i} title=\"</b>\">", "<b id={i}><!--</b>-->", "<b id={i} title=</b>"] {
+            let html = format!("{}{}", (0..5000).map(|i| open.replace("{i}", &i.to_string())).collect::<String>(), "<p>x".repeat(20_000));
+            assert!(!defused(&html).contains("<b "), "{open}");
+            let started = std::time::Instant::now();
+            assert!(html_to_text(&html).contains('x'));
+            assert!(started.elapsed() < std::time::Duration::from_secs(10), "{open}: {:?}", started.elapsed());
+        }
+        // A closing tag inside a style or a title is text too.
+        let styled = format!("{}{}", (0..5000).map(|i| format!("<b id={i}><style></b></style>")).collect::<String>(), "<p>x".repeat(20_000));
+        assert!(!defused(&styled).contains("<b "));
+    }
+
+    #[test]
+    fn unclosed_identical_fonts_keep_their_formatting() {
+        let report = "<p><font face=\"Arial\" size=2>ligne <a href=\"https://x.example\">lien</a></p>".repeat(1000);
+        assert!(matches!(defused(&report), std::borrow::Cow::Borrowed(_)), "the parser keeps three of a kind at most");
+        assert!(html_to_text(&report).contains("https://x.example"));
+    }
+
+    #[test]
+    fn tag_names_are_read_once() {
+        let html = "<x".repeat(1_000_000);
+        let started = std::time::Instant::now();
+        defused(&html);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn deep_nesting_of_ordinary_tags_stays_quick() {
+        let divs = format!("{}x", "<div>".repeat(200_000));
+        let spans = format!("{}x{}", "<span>".repeat(100_000), "</q>".repeat(100_000));
+        for html in [divs, spans] {
+            let started = std::time::Instant::now();
+            assert!(html_to_text(&html).contains('x'));
+            let (shown, _) = sanitize_html(&html, HashMap::new());
+            assert!(shown.contains('x'));
+            assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+        }
+        // Ordinary mail is left as it is.
+        let mail = "<div><table><tr><td><p>a<p>b</td></tr></table><span>c</span></div><br></p>".repeat(2000);
+        assert!(matches!(defused(&mail), std::borrow::Cow::Borrowed(_)));
     }
 
     #[test]

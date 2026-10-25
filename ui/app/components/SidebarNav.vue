@@ -111,6 +111,9 @@ const links = computed<NavLink[]>(() => [
     : [])
 ])
 
+/** Opening a thread changes only the query: the folder tree is not built again for it. */
+const shownMailbox = computed(() => String(route.value.params.mailbox ?? ''))
+
 function folderNode(m: Mailbox): FolderNode {
   return {
     mailbox: m,
@@ -118,7 +121,7 @@ function folderNode(m: Mailbox): FolderNode {
     icon: m.role ? roleIcons[m.role] : 'i-lucide-folder',
     iconClass: m.role === 'flagged' ? 'text-amber-600 dark:text-amber-400' : 'text-muted',
     count: countBadge(m),
-    active: route.value.params.mailbox === String(m.id),
+    active: shownMailbox.value === String(m.id),
     ...folderAccent(m.account_id),
     children: []
   }

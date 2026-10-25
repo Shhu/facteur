@@ -4,7 +4,7 @@ import type { MessageDetail, MessageSummary } from '~/utils/types'
 
 /** `latest`: last message of the thread; on mobile its reply buttons sit in the thread's bottom bar. */
 const props = defineProps<{ message: MessageSummary, detail?: MessageDetail, expanded: boolean, loading: boolean, latest?: boolean }>()
-defineEmits<{ toggle: [] }>()
+defineEmits<{ toggle: [id: number] }>()
 
 const { reply, forward, composeMailto } = useComposer()
 const { quick } = useTemplates()
@@ -67,6 +67,8 @@ async function showRemote() {
 async function reportSpam() {
   try {
     done(await api.reportSpam([props.message.id]), t('mail.messageCard.reportedJunk'), 'i-lucide-shield-alert')
+    // Its row may lie past the list's first page, which the usual refresh does not reread.
+    useListStale().bump()
   } catch (e) {
     showError(e)
   }
@@ -236,8 +238,8 @@ const originalExcerpt = computed(() => {
     role="button"
     tabindex="0"
     class="flex cursor-pointer items-start gap-3 rounded-2xl border border-default bg-(--surface-card) px-3.5 py-3 text-left shadow-xs transition-colors hover:bg-elevated/40 lg:items-center lg:px-4 dark:shadow-none"
-    @click="$emit('toggle')"
-    @keydown.enter.self="$emit('toggle')"
+    @click="$emit('toggle', message.id)"
+    @keydown.enter.self="$emit('toggle', message.id)"
   >
     <MailAvatar :address="message.from" />
     <div class="flex min-w-0 flex-1 flex-col gap-0.5">
@@ -268,8 +270,8 @@ const originalExcerpt = computed(() => {
       role="button"
       tabindex="0"
       class="flex items-center gap-2.5 px-1 text-left lg:hidden"
-      @click="$emit('toggle')"
-      @keydown.enter.self="$emit('toggle')"
+      @click="$emit('toggle', message.id)"
+      @keydown.enter.self="$emit('toggle', message.id)"
     >
       <MailAvatar :address="message.from" />
       <div class="flex min-w-0 flex-1 flex-col gap-px">
@@ -302,8 +304,8 @@ const originalExcerpt = computed(() => {
       tabindex="0"
       class="flex w-full items-start gap-3 border-b border-default/60 px-3.5 pt-3.5 pb-3 text-left lg:px-4.5 lg:py-4"
       :class="invite && 'max-lg:hidden'"
-      @click="$emit('toggle')"
-      @keydown.enter.self="$emit('toggle')"
+      @click="$emit('toggle', message.id)"
+      @keydown.enter.self="$emit('toggle', message.id)"
     >
       <MailAvatar :address="message.from" />
       <div class="flex min-w-0 flex-1 flex-col gap-1">

@@ -149,6 +149,7 @@ export const roleIcons: Record<Role, string> = {
   archive: 'i-lucide-archive',
   all: 'i-lucide-mails',
   flagged: 'i-lucide-pin',
+  important: 'i-lucide-bookmark',
   snoozed: 'i-lucide-alarm-clock',
   screener: 'i-lucide-user-round-search',
   refused: 'i-lucide-user-round-x'

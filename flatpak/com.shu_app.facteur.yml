@@ -53,6 +53,14 @@ modules:
         CARGO_NET_OFFLINE: 'true'
         npm_config_offline: 'true'
         NUXT_TELEMETRY_DISABLED: '1'
+        # The local AI's processor code as on Windows (AVX2 and its companions): flatpak-builder
+        # sets SOURCE_DATE_EPOCH, which turns ggml's defaults down to SSE, several times slower.
+        # The engine refuses the AI on a processor without them (`ai::processor_supported`).
+        GGML_AVX: 'ON'
+        GGML_AVX2: 'ON'
+        GGML_FMA: 'ON'
+        GGML_F16C: 'ON'
+        GGML_BMI2: 'ON'
     build-commands:
       # The interface, generated here from the listed packages.
       - node pnpm/bin/pnpm.cjs install --offline --frozen-lockfile

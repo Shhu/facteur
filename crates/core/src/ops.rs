@@ -201,6 +201,7 @@ pub async fn flush(store: &Store, account_id: i64, session: &mut Session, caps: 
         if !caps.mv && matches!(op, Op::Move { .. } | Op::MoveSet { .. } | Op::DeleteMailbox { dest: Some(_), .. }) && !pending.tried {
             store.mark_op_started(pending.id)?;
         }
+        let _sending = Replaying::start(pending.id);
         match bounded(op.timeout_secs(), &what, apply(session, caps, &op, pending.tried, &protected)).await {
             Ok(()) => {
                 store.finish_replayed(pending.id, &payload)?;
@@ -716,6 +717,33 @@ fn carries_all(labels: &[String], wanted: &[String]) -> bool {
 
 async fn expunge_uid(session: &mut Session, caps: &Caps, uid: u32) -> Result<()> {
     expunge_uids(session, caps, &[uid]).await
+}
+
+/// The operations being sent to the server right now: too late to take one back.
+fn replaying() -> std::sync::MutexGuard<'static, HashSet<i64>> {
+    use std::sync::{Mutex, OnceLock};
+    static SET: OnceLock<Mutex<HashSet<i64>>> = OnceLock::new();
+    SET.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// While it lives, the operation counts as being sent.
+pub(crate) struct Replaying(i64);
+
+impl Replaying {
+    pub(crate) fn start(id: i64) -> Self {
+        replaying().insert(id);
+        Replaying(id)
+    }
+}
+
+impl Drop for Replaying {
+    fn drop(&mut self) {
+        replaying().remove(&self.0);
+    }
+}
+
+pub(crate) fn being_sent(id: i64) -> bool {
+    replaying().contains(&id)
 }
 
 #[cfg(test)]
