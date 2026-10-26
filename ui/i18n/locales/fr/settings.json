@@ -2,7 +2,7 @@
   "settings": {
     "about": {
       "logs": "Journaux",
-      "keywords": "version mise à jour journaux logs diagnostics facteur",
+      "keywords": "version mise à jour journaux logs diagnostics développeur performance facteur",
       "title": "À propos",
       "intro": "La version de facteur et ses mises à jour.",
       "version": "facteur {version}",
@@ -15,7 +15,9 @@
       "install": "Installer et redémarrer",
       "installing": "Installation…",
       "downloading": "Téléchargement… {percent} %",
-      "installFailed": "Impossible d'installer la mise à jour"
+      "installFailed": "Impossible d'installer la mise à jour",
+      "developer": "Outils développeur",
+      "developerHelp": "Mesure les lenteurs (base de données, synchronisation, interface) et ouvre le panneau de diagnostic avec Ctrl+Maj+P. Tout reste sur cet appareil."
     },
     "title": "Réglages",
     "nav": "Sections des réglages",

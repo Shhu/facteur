@@ -172,7 +172,7 @@ const row = 'flex gap-3 border-t border-default px-4 hover:bg-elevated/50 sm:px-
             <p class="text-xs font-semibold uppercase tracking-wide text-muted">{{ today }}</p>
             <h1 class="text-3xl font-bold tracking-tight text-highlighted">{{ t('tools.home.title') }}</h1>
           </div>
-          <!-- Local perf builds only: the diagnostics panel, by the sync button. -->
+          <!-- Developer tools on: the diagnostics panel, by the sync button. -->
           <UButton
             v-if="perfEnabled"
             icon="i-lucide-activity"

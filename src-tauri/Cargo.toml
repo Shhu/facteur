@@ -30,8 +30,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [features]
 default = ["local-ai"]
-# Performance tracing for local builds (scripts/build-windows.sh --perf); never in a release.
-perf = ["facteur-core/perf"]
 # The local AI (llama.cpp, built in): its build needs CMake and libclang.
 local-ai = ["facteur-core/local-ai"]
 # The local AI on the graphics card (Vulkan): its build needs the Vulkan SDK.

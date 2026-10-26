@@ -4,6 +4,7 @@
 defineProps<{ layout: 'card' | 'list' }>()
 const { supported, version, available, checking, installing, progress, checkNow, install } = useUpdater()
 const showError = useErrorToast()
+const { enabled: developer, setEnabled: setDeveloper } = usePerf()
 
 const status = computed(() => {
   if (installing.value) return progress.value === null ? tr('settings.about.installing') : tr('settings.about.downloading', { percent: Math.round(progress.value * 100) })
@@ -43,6 +44,9 @@ const status = computed(() => {
           @click="checkNow(true)"
         />
       </div>
+    </SettingsRow>
+    <SettingsRow :label="$t('settings.about.developer')" :description="$t('settings.about.developerHelp')">
+      <USwitch :model-value="developer" size="lg" :aria-label="$t('settings.about.developer')" @update:model-value="setDeveloper" />
     </SettingsRow>
   </template>
   <SettingsListRow

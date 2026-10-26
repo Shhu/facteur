@@ -1,7 +1,8 @@
-import { invoke } from '~/utils/ipc'
+import { invoke, timeCommands } from '~/utils/ipc'
 
-// Local `--perf` builds only, never in a release. Commands are timed from the UI so the figure is
-// the delay a user feels, waiting included.
+// Developer tools, off unless turned on in Settings > About; the engine records its slow
+// operations all the same, from launch. Commands are timed from the UI so the figure is the delay
+// a user feels, waiting included.
 
 export interface CommandTiming {
   at: number
@@ -55,8 +56,64 @@ function clear() {
   samples.value = []
 }
 
+/** The panel's own polling stays out of the measures. */
+const QUIET = new Set(['perf_events', 'log_ui', 'diagnostics', 'read_log'])
+let watching = false
+
+/** Observers set once, the first time the tools are turned on; they record only while on. */
+function observe() {
+  if (watching) return
+  watching = true
+  try {
+    new PerformanceObserver((list) => {
+      if (!enabled.value) return
+      for (const entry of list.getEntries()) push(freezes, { at: Date.now(), ms: entry.duration })
+    }).observe({ type: 'longtask', buffered: true })
+  } catch {}
+  let expected = performance.now() + 1000
+  setInterval(() => {
+    const now = performance.now()
+    const lag = Math.max(0, now - expected)
+    expected = now + 1000
+    // Over 10 s the page was not running (the machine asleep, a hidden window's throttled
+    // timers): not a freeze of the interface, so not a sample.
+    if (lag > 10_000 || !enabled.value) return
+    const memory = (performance as unknown as { memory?: { usedJSHeapSize: number } }).memory
+    push(samples, { at: Date.now(), lag, heap: memory ? memory.usedJSHeapSize : null }, SAMPLES_KEPT)
+  }, 1000)
+  window.addEventListener('keydown', (e) => {
+    if (enabled.value && e.ctrlKey && e.shiftKey && (e.key as string | undefined)?.toLowerCase() === 'p') {
+      e.preventDefault()
+      open.value = !open.value
+    }
+  })
+}
+
+/** Applies the engine's state (`persist`: false) or turns the tools on or off for good. Never in
+ *  the way of the app: a failure is only logged. */
+async function setEnabled(on: boolean, persist = true) {
+  try {
+    if (persist) await api.setSetting('developer_tools', on ? '1' : '0')
+    enabled.value = on
+    if (on) {
+      timeCommands((command, ms, ok) => {
+        if (QUIET.has(command)) return
+        push(commands, { at: Date.now(), command, ms, ok })
+        if (ms > 500) logUi('warn', `perf: ${command} took ${Math.round(ms)} ms`)
+      })
+      observe()
+    } else {
+      timeCommands(null)
+      open.value = false
+      clear()
+    }
+  } catch (e) {
+    console.warn('perf tools unavailable', e)
+  }
+}
+
 export function usePerf() {
-  return { enabled, open, commands, engine, freezes, samples, push, clear, pollEngine, SAMPLES_KEPT }
+  return { enabled, open, commands, engine, freezes, samples, push, clear, pollEngine, setEnabled, SAMPLES_KEPT }
 }
 
 // Mirrors crates/core/src/engine/diagnostics.rs.

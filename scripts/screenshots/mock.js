@@ -191,7 +191,7 @@
     }
   }
 
-  // ── Diagnostics (local perf builds; `window.__FACTEUR_PERF__ = true` shows the panel) ──
+  // ── Diagnostics (developer tools; `window.__FACTEUR_PERF__ = true` shows the panel) ──
 
   function diagnostics() {
     const now = Date.now()

@@ -4,7 +4,7 @@ import { useMediaQuery } from '@vueuse/core'
 import type { Diagnostics } from '~/composables/usePerf'
 import { commandStats, spanLabel } from '~/utils/diagnostics'
 
-/** Only in local `--perf` builds; everything is polled only while the panel is open. */
+/** Developer tools only; everything is polled only while the panel is open. */
 const { open, commands, engine, freezes, samples, clear, pollEngine } = usePerf()
 const { t } = useI18n()
 const toast = useToast()

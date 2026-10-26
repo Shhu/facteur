@@ -375,7 +375,7 @@ impl Engine {
             app_version: String::new(),
             os: std::env::consts::OS,
             arch: std::env::consts::ARCH,
-            perf_build: crate::perf::ENABLED,
+            perf_build: crate::perf::enabled(),
             uptime_secs: self.diag.started.elapsed().as_secs(),
             resumed_secs_ago: self.last_resume.lock().unwrap().map(|t| t.elapsed().as_secs()),
             events_queued: self.events.len(),
@@ -384,7 +384,7 @@ impl Engine {
             runtime: self.runtime_diagnostics(),
             store: self.store.diagnostics(),
             memory: process_memory(),
-            perf: crate::perf::ENABLED.then(|| crate::perf::summary(5 * 60 * 1000, 10)),
+            perf: crate::perf::enabled().then(|| crate::perf::summary(5 * 60 * 1000, 10)),
         })
     }
 

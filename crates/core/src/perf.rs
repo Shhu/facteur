@@ -1,13 +1,26 @@
-//! Performance tracing for local builds only (feature `perf`, never in a release), kept in a
-//! ring buffer read by the interface's diagnostics panel.
+//! Performance tracing: slow operations only, always recorded (launch included) in a ring buffer
+//! the interface's diagnostics panel reads once the developer tools are on (Settings > About).
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
 
-pub const ENABLED: bool = cfg!(feature = "perf");
+static ON: AtomicBool = AtomicBool::new(false);
+
+/// Settings key of the developer tools.
+pub const SETTING: &str = "developer_tools";
+
+pub fn enabled() -> bool {
+    ON.load(Ordering::Relaxed)
+}
+
+/// The interface's tools and panel only: the engine records whatever this says.
+pub fn set_enabled(on: bool) {
+    ON.store(on, Ordering::Relaxed);
+}
 
 pub const SLOW_SQL: Duration = Duration::from_millis(30);
 pub const SLOW_WAIT: Duration = Duration::from_millis(20);
@@ -29,9 +42,6 @@ pub struct PerfEvent {
 static EVENTS: LazyLock<Mutex<VecDeque<PerfEvent>>> = LazyLock::new(|| Mutex::new(VecDeque::with_capacity(KEPT)));
 
 pub fn record(kind: &'static str, what: impl Into<String>, took: Duration) {
-    if !ENABLED {
-        return;
-    }
     let event = PerfEvent { at: chrono::Utc::now().timestamp_millis(), kind, what: what.into(), ms: took.as_secs_f64() * 1000.0 };
     tracing::debug!(target: "perf", "{kind} {:.0} ms: {}", event.ms, event.what);
     let mut events = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -91,13 +101,10 @@ pub struct Steps {
 impl Steps {
     pub fn new(what: impl FnOnce() -> String) -> Self {
         let now = std::time::Instant::now();
-        Steps { what: if ENABLED { what() } else { String::new() }, start: now, last: now, steps: Vec::new() }
+        Steps { what: what(), start: now, last: now, steps: Vec::new() }
     }
 
     pub fn mark(&mut self, step: &'static str) {
-        if !ENABLED {
-            return;
-        }
         let now = std::time::Instant::now();
         self.steps.push((step, now - self.last));
         self.last = now;
@@ -107,7 +114,7 @@ impl Steps {
 impl Drop for Steps {
     fn drop(&mut self) {
         let took = self.start.elapsed();
-        if !ENABLED || took < SLOW_IMAP {
+        if took < SLOW_IMAP {
             return;
         }
         let steps: Vec<String> = self.steps.iter().filter(|(_, d)| d.as_millis() >= 10).map(|(s, d)| format!("{s} {}", d.as_millis())).collect();
@@ -115,10 +122,8 @@ impl Drop for Steps {
     }
 }
 
-#[cfg(feature = "perf")]
 pub use held::{Held, profile};
 
-#[cfg(feature = "perf")]
 mod held {
     use std::ops::{Deref, DerefMut};
     use std::panic::Location;
@@ -178,5 +183,17 @@ mod held {
                 }
             }),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slow_operations_are_kept_with_the_tools_off() {
+        set_enabled(false);
+        record("sql", "SELECT launch_marker", Duration::from_millis(40));
+        assert!(since(0).iter().any(|e| e.what == "SELECT launch_marker"), "launch measured before the setting is read");
     }
 }

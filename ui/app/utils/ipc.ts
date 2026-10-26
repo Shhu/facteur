@@ -1,12 +1,12 @@
 import { invoke as tauriInvoke } from '@tauri-apps/api/core'
 import type { InvokeArgs, InvokeOptions } from '@tauri-apps/api/core'
 
-// The app calls this wrapper instead of Tauri's `invoke` so `--perf` builds can time commands
+// The app calls this wrapper instead of Tauri's `invoke` so the developer tools can time commands
 // without patching Tauri's internals (they are read-only).
 type Timer = (command: string, ms: number, ok: boolean) => void
 let timer: Timer | null = null
 
-export function timeCommands(t: Timer) {
+export function timeCommands(t: Timer | null) {
   timer = t
 }
 

@@ -2,7 +2,7 @@
   "settings": {
     "about": {
       "logs": "Logs",
-      "keywords": "version update logs diagnostics facteur",
+      "keywords": "version update logs diagnostics developer performance facteur",
       "title": "About",
       "intro": "facteur's version and its updates.",
       "version": "facteur {version}",
@@ -15,7 +15,9 @@
       "install": "Install and restart",
       "installing": "Installing…",
       "downloading": "Downloading… {percent}%",
-      "installFailed": "Could not install the update"
+      "installFailed": "Could not install the update",
+      "developer": "Developer tools",
+      "developerHelp": "Measures slowdowns (database, sync, interface) and opens the diagnostics panel with Ctrl+Shift+P. Everything stays on this device."
     },
     "title": "Settings",
     "nav": "Settings sections",

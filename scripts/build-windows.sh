@@ -3,7 +3,6 @@
 #
 #   scripts/build-windows.sh            → target\release\facteur.exe (standalone)
 #   scripts/build-windows.sh --setup    → plus an NSIS installer
-#   scripts/build-windows.sh --perf     → with the performance tools (Ctrl+Shift+P), local only
 #
 # The working tree is copied to the Windows disk: building through \\wsl.localhost is slow and
 # unreliable.
@@ -19,8 +18,6 @@ features='vulkan'
 for arg in "$@"; do
   case "$arg" in
     --setup) bundle='--bundles nsis' ;;
-    # Local builds only: scripts/release.sh never passes it.
-    --perf) features='vulkan,perf' ;;
   esac
 done
 

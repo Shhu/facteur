@@ -1181,7 +1181,7 @@ fn log_ui(level: String, message: String) {
 
 #[tauri::command]
 fn perf_enabled() -> bool {
-    facteur_core::perf::ENABLED
+    facteur_core::perf::enabled()
 }
 
 /// `since`: Unix ms.

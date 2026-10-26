@@ -848,11 +848,8 @@ pub struct Store {
 
 const READERS: usize = 3;
 
-/// A store connection: timed in local perf builds (`crate::perf`), a plain guard otherwise.
-#[cfg(feature = "perf")]
+/// A store connection, timed while the developer tools are on (`crate::perf`).
 type Conn<'a> = crate::perf::Held<'a>;
-#[cfg(not(feature = "perf"))]
-type Conn<'a> = std::sync::MutexGuard<'a, Connection>;
 
 /// Caches given back to the system at most this often (seconds).
 const SHRINK_EVERY: i64 = 3600;
@@ -1191,9 +1188,7 @@ impl Store {
             // cache: there are three of them, open for days.
             conn.execute_batch(&format!("PRAGMA cache_size = -8192; PRAGMA temp_store = MEMORY; PRAGMA mmap_size = {READER_MMAP};"))?;
             register_functions(&conn)?;
-            #[cfg(feature = "perf")]
             let mut conn = conn;
-            #[cfg(feature = "perf")]
             crate::perf::profile(&mut conn);
             store.readers.push(Mutex::new(conn));
         }
@@ -1322,8 +1317,7 @@ impl Store {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(#[allow(unused_mut)] mut conn: Connection) -> Result<Self> {
-        #[cfg(feature = "perf")]
+    fn init(mut conn: Connection) -> Result<Self> {
         crate::perf::profile(&mut conn);
         conn.execute_batch(
             "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;
@@ -1421,14 +1415,11 @@ impl Store {
 
     #[track_caller]
     fn db(&self) -> Conn<'_> {
-        #[cfg(feature = "perf")]
         let (started, at) = (std::time::Instant::now(), std::panic::Location::caller());
         // A panic mid-query leaves the connection consistent (SQLite rolls the transaction back),
         // so the poisoned lock can be recovered.
         let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        #[cfg(feature = "perf")]
-        let guard = crate::perf::Held::new(guard, started.elapsed(), at, "writer");
-        guard
+        crate::perf::Held::new(guard, started.elapsed(), at, "writer")
     }
 
     /// A free reader, else the next one in turn. Each query sees everything committed before it.
@@ -1437,15 +1428,12 @@ impl Store {
         if self.readers.is_empty() {
             return self.db();
         }
-        #[cfg(feature = "perf")]
         let (started, at) = (std::time::Instant::now(), std::panic::Location::caller());
         let guard = self.readers.iter().find_map(|r| r.try_lock().ok()).unwrap_or_else(|| {
             let i = self.next_reader.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.readers.len();
             self.readers[i].lock().unwrap_or_else(|e| e.into_inner())
         });
-        #[cfg(feature = "perf")]
-        let guard = crate::perf::Held::new(guard, started.elapsed(), at, "reader");
-        guard
+        crate::perf::Held::new(guard, started.elapsed(), at, "reader")
     }
 
     /// The database's size and each connection's page cache, for the diagnostics. Never waits:

@@ -903,6 +903,9 @@ impl Engine {
             crate::i18n::set(&language);
         }
         crate::ai::set_graphics(store.setting(AI_GRAPHICS).ok().flatten().as_deref() != Some("off"));
+        if store.setting(crate::perf::SETTING).ok().flatten().as_deref() == Some("1") {
+            crate::perf::set_enabled(true);
+        }
         if store.setting(AI_GRAPHICS_FAILED).ok().flatten().is_some() {
             crate::ai::graphics_failed_before();
         }
@@ -3636,6 +3639,9 @@ impl Engine {
             crate::i18n::set(value);
         }
         self.store.set_setting(key, value)?;
+        if key == crate::perf::SETTING {
+            crate::perf::set_enabled(value == "1");
+        }
         if relanguaged {
             self.restate();
         }
@@ -8497,6 +8503,19 @@ mod tests {
             })
             .unwrap();
         (dir, engine, acc)
+    }
+
+    #[test]
+    fn the_developer_tools_follow_their_setting_and_come_back_at_launch() {
+        let (dir, engine, _acc) = test_engine();
+        engine.set_setting(crate::perf::SETTING, "1").unwrap();
+        assert!(crate::perf::enabled());
+        crate::perf::set_enabled(false);
+        drop(engine);
+        let _engine = Engine::open(dir.path()).unwrap();
+        assert!(crate::perf::enabled(), "kept on across a restart");
+        _engine.set_setting(crate::perf::SETTING, "0").unwrap();
+        assert!(!crate::perf::enabled());
     }
 
     #[test]
