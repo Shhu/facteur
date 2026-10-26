@@ -214,7 +214,7 @@
       "senderLogos": "Sender logos",
       "senderLogosHelp": "Brand logos (Airbnb, GitHub…) instead of initials. Each logo is requested once per domain, from the brand's own website.",
       "trusted": "Always show remote images",
-      "trustedHelp": "For these domains (or addresses), images load as soon as the message opens, unless it is deemed untrustworthy.",
+      "trustedHelp": "Images load as soon as the message opens when it is signed by one of these domains or addresses, or when they are hosted on one of these domains; never for a message deemed untrustworthy.",
       "trustedPlaceholder": "example.com or name{'@'}gmail.com",
       "add": "Add",
       "blocked": "Blocked senders",

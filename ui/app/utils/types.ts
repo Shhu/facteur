@@ -314,6 +314,14 @@ export interface MessageDetail {
   images_allowed: boolean
   /** Signed by its sender's domain: an approval of that domain applies to it. */
   sender_proven: boolean
+  /** Written here (Sent, Drafts): its images are those of the mail it quotes, the sender's
+   *  approval does not apply. */
+  own_copy: boolean
+  /** Approved domains its remote content comes from: loaded whoever sent it. */
+  image_hosts: string[]
+  blocked_hosts: string[]
+  /** All its remote content comes from approved domains. */
+  images_covered: boolean
   invite: Invite | null
   /** A day and time the message's own words give: offered as an event. */
   appointment: Appointment | null

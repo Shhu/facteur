@@ -6,7 +6,8 @@ import type { LinkReport } from '~/utils/types'
 // Two roots (link preview, frame): attributes such as `class` go to the frame's box.
 defineOptions({ inheritAttrs: false })
 /** `highlight`: words to mark in the text (an appointment the engine found there). */
-const props = defineProps<{ messageId?: number, html: string, plain: boolean, allowRemote: boolean, cautious?: boolean, darken?: boolean, highlight?: string | null }>()
+/** `hosts`: approved domains whose remote content loads even while `allowRemote` is off. */
+const props = defineProps<{ messageId?: number, html: string, plain: boolean, allowRemote: boolean, hosts?: string[], cautious?: boolean, darken?: boolean, highlight?: string | null }>()
 const emit = defineEmits<{ mailto: [address: string] }>()
 
 const frame = ref<HTMLIFrameElement>()
@@ -43,7 +44,7 @@ const { t } = useI18n()
 // The HTML is already sanitised in Rust. The iframe has no `allow-scripts`: no script can run.
 // `allow-same-origin` only serves to measure the height and catch clicks from the parent page.
 const srcdoc = computed(() => {
-  const remote = props.allowRemote ? ' https: http:' : ''
+  const remote = remoteSources(props.allowRemote, props.hosts ?? [])
   const csp = `default-src 'none'; img-src data:${remote}; style-src 'unsafe-inline'${remote}; font-src data:${remote}`
   // Plain-text mails follow the theme; HTML mails keep the white background their author intended.
   const dark = props.plain && colorMode.value === 'dark'

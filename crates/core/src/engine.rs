@@ -721,6 +721,10 @@ enum AiKind {
 
 /// The From is the sender's own: a DMARC pass (no other server's verdict mixed in), or the
 /// message's DKIM signature checked here and aligned with it.
+fn written_by_me(role: Option<Role>, from: Option<&str>, own: &[String]) -> bool {
+    matches!(role, Some(Role::Sent | Role::Drafts)) && from.is_some_and(|f| own.iter().any(|o| o.eq_ignore_ascii_case(f.trim())))
+}
+
 fn from_proven(signals: &crate::trust::Signals, context: &crate::trust::Context) -> bool {
     (signals.dmarc == Some(true) && context.foreign_results.is_none()) || signals.dkim_local.as_ref().is_some_and(|d| d.pass && d.aligned)
 }
@@ -2372,8 +2376,10 @@ impl Engine {
         };
         let (mut signals, context) = self.trust_parts(id, Some(&parsed.headers.signals))?;
         let sender_key = parsed.headers.from.as_ref().and_then(|a| crate::avatars::sender_key(&a.email));
+        let mine = self.own_copy(id)?;
         // Before the images are allowed, so that a forged signature never loads them.
-        if crate::dkim::wanted(&signals, &context)
+        if !mine
+            && crate::dkim::wanted(&signals, &context)
             && let Some(verdict) = self.dkim_verdict(id, &raw, summary.from.as_ref().map(|a| a.email.as_str()), summary.date, self.lookup_on_open(sender_key.as_deref())?).await
         {
             signals.dkim_local = Some(verdict);
@@ -2383,6 +2389,7 @@ impl Engine {
         }
         let trust = crate::trust::evaluate(&signals, &context);
         let sender_proven = from_proven(&signals, &context);
+        let (image_hosts, blocked_hosts) = self.image_hosts(&parsed.remote, trust.is_low())?;
         let invite = invite.map(|mut i| {
             i.my_response = self.store.setting(&format!("rsvp:{}", i.uid)).ok().flatten();
             i
@@ -2403,10 +2410,15 @@ impl Engine {
             images_allowed: match &sender_key {
                 // Approved for the sender's domain: only for mail proven to come from it, or a
                 // From forged on a domain without DMARC would load them (a read receipt).
-                Some(key) => !trust.is_low() && sender_proven && self.store.images_trusted(key)?,
+                // One's own copy: its images come from the mail it quotes or forwards, not from us.
+                Some(key) => !mine && !trust.is_low() && sender_proven && self.store.images_trusted(key)?,
                 None => false,
             },
             sender_proven,
+            own_copy: mine,
+            images_covered: parsed.remote.any && !parsed.remote.unlisted && blocked_hosts.is_empty(),
+            image_hosts,
+            blocked_hosts,
             sender_key,
             trust,
             invite,
@@ -3346,6 +3358,31 @@ impl Engine {
                 }
             }
         });
+    }
+
+    /// The domains a message's remote content comes from, approved ones first (they load whoever
+    /// sent it: the request goes to them, not to a forger), then the others. None approved for an
+    /// untrustworthy message.
+    fn image_hosts(&self, remote: &crate::mime::Remote, low: bool) -> Result<(Vec<String>, Vec<String>)> {
+        let domains: std::collections::BTreeSet<String> = remote.hosts.iter().map(|h| crate::autoconfig::registrable(h)).filter(|d| !d.is_empty()).collect();
+        let (mut approved, mut blocked) = (Vec::new(), Vec::new());
+        for domain in domains {
+            if !low && self.store.images_trusted(&domain)? {
+                approved.push(domain);
+            } else {
+                blocked.push(domain);
+            }
+        }
+        Ok((approved, blocked))
+    }
+
+    /// A message of one's own addresses in one's Sent or Drafts: written here (no server received
+    /// it, so it carries no verdict), while a forged From arrives in the inbox.
+    fn own_copy(&self, id: i64) -> Result<bool> {
+        let crate::store::TrustInputs { account_id, from, role, .. } = self.store.trust_inputs(id)?;
+        let account = self.store.account(account_id)?;
+        let own: Vec<String> = std::iter::once(account.email).chain(account.identities.into_iter().map(|i| i.email)).collect();
+        Ok(written_by_me(role, from.as_deref(), &own))
     }
 
     /// Whether a message being opened may have its sender's DKIM key looked up. Only for a domain
@@ -7929,6 +7966,32 @@ mod tests {
         r.cut(secs(61));
         r.cut(secs(65));
         assert_eq!(r.every, secs(45));
+    }
+
+    #[test]
+    fn images_load_from_an_approved_host_whoever_sent_them() {
+        let (_dir, engine, _acc) = test_engine();
+        engine.add_trusted_images("salesforce.com").unwrap();
+        let remote = crate::mime::Remote {
+            any: true,
+            hosts: ["windu.my.salesforce.com".to_string(), "pixel.tracker.example".to_string()].into(),
+            unlisted: false,
+        };
+        let (approved, blocked) = engine.image_hosts(&remote, false).unwrap();
+        assert_eq!(approved, ["salesforce.com"]);
+        assert_eq!(blocked, ["tracker.example"]);
+        let (approved, _) = engine.image_hosts(&remote, true).unwrap();
+        assert!(approved.is_empty(), "never for an untrustworthy message");
+    }
+
+    #[test]
+    fn ones_own_sent_mail_needs_no_signature_to_be_ones_own() {
+        let own = ["passerelle@mli.immo".to_string(), "alias@mli.immo".to_string()];
+        assert!(written_by_me(Some(Role::Sent), Some("Passerelle@mli.immo"), &own));
+        assert!(written_by_me(Some(Role::Drafts), Some("alias@mli.immo"), &own));
+        assert!(!written_by_me(Some(Role::Inbox), Some("passerelle@mli.immo"), &own), "a forged From arrives in the inbox");
+        assert!(!written_by_me(Some(Role::Sent), Some("hotline.passerelles@seloger.com"), &own));
+        assert!(!written_by_me(Some(Role::Sent), None, &own));
     }
 
     #[test]

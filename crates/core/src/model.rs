@@ -557,6 +557,15 @@ pub struct MessageDetail {
     /// Signed by its sender's domain (DMARC or facteur's own DKIM check): an approval of that
     /// domain applies to it. Unproven, anyone could have written it under that name.
     pub sender_proven: bool,
+    /// Written here (one's Sent or Drafts): the sender's approval does not apply, its images
+    /// being those of the mail it quotes.
+    pub own_copy: bool,
+    /// Approved domains its remote content comes from: loaded whatever the sender.
+    pub image_hosts: Vec<String>,
+    /// Domains its remote content comes from that are not approved.
+    pub blocked_hosts: Vec<String>,
+    /// All its remote content comes from approved domains.
+    pub images_covered: bool,
     pub invite: Option<crate::calendar::Invite>,
     /// A day and time the message's own words give (not an invitation): offered as an event.
     pub appointment: Option<crate::ai::Appointment>,

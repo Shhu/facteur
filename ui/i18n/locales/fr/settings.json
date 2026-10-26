@@ -214,7 +214,7 @@
       "senderLogos": "Logos des expéditeurs",
       "senderLogosHelp": "Logo des marques (Airbnb, GitHub…) à la place des initiales. Il est demandé une fois par domaine, au site de la marque lui-même.",
       "trusted": "Images distantes toujours affichées",
-      "trustedHelp": "Pour ces domaines (ou ces adresses), les images s'affichent dès l'ouverture, sauf si le message est jugé peu fiable.",
+      "trustedHelp": "Les images s'affichent dès l'ouverture quand le message est signé par l'un de ces domaines ou adresses, ou qu'elles sont hébergées sur l'un de ces domaines ; jamais pour un message jugé peu fiable.",
       "trustedPlaceholder": "exemple.fr ou prenom{'@'}gmail.com",
       "add": "Ajouter",
       "blocked": "Expéditeurs bloqués",

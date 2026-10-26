@@ -36,10 +36,37 @@ pub struct ParsedBody {
     pub is_plain: bool,
     pub text: Option<String>,
     pub has_remote_content: bool,
+    /// Where the remote content would be loaded from.
+    pub remote: Remote,
     pub attachments: Vec<Attachment>,
     pub unsubscribe: Option<Unsubscribe>,
     pub links: Vec<(String, usize)>,
     pub calendar: Option<String>,
+}
+
+/// The hosts remote content would be fetched from (lowercase); `unlisted`: some is written so its
+/// host cannot be told (`@import`, `image-set`, a relative URL), which no approval covers.
+#[derive(Debug, Clone, Default)]
+pub struct Remote {
+    pub any: bool,
+    pub hosts: std::collections::BTreeSet<String>,
+    pub unlisted: bool,
+}
+
+impl Remote {
+    fn add(&mut self, other: Remote) {
+        self.any |= other.any;
+        self.hosts.extend(other.hosts);
+        self.unlisted |= other.unlisted;
+    }
+}
+
+/// Host of a URL as a browser would fetch it (`//host/…` taken as https).
+fn fetched_host(url: &str) -> Option<String> {
+    let url = url.trim_matches(|c: char| c <= ' ');
+    let absolute = if url.starts_with("//") { format!("https:{url}") } else { url.to_string() };
+    let parsed = url::Url::parse(&absolute).ok()?;
+    matches!(parsed.scheme(), "http" | "https").then(|| parsed.host_str().map(str::to_ascii_lowercase)).flatten()
 }
 
 /// A `text/calendar` part, or an `.ics` attachment.
@@ -577,13 +604,13 @@ pub fn parse_body(raw: &[u8]) -> Result<ParsedBody> {
     let cids = inline_cids(&msg, html_body.as_deref());
 
     let text = joined_text(msg.raw_message(), msg.text_bodies());
-    let (html, has_remote_content, is_plain, shown) = match html_body {
+    let (html, remote, is_plain, shown) = match html_body {
         // mail-parser makes up HTML from the text when there is none: ours is better.
         Some(h) => {
             let (html, remote, shown) = sanitize_html_inlining(&h, cids);
             (html, remote, false, shown)
         }
-        _ => (text_to_html(text.as_deref().unwrap_or_default()), false, true, HashSet::new()),
+        _ => (text_to_html(text.as_deref().unwrap_or_default()), Remote::default(), true, HashSet::new()),
     };
 
     // A message made of thousands of tiny parts would become thousands of chips: the first ones
@@ -601,7 +628,7 @@ pub fn parse_body(raw: &[u8]) -> Result<ParsedBody> {
     let unsubscribe = unsubscribe(&msg);
     let links = link_domains(&link_source(&msg));
     let calendar = calendar_part(&msg);
-    Ok(ParsedBody { headers, html, is_plain, text, has_remote_content, attachments, unsubscribe, links, calendar })
+    Ok(ParsedBody { headers, html, is_plain, text, has_remote_content: remote.any, remote, attachments, unsubscribe, links, calendar })
 }
 
 pub struct DraftParts {
@@ -760,22 +787,22 @@ fn original_bytes(raw: &[u8], part: &mail_parser::MessagePart) -> Option<Vec<u8>
 /// Also returns whether the message has remote resources (tracking pixels, hosted images…).
 pub fn sanitize_html(html: &str, cids: HashMap<String, String>) -> (String, bool) {
     let (clean, remote, _) = sanitize_html_inlining(html, cids);
-    (clean, remote)
+    (clean, remote.any)
 }
 
 /// `sanitize_html`, plus the Content-IDs of `cids` really written into an `<img>` (the others
 /// went over the inline budgets, or are not shown).
-fn sanitize_html_inlining(html: &str, cids: HashMap<String, String>) -> (String, bool, HashSet<String>) {
+fn sanitize_html_inlining(html: &str, cids: HashMap<String, String>) -> (String, Remote, HashSet<String>) {
     sanitize_html_budgeted(html, cids.into_iter().map(|(cid, data)| (cid, (data.len(), data))).collect())
 }
 
 /// `sanitize_html_inlining`, each image given as (length counted against the inline budget,
 /// what is written): [`body_info`] gives empty sources of the real lengths, to learn which
 /// images the reader shows without encoding them.
-fn sanitize_html_budgeted(html: &str, cids: HashMap<String, (usize, String)>) -> (String, bool, HashSet<String>) {
+fn sanitize_html_budgeted(html: &str, cids: HashMap<String, (usize, String)>) -> (String, Remote, HashSet<String>) {
     use std::sync::{Arc, Mutex};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    let remote = Arc::new(AtomicBool::new(false));
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let remote = Arc::new(Mutex::new(Remote::default()));
     let flag = remote.clone();
     let cids = Arc::new(cids);
     // Budget of inlined image bytes and substitutions, shared by every `<img src="cid:…">`.
@@ -800,9 +827,7 @@ fn sanitize_html_budgeted(html: &str, cids: HashMap<String, (usize, String)>) ->
         // inside the scheme…): decisions are made on the URL as a browser would parse it.
         .attribute_filter(move |element, attribute, value| {
             if attribute == "style" {
-                if css_loads_remote(value) {
-                    flag.store(true, Ordering::Relaxed);
-                }
+                flag.lock().unwrap_or_else(|e| e.into_inner()).add(css_remote(value));
                 return Some(value.into());
             }
             let is_url = matches!((element, attribute), ("img", "src") | ("a", "href"));
@@ -829,7 +854,12 @@ fn sanitize_html_budgeted(html: &str, cids: HashMap<String, (usize, String)>) ->
                     "cid" => None,
                     "http" | "https" => {
                         if image {
-                            flag.store(true, Ordering::Relaxed);
+                            let mut r = flag.lock().unwrap_or_else(|e| e.into_inner());
+                            r.any = true;
+                            match url.host_str() {
+                                Some(host) => r.hosts.insert(host.to_ascii_lowercase()),
+                                None => std::mem::replace(&mut r.unlisted, true),
+                            };
                         }
                         Some(url.to_string().into())
                     }
@@ -846,7 +876,12 @@ fn sanitize_html_budgeted(html: &str, cids: HashMap<String, (usize, String)>) ->
                     if trimmed.starts_with("//") || trimmed.starts_with("\\\\") || trimmed.starts_with("/\\") || trimmed.starts_with("\\/") {
                         let absolute = url::Url::parse(&format!("https:{}", trimmed.replace('\\', "/"))).ok()?;
                         if image {
-                            flag.store(true, Ordering::Relaxed);
+                            let mut r = flag.lock().unwrap_or_else(|e| e.into_inner());
+                            r.any = true;
+                            match absolute.host_str() {
+                                Some(host) => r.hosts.insert(host.to_ascii_lowercase()),
+                                None => std::mem::replace(&mut r.unlisted, true),
+                            };
                         }
                         Some(absolute.to_string().into())
                     } else if image {
@@ -862,7 +897,10 @@ fn sanitize_html_budgeted(html: &str, cids: HashMap<String, (usize, String)>) ->
         .clean(&defused(html))
         .to_string();
     // <style> sheets can load resources too.
-    let remote = remote.load(Ordering::Relaxed) || style_blocks(&clean).any(css_loads_remote);
+    let mut remote = std::mem::take(&mut *remote.lock().unwrap_or_else(|e| e.into_inner()));
+    for block in style_blocks(&clean) {
+        remote.add(css_remote(block));
+    }
     let shown = std::mem::take(&mut *shown.lock().unwrap_or_else(|e| e.into_inner()));
     (clean, remote, shown)
 }
@@ -902,6 +940,35 @@ fn style_blocks(html: &str) -> impl Iterator<Item = &str> {
         }
         Some(block)
     })
+}
+
+/// What CSS would load from the network, by host (see [`css_loads_remote`]).
+fn css_remote(css: &str) -> Remote {
+    let mut remote = Remote { any: css_loads_remote(css), ..Default::default() };
+    if !remote.any {
+        return remote;
+    }
+    let css = css_normalize(css);
+    if css.contains("@import") || css.contains("image-set(") || css.contains("image(") {
+        remote.unlisted = true;
+    }
+    let mut rest = css.as_str();
+    while let Some(pos) = rest.find("url(") {
+        rest = &rest[pos + 4..];
+        let arg = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '"' || c == '\'');
+        let end = arg.find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')')).unwrap_or(arg.len());
+        let url = &arg[..end];
+        if url.starts_with("data:") {
+            continue;
+        }
+        match fetched_host(url) {
+            Some(host) => {
+                remote.hosts.insert(host);
+            }
+            None => remote.unlisted = true,
+        }
+    }
+    remote
 }
 
 /// CSS that would load something from the network: `url(…)` other than `data:`, `@import`,
@@ -1693,6 +1760,23 @@ Subject: Votre compte\r\n\r\n.\r\n";
         // A scheme broken up by a tab is still `data:` to the browser.
         let (html, _) = sanitize_html("<a href=\"da\tta:text/html,<script>x</script>\">x</a>", HashMap::new());
         assert!(!html.contains("href"), "{html}");
+    }
+
+    #[test]
+    fn remote_content_is_listed_by_host() {
+        let hosts = |html: &str| {
+            let (_, remote, _) = sanitize_html_inlining(html, HashMap::new());
+            (remote.hosts.into_iter().collect::<Vec<_>>(), remote.unlisted)
+        };
+        assert_eq!(
+            hosts(r#"<img src="https://windu.my.Salesforce.com/p.png"><img src="//cdn.example/a.gif"><div style="background: url('https://img.example/b.jpg')">x</div>"#),
+            (vec!["cdn.example".to_string(), "img.example".to_string(), "windu.my.salesforce.com".to_string()], false)
+        );
+        assert_eq!(hosts("<style>p { background: URL(https://s.example/c.png) }</style><p>x</p>"), (vec!["s.example".to_string()], false));
+        assert_eq!(hosts(r#"<a href="https://link.example/">lien</a><img src="data:image/png;base64,AA">"#), (vec![], false));
+        // What cannot be read to a host stays blocked: never counted as approved.
+        assert!(hosts("<style>@import 'https://t.example/a.css';</style><p>x</p>").1);
+        assert!(hosts(r#"<div style="background: url(relative.png)">x</div>"#).1);
     }
 
     #[test]

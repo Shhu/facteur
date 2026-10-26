@@ -32,9 +32,7 @@ watch(() => props.detail?.images_allowed, (allowed) => {
   }
 }, { immediate: true })
 
-async function alwaysShowRemote() {
-  const key = props.detail?.sender_key
-  if (!key) return
+async function alwaysShowRemote(key: string) {
   try {
     await api.addTrustedImages(key)
     autoAllowed = false
@@ -45,14 +43,29 @@ async function alwaysShowRemote() {
   }
 }
 
-const remoteActions = computed(() => [
-  { label: t('mail.messageCard.show'), color: 'neutral' as const, variant: 'outline' as const, onClick: showRemote },
-  // Never a lasting approval from a suspicious message, nor from one its domain did not sign
-  // (the approval would not apply to it).
-  ...(props.detail?.sender_key && props.detail.sender_proven && !lowTrust.value
-    ? [{ label: t('mail.messageCard.alwaysFor', { key: props.detail.sender_key }), color: 'neutral' as const, variant: 'ghost' as const, onClick: alwaysShowRemote }]
-    : [])
-])
+/** The sender's approval applies: signed by its domain, not one's own copy. */
+const senderApprovable = computed(() => !!props.detail?.sender_key && props.detail.sender_proven && !props.detail.own_copy && !lowTrust.value)
+const remoteActions = computed(() => {
+  const d = props.detail
+  // Never a lasting approval from a suspicious message.
+  if (!d || lowTrust.value) return [{ label: t('mail.messageCard.show'), color: 'neutral' as const, variant: 'outline' as const, onClick: showRemote }]
+  const sender = senderApprovable.value ? d.sender_key! : null
+  return [
+    { label: t('mail.messageCard.show'), color: 'neutral' as const, variant: 'outline' as const, onClick: showRemote },
+    ...(sender ? [{ label: t('mail.messageCard.alwaysFor', { key: sender }), color: 'neutral' as const, variant: 'ghost' as const, onClick: () => alwaysShowRemote(sender) }] : []),
+    // The sites hosting the images: approved, they load whoever sends them.
+    ...d.blocked_hosts
+      .filter(h => h !== sender)
+      .slice(0, 2)
+      .map(h => ({ label: t('mail.messageCard.alwaysFrom', { host: h }), color: 'neutral' as const, variant: 'ghost' as const, onClick: () => alwaysShowRemote(h) }))
+  ]
+})
+const remoteNotice = computed(() => {
+  const d = props.detail
+  if (!d) return ''
+  if (d.sender_key && !d.sender_proven && !d.own_copy && !lowTrust.value) return t('mail.messageCard.remoteUnproven', { key: d.sender_key })
+  return d.image_hosts.length ? t('mail.messageCard.remotePartly') : t('mail.messageCard.remoteBlocked')
+})
 
 const lowTrust = computed(() => props.detail?.trust.level === 'low')
 const trustTooltip = computed(() => props.detail?.trust.reasons.filter(r => r.positive).map(r => r.text).join(' · ') ?? '')
@@ -129,7 +142,7 @@ const sourceOpen = ref(false)
 function printMessage() {
   const d = props.detail
   if (!d) return
-  const remote = allowRemote.value ? ' https: http:' : ''
+  const remote = remoteSources(allowRemote.value, d.image_hosts)
   const row = (label: string, value: string) => (value ? `<tr><th>${label}</th><td>${escapeHtml(value)}</td></tr>` : '')
   // No DNS prefetch of the mail's links (see MailFrame): first in the head, before any link.
   const doc = `<!doctype html><html><head><meta http-equiv="x-dns-prefetch-control" content="off"><meta charset="utf-8">
@@ -488,12 +501,12 @@ const originalExcerpt = computed(() => {
             />
           </div>
           <UAlert
-            v-if="detail.has_remote_content && !allowRemote && (!detail.invite || originalOpen)"
+            v-if="detail.has_remote_content && !allowRemote && !detail.images_covered && (!detail.invite || originalOpen)"
             class="mb-3"
             color="neutral"
             variant="subtle"
             icon="i-lucide-image-off"
-            :description="detail.sender_key && !detail.sender_proven && !lowTrust ? $t('mail.messageCard.remoteUnproven', { key: detail.sender_key }) : $t('mail.messageCard.remoteBlocked')"
+            :description="remoteNotice"
             :actions="remoteActions"
           />
           <template v-if="detail.invite">
@@ -507,6 +520,7 @@ const originalExcerpt = computed(() => {
             :html="detail.html"
             :plain="detail.is_plain"
             :allow-remote="allowRemote"
+            :hosts="detail.image_hosts"
             :cautious="lowTrust"
             :darken="darkMail.active.value && !original"
             :highlight="appointment?.phrase"
