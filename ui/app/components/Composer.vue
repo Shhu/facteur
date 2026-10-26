@@ -156,6 +156,10 @@ const htmlFor = (of: number) => (v: string) => {
 const textFor = (of: number) => (text: string) => {
   if (of === session.value) onText(text)
 }
+/** Bound in the script, not called in the template: a call there would run `htmlFor` at each
+ *  update and drop the handler it returns (the text never reaching the draft). */
+const onHtml = computed(() => htmlFor(session.value))
+const onBodyText = computed(() => textFor(session.value))
 
 function onText(text: string) {
   const d = draft.value
@@ -848,8 +852,8 @@ defineShortcuts({
             :used-bytes="attachedBytes"
             autofocus="start"
             :placeholder="$t('app.composer.bodyPlaceholder')"
-            @update:model-value="htmlFor(session)"
-            @text="textFor(session)"
+            @update:model-value="onHtml"
+            @text="onBodyText"
             @changed="onEdited"
             @files="attach"
           >
@@ -1046,8 +1050,8 @@ defineShortcuts({
               :used-bytes="attachedBytes"
               autofocus="start"
               :placeholder="$t('app.composer.bodyPlaceholder')"
-              @update:model-value="htmlFor(session)"
-              @text="textFor(session)"
+              @update:model-value="onHtml"
+              @text="onBodyText"
               @changed="onEdited"
               @files="attach"
             />
