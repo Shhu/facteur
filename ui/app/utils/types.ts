@@ -312,6 +312,8 @@ export interface MessageDetail {
   sender_key: string | null
   /** Approved sender and nothing suspicious. */
   images_allowed: boolean
+  /** Signed by its sender's domain: an approval of that domain applies to it. */
+  sender_proven: boolean
   invite: Invite | null
   /** A day and time the message's own words give: offered as an event. */
   appointment: Appointment | null

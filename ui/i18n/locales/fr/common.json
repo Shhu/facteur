@@ -72,6 +72,8 @@
     "toast": {
       "stillRefused": "Toujours refusée par le serveur",
       "draftUnreadable": "Brouillon illisible",
+      "draftOpen": "Ce brouillon est ouvert : abandonnez-le depuis la fenêtre de rédaction",
+      "draftNotDiscarded": "Brouillon non supprimé",
       "cannotReopen": "Impossible de reprendre le message",
       "searchNotSaved": "Recherche non enregistrée",
       "syncFailed": "Synchronisation impossible",

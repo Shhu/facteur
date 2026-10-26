@@ -139,8 +139,9 @@ impl Verifier {
     }
 
     /// `None` when no verdict can be given (no signature, key not found, DNS unreachable or too
-    /// slow, expired, `l=`, RSA-SHA1 or unsupported). `lookup`: only for a message that just
-    /// arrived; when it is being opened, a lookup would tell the sender when it was read.
+    /// slow, expired, `l=`, RSA-SHA1 or unsupported). `lookup`: for a message that just arrived;
+    /// when it is being opened, a lookup tells the sender when it was read (allowed only for a
+    /// domain whose images are approved, which learns it anyway).
     pub async fn verify(&self, raw: &[u8], from_domain: &str, own: &[String], sent_at: i64, lookup: bool) -> Option<DkimLocal> {
         let auth = self.authenticator()?;
         verify_with(auth, &self.keys, raw, from_domain, own, sent_at, crate::store::now(), lookup).await

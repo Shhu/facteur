@@ -100,7 +100,8 @@ function scrollTo(id: number | undefined) {
 }
 /** Message answered by reply, reply all and forward: the latest one, a draft aside (a draft
  *  saved in the thread is not what one replies to). */
-const replyTarget = computed(() => [...messages.value].reverse().find(m => mailboxes.value.find(b => b.id === m.mailbox_id)?.role !== 'drafts') ?? latest.value)
+const drafts = computed(() => draftIds(messages.value, mailboxes.value))
+const replyTarget = computed(() => replyTargetIn(messages.value, drafts.value))
 /** Another thread was asked for and its messages aren't in yet: `messages` still holds the
  *  previous one, which no action (button or shortcut) may target meanwhile. */
 const resetPending = ref(false)
@@ -894,6 +895,7 @@ useEventListener('keydown', (e: KeyboardEvent) => {
               :expanded="expanded.has(row.message.id)"
               :loading="loadingIds.has(row.message.id)"
               :latest="row.message.id === replyTarget?.id"
+              :draft="drafts.has(row.message.id)"
               @toggle="toggle"
             />
           </div>

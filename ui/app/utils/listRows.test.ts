@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { keptById, latestIn, newlySeen, reconcileLeaving, rowsLeft, seenPatched, whileCovered } from './listRows'
-import type { MessageSummary, Outgoing, ThreadSummary } from './types'
+import { draftIds, keptById, latestIn, replyTargetIn, newlySeen, reconcileLeaving, rowsLeft, seenPatched, whileCovered } from './listRows'
+import type { Mailbox, MessageSummary, Outgoing, ThreadSummary } from './types'
 
 const thread = (id: number, ids: number[], unread: number) => ({ thread_id: id, message_ids: ids, unread, count: ids.length }) as unknown as ThreadSummary
 
@@ -102,5 +102,20 @@ describe('whileCovered', () => {
     later.ask(true, 1, () => acted++)
     later.uncovered(2, () => acted++)
     expect(acted).toBe(2)
+  })
+})
+
+describe('drafts in a thread', () => {
+  const boxes = [{ id: 1, role: 'inbox' }, { id: 2, role: 'drafts' }, { id: 3, role: 'sent' }] as unknown as Mailbox[]
+  const msg = (id: number, mailbox_id: number) => ({ id, mailbox_id }) as unknown as MessageSummary
+  const thread = [msg(10, 1), msg(11, 3), msg(12, 2)]
+
+  it('tells the unsent draft from the messages sent or received', () => {
+    expect([...draftIds(thread, boxes)]).toEqual([12])
+  })
+
+  it('replies to the latest real message, not to the draft', () => {
+    expect(replyTargetIn(thread, draftIds(thread, boxes))?.id).toBe(11)
+    expect(replyTargetIn([msg(12, 2)], new Set([12]))?.id).toBe(12)
   })
 })

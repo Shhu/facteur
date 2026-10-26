@@ -2,11 +2,12 @@
 import { confirm } from '~/composables/useConfirm'
 import type { MessageDetail, MessageSummary } from '~/utils/types'
 
-/** `latest`: last message of the thread; on mobile its reply buttons sit in the thread's bottom bar. */
-const props = defineProps<{ message: MessageSummary, detail?: MessageDetail, expanded: boolean, loading: boolean, latest?: boolean }>()
+/** `latest`: last message of the thread; on mobile its reply buttons sit in the thread's bottom bar.
+ *  `draft`: saved in Drafts, never sent; it is resumed instead of answered. */
+const props = defineProps<{ message: MessageSummary, detail?: MessageDetail, expanded: boolean, loading: boolean, latest?: boolean, draft?: boolean }>()
 defineEmits<{ toggle: [id: number] }>()
 
-const { reply, forward, composeMailto } = useComposer()
+const { reply, forward, composeMailto, resume, discardSaved } = useComposer()
 const { quick } = useTemplates()
 const { accountById, accountColor, isMine } = useMail()
 const showError = useErrorToast()
@@ -46,8 +47,9 @@ async function alwaysShowRemote() {
 
 const remoteActions = computed(() => [
   { label: t('mail.messageCard.show'), color: 'neutral' as const, variant: 'outline' as const, onClick: showRemote },
-  // Never a lasting approval from a suspicious message.
-  ...(props.detail?.sender_key && !lowTrust.value
+  // Never a lasting approval from a suspicious message, nor from one its domain did not sign
+  // (the approval would not apply to it).
+  ...(props.detail?.sender_key && props.detail.sender_proven && !lowTrust.value
     ? [{ label: t('mail.messageCard.alwaysFor', { key: props.detail.sender_key }), color: 'neutral' as const, variant: 'ghost' as const, onClick: alwaysShowRemote }]
     : [])
 ])
@@ -106,6 +108,17 @@ async function unsubscribe() {
     showError(e, t('mail.messageCard.unsubFailed'))
   } finally {
     unsubscribing.value = false
+  }
+}
+
+const discarding = ref(false)
+async function discardDraft() {
+  if (!await confirm(t('mail.messageCard.discardDraftConfirm'), { title: t('mail.messageCard.discardDraft'), kind: 'warning', okLabel: t('mail.messageCard.discardDraft') })) return
+  discarding.value = true
+  try {
+    if (await discardSaved(props.message.id)) useListStale().bump()
+  } finally {
+    discarding.value = false
   }
 }
 
@@ -245,6 +258,7 @@ const originalExcerpt = computed(() => {
     <div class="flex min-w-0 flex-1 flex-col gap-0.5">
       <div class="flex min-w-0 items-baseline gap-2">
         <span class="truncate text-sm font-semibold text-highlighted">{{ addressLabel(message.from) }}</span>
+        <UBadge v-if="draft" :label="$t('mail.messageCard.draft')" color="error" variant="subtle" size="sm" class="shrink-0" />
         <span class="flex-1" />
         <span class="shrink-0 text-xs text-muted lg:hidden">{{ shortDate(message.date) }}</span>
       </div>
@@ -340,6 +354,7 @@ const originalExcerpt = computed(() => {
                 <p class="max-w-80 p-3 text-sm text-toned">{{ $t('mail.messageCard.fraudTitle') }}</p>
               </template>
             </UPopover>
+            <UBadge v-if="draft" :label="$t('mail.messageCard.draft')" color="error" variant="subtle" size="sm" class="shrink-0" />
           </div>
           <span class="flex-1" />
           <UIcon v-if="message.has_attachments" name="i-lucide-paperclip" class="size-4 shrink-0 text-dimmed" />
@@ -478,7 +493,7 @@ const originalExcerpt = computed(() => {
             color="neutral"
             variant="subtle"
             icon="i-lucide-image-off"
-            :description="$t('mail.messageCard.remoteBlocked')"
+            :description="detail.sender_key && !detail.sender_proven && !lowTrust ? $t('mail.messageCard.remoteUnproven', { key: detail.sender_key }) : $t('mail.messageCard.remoteBlocked')"
             :actions="remoteActions"
           />
           <template v-if="detail.invite">
@@ -526,7 +541,30 @@ const originalExcerpt = computed(() => {
           </div>
         </div>
 
-        <div v-if="latest && !fromMe && quick.length" class="mt-4.5 flex flex-wrap items-center gap-2">
+        <div v-if="draft" class="mt-4.5 flex flex-wrap gap-2">
+          <UButton
+            icon="i-lucide-file-pen"
+            :label="$t('mail.messageCard.resumeDraft')"
+            size="lg"
+            class="rounded-[10px] font-semibold max-lg:min-h-11"
+            @click="resume(message.id)"
+          />
+          <UButton
+            icon="i-lucide-trash-2"
+            :label="$t('mail.messageCard.discardDraft')"
+            size="lg"
+            color="error"
+            variant="outline"
+            class="rounded-[10px] max-lg:min-h-11"
+            :loading="discarding"
+            @click="discardDraft"
+          />
+          <UDropdownMenu :items="moreItems">
+            <UButton icon="i-lucide-ellipsis" size="lg" color="neutral" variant="ghost" class="hidden rounded-[10px] lg:inline-flex" :aria-label="$t('mail.threadView.more')" />
+          </UDropdownMenu>
+        </div>
+
+        <div v-else-if="latest && !fromMe && quick.length" class="mt-4.5 flex flex-wrap items-center gap-2">
           <UButton
             v-for="tpl in quick"
             :key="tpl.id"
@@ -541,7 +579,7 @@ const originalExcerpt = computed(() => {
           />
         </div>
 
-        <div class="mt-4.5 flex-wrap gap-2" :class="latest ? 'hidden lg:flex' : 'flex'">
+        <div v-if="!draft" class="mt-4.5 flex-wrap gap-2" :class="latest ? 'hidden lg:flex' : 'flex'">
           <UButton
             icon="i-lucide-reply"
             :label="$t('mail.messageCard.reply')"

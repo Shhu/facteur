@@ -1,4 +1,4 @@
-import type { MessageSummary, Outgoing, ThreadSummary } from './types'
+import type { Mailbox, MessageSummary, Outgoing, ThreadSummary } from './types'
 
 /** `threads` with the unread counts of those holding `ids` moved by them (marked read or
  *  unread); the same array when none changed. */
@@ -61,6 +61,17 @@ export function keptById<T extends { id: number }>(old: T[], next: T[]): T[] {
 /** The thread's latest message in the folder shown (not the reply sent from it), else its latest. */
 export function latestIn(messages: MessageSummary[], mailboxId: number): MessageSummary | undefined {
   return messages.findLast(m => m.mailbox_id === mailboxId) ?? messages.at(-1)
+}
+
+/** The thread's messages saved in a Drafts folder: written, never sent. */
+export function draftIds(messages: MessageSummary[], mailboxes: Mailbox[]): Set<number> {
+  const drafts = new Set(mailboxes.filter(b => b.role === 'drafts').map(b => b.id))
+  return new Set(messages.filter(m => drafts.has(m.mailbox_id)).map(m => m.id))
+}
+
+/** What reply and forward answer: the latest message, a draft aside. */
+export function replyTargetIn(messages: MessageSummary[], drafts: Set<number>): MessageSummary | undefined {
+  return messages.findLast(m => !drafts.has(m.id)) ?? messages.at(-1)
 }
 
 export interface Leaving { item: Outgoing, sentAt: number | null }

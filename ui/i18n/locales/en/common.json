@@ -72,6 +72,8 @@
     "toast": {
       "stillRefused": "Still refused by the server",
       "draftUnreadable": "Unreadable draft",
+      "draftOpen": "This draft is open: discard it from the composer",
+      "draftNotDiscarded": "Draft not deleted",
       "cannotReopen": "Could not reopen the message",
       "searchNotSaved": "Search not saved",
       "syncFailed": "Sync failed",

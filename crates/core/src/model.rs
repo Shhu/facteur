@@ -554,6 +554,9 @@ pub struct MessageDetail {
     pub sender_key: Option<String>,
     /// Approved sender and message not suspicious.
     pub images_allowed: bool,
+    /// Signed by its sender's domain (DMARC or facteur's own DKIM check): an approval of that
+    /// domain applies to it. Unproven, anyone could have written it under that name.
+    pub sender_proven: bool,
     pub invite: Option<crate::calendar::Invite>,
     /// A day and time the message's own words give (not an invitation): offered as an event.
     pub appointment: Option<crate::ai::Appointment>,

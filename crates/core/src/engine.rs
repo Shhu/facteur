@@ -2368,9 +2368,10 @@ impl Engine {
             .await?
         };
         let (mut signals, context) = self.trust_parts(id, Some(&parsed.headers.signals))?;
+        let sender_key = parsed.headers.from.as_ref().and_then(|a| crate::avatars::sender_key(&a.email));
         // Before the images are allowed, so that a forged signature never loads them.
         if crate::dkim::wanted(&signals, &context)
-            && let Some(verdict) = self.dkim_verdict(id, &raw, summary.from.as_ref().map(|a| a.email.as_str()), summary.date, false).await
+            && let Some(verdict) = self.dkim_verdict(id, &raw, summary.from.as_ref().map(|a| a.email.as_str()), summary.date, self.lookup_on_open(sender_key.as_deref())?).await
         {
             signals.dkim_local = Some(verdict);
             if let Err(e) = crate::rt::offload(|| self.store.set_signals(id, &signals)) {
@@ -2378,7 +2379,7 @@ impl Engine {
             }
         }
         let trust = crate::trust::evaluate(&signals, &context);
-        let sender_key = parsed.headers.from.as_ref().and_then(|a| crate::avatars::sender_key(&a.email));
+        let sender_proven = from_proven(&signals, &context);
         let invite = invite.map(|mut i| {
             i.my_response = self.store.setting(&format!("rsvp:{}", i.uid)).ok().flatten();
             i
@@ -2399,9 +2400,10 @@ impl Engine {
             images_allowed: match &sender_key {
                 // Approved for the sender's domain: only for mail proven to come from it, or a
                 // From forged on a domain without DMARC would load them (a read receipt).
-                Some(key) => !trust.is_low() && from_proven(&signals, &context) && self.store.images_trusted(key)?,
+                Some(key) => !trust.is_low() && sender_proven && self.store.images_trusted(key)?,
                 None => false,
             },
+            sender_proven,
             sender_key,
             trust,
             invite,
@@ -3341,6 +3343,17 @@ impl Engine {
                 }
             }
         });
+    }
+
+    /// Whether a message being opened may have its sender's DKIM key looked up. Only for a domain
+    /// whose images the user approved: they load once the signature passes, telling that domain
+    /// far more than the lookup; without it, mail that arrived before the account was added (no
+    /// lookup at arrival) never proves its sender and the approval never applies.
+    fn lookup_on_open(&self, sender_key: Option<&str>) -> Result<bool> {
+        match sender_key {
+            Some(key) => self.store.images_trusted(key),
+            None => Ok(false),
+        }
     }
 
     /// `lookup`: keys not known yet may be looked up (a message that just arrived).
@@ -8484,6 +8497,17 @@ mod tests {
             })
             .unwrap();
         (dir, engine, acc)
+    }
+
+    #[test]
+    fn an_approved_domain_may_prove_its_mail_when_opened() {
+        let (_dir, engine, _acc) = test_engine();
+        engine.add_trusted_images("seloger.com").unwrap();
+        let key = |email: &str| crate::avatars::sender_key(email);
+        // Mail that arrived before the account was added had no lookup: the approval needs one.
+        assert!(engine.lookup_on_open(key("hotline.passerelles@seloger.com").as_deref()).unwrap());
+        assert!(!engine.lookup_on_open(key("news@example.com").as_deref()).unwrap());
+        assert!(!engine.lookup_on_open(None).unwrap());
     }
 
     #[tokio::test]

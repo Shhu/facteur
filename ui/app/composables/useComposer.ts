@@ -121,6 +121,7 @@ export function useComposer() {
   }
   const { accountId, accountById, isMine } = useMail()
   const showError = useErrorToast()
+  const toast = useToast()
 
   function blank(account = accountId.value!): Draft {
     return {
@@ -241,6 +242,24 @@ export function useComposer() {
     }
   }
 
+  /** Deletes a saved draft without opening it; not the one the composer holds, which saves itself
+   *  again (it is discarded from there). Resolves to false when nothing was deleted. */
+  async function discardSaved(messageId: number): Promise<boolean> {
+    try {
+      const d = await api.openDraft(messageId)
+      if (!d.draft_id) return false
+      if (open.value && draft.value?.draft_id === d.draft_id) {
+        toast.add({ title: tr('common.toast.draftOpen'), icon: 'i-lucide-file-pen' })
+        return false
+      }
+      await api.discardDraft(d.account_id, d.draft_id)
+      return true
+    } catch (e) {
+      showError(e, tr('common.toast.draftNotDiscarded'))
+      return false
+    }
+  }
+
   /** `unsaved`: the message exists nowhere else any more, the composer saves it as a draft right
    *  away. */
   function reopen(d: Draft, unsaved = false) {
@@ -256,7 +275,7 @@ export function useComposer() {
     }
   }
 
-  return { open, draft, session, unsaved, compose, composeMailto, reply, forward, resume, reopen, editOutgoing, onBeforeReplace, onBeforeQuit }
+  return { open, draft, session, unsaved, compose, composeMailto, reply, forward, resume, discardSaved, reopen, editOutgoing, onBeforeReplace, onBeforeQuit }
 }
 
 /** Strips every remote resource the editor would load (tracking pixels): non-embedded `img`
