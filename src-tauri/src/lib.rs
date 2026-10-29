@@ -358,6 +358,11 @@ async fn add_trusted_images(engine: Eng<'_>, entry: String) -> Res<String> {
 }
 
 #[tauri::command]
+async fn remember_images(engine: Eng<'_>, id: i64) -> Res<()> {
+    blocking(&engine, move |e| e.remember_images(id)).await
+}
+
+#[tauri::command]
 async fn remove_trusted_images(engine: Eng<'_>, key: String) -> Res<()> {
     blocking(&engine, move |e| e.remove_trusted_images(&key)).await
 }
@@ -1350,6 +1355,7 @@ pub fn run() {
             find_similar,
             similar_from_server,
             add_trusted_images,
+            remember_images,
             remove_trusted_images,
             set_account_label,
             set_account_color,

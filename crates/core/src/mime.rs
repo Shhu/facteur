@@ -511,6 +511,18 @@ fn real_attachments<'a>(msg: &'a mail_parser::Message<'a>, shown: &'a HashSet<St
     })
 }
 
+/// An attachment left on the server by a partial opening (see [`crate::partial`]): its size as
+/// the structure gave it. Only on an empty part: a sender's own header changes nothing.
+fn deferred_size(part: &mail_parser::MessagePart) -> Option<usize> {
+    if !part.contents().is_empty() {
+        return None;
+    }
+    part.headers.iter().rev().find_map(|h| match (&h.name, &h.value) {
+        (mail_parser::HeaderName::Other(name), mail_parser::HeaderValue::Text(v)) if name.eq_ignore_ascii_case(crate::partial::DEFERRED_HEADER) => v.trim().parse().ok(),
+        _ => None,
+    })
+}
+
 fn part_mime(part: &mail_parser::MessagePart) -> String {
     part.content_type()
         .map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or("octet-stream")))
@@ -621,7 +633,7 @@ pub fn parse_body(raw: &[u8]) -> Result<ParsedBody> {
             index,
             filename: p.attachment_name().unwrap_or("sans-nom").to_string(),
             mime: part_mime(p),
-            size: p.contents().len(),
+            size: deferred_size(p).unwrap_or_else(|| p.contents().len()),
         })
         .collect();
 

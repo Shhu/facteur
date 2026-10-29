@@ -547,11 +547,13 @@ onBeforeUnmount(() => observer?.disconnect())
     @close="hide"
   />
   <div v-bind="$attrs" class="relative">
+    <!-- An HTML mail sees a light page: its own dark-mode rules (Google Calendar has some) would
+         otherwise apply in a dark app, and facteur's inversion then turn their light text dark. -->
     <iframe
       ref="frame"
       sandbox="allow-same-origin"
       :srcdoc="srcdoc"
-      :style="{ height: `${height}px` }"
+      :style="{ height: `${height}px`, colorScheme: plain ? undefined : 'light' }"
       class="block w-full rounded-md border-0"
       :class="[plain || darken ? '' : 'bg-white', ready ? '' : 'opacity-0']"
       :title="$t('mail.mailFrame.frameTitle')"

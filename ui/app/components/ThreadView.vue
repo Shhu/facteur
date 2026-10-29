@@ -128,6 +128,23 @@ function applyRefinedTrust(detail: MessageDetail) {
 }
 watch(refinedTrust, () => details.forEach(applyRefinedTrust))
 
+/** A message read before, read again in place (no spinner meanwhile); dropped if not open. */
+async function refreshDetail(id: number) {
+  if (!details.has(id)) return
+  if (!expanded.has(id)) {
+    details.delete(id)
+    return
+  }
+  const gen = generation
+  try {
+    const detail = await api.message(id)
+    applyRefinedTrust(detail)
+    if (gen === generation) details.set(id, detail)
+  } catch {
+    // Gone meanwhile (a draft sent and deleted): the next reload drops its card.
+  }
+}
+
 async function loadDetail(id: number) {
   if (details.has(id) || loadingIds.has(id)) return
   const gen = generation
@@ -207,7 +224,9 @@ async function load(reset: boolean) {
     const was = old.get(m.id)
     return was && sign(was) === sign(m) ? was : m
   })
+  const stale = wasReset ? [] : staleDetails(messages.value, list, draftIds(list, mailboxes.value))
   if (wasReset || kept.length !== messages.value.length || kept.some((m, i) => m !== messages.value[i])) messages.value = kept
+  for (const id of stale) refreshDetail(id)
   if (wasReset) {
     resetPending.value = false
     details.clear()

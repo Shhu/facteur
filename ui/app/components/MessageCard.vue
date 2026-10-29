@@ -77,6 +77,8 @@ async function showRemote() {
   )) return
   autoAllowed = false
   allowRemote.value = true
+  // Shown again at the next opening (never for a message found untrustworthy).
+  api.rememberImages(props.message.id).catch(showError)
 }
 
 async function reportSpam() {
@@ -341,7 +343,8 @@ const originalExcerpt = computed(() => {
             <AddressChip v-if="message.from" :address="message.from" :account-id="message.account_id" sender header class="-ms-2 min-w-0" />
             <span v-else class="truncate text-[15px] font-bold text-highlighted">{{ addressLabel(message.from) }}</span>
             <span v-if="message.from?.name" class="hidden truncate text-[12.5px] text-muted lg:inline">{{ message.from.email }}</span>
-            <UPopover v-if="detail?.trust.level === 'high'" :content="{ align: 'start' }">
+            <!-- One's own copy: its trust only says one writes to these people, nothing to show. -->
+            <UPopover v-if="detail?.trust.level === 'high' && !detail.own_copy" :content="{ align: 'start' }">
               <button
                 type="button"
                 class="relative inline-flex shrink-0 items-center gap-1 rounded-full py-px ps-[5px] pe-2 text-[11px] font-semibold text-green-700 before:absolute before:-inset-3 lg:bg-green-100 lg:before:hidden dark:text-green-300 lg:dark:bg-green-500/15"

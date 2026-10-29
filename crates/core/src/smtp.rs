@@ -120,7 +120,7 @@ fn build_inner(
             let text = crate::mime::html_to_text(html);
             let (html, images) = inline_images(html)?;
             let document = format!(
-                "<!doctype html><html><head><meta charset=\"utf-8\"></head>\
+                "<!doctype html><html><head><meta charset=\"utf-8\"><style>td > p, th > p {{ margin: 0 }}</style></head>\
                  <body style=\"font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; font-size: 14px\">{html}</body></html>"
             );
             // No image: alternative(text, html). With: alternative(text, related(html, images)).
@@ -577,6 +577,14 @@ mod tests {
         assert_eq!(to, ["contact@xn--socit-esab.fr"]);
         let head = String::from_utf8_lossy(&raw);
         assert!(head.lines().find(|l| l.starts_with("To:")).is_some_and(str::is_ascii), "{head}");
+    }
+
+    #[test]
+    fn table_cells_are_not_spaced_out_by_their_paragraphs() {
+        let draft = Draft { to: vec!["a@example.com".into()], subject: "x".into(), html: Some("<table><tbody><tr><td><p>5,28 kWh</p></td></tr></tbody></table>".into()), ..Default::default() };
+        let (_, raw) = build_outgoing(&account(), &draft, None, &[]).unwrap();
+        let raw = String::from_utf8_lossy(&raw).replace("=\r\n", "");
+        assert!(raw.contains("td > p, th > p { margin: 0 }"), "{raw}");
     }
 
     fn account() -> Account {

@@ -189,7 +189,7 @@ pub struct BackupStatus {
     pub manifest: Option<backup::Manifest>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Purpose {
     Sync,
     Interactive,
@@ -410,6 +410,11 @@ pub struct Engine {
     /// The attachment decoded last (message, index), for a minute (see `attachment`).
     #[allow(clippy::type_complexity)]
     last_attachment: Mutex<Option<((i64, usize), Instant, Arc<(String, String, Vec<u8>)>)>>,
+    /// One download of a message's body at a time: an attachment clicked while the background
+    /// download runs waits for it instead of fetching the message again.
+    body_downloads: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
+    /// The body downloaded last, until cached (the cache write may wait for a sync's batch).
+    last_body: Mutex<Option<(i64, Arc<Vec<u8>>)>>,
     /// Sends running per account (see `deliver_outgoing`).
     sending: Mutex<HashMap<i64, Arc<tokio::sync::Semaphore>>>,
     last_resume: Mutex<Option<Instant>>,
@@ -931,6 +936,8 @@ impl Engine {
             resume: tokio::sync::Notify::new(),
             sending: Mutex::default(),
             last_attachment: Mutex::default(),
+            body_downloads: Mutex::default(),
+            last_body: Mutex::default(),
             last_resume: Mutex::default(),
             cuts: Mutex::default(),
             advised: Mutex::default(),
@@ -1053,8 +1060,11 @@ impl Engine {
     /// [`REFUSED_FOR_NOW_LIMIT`], the account waits for the user to sign in again, which is what
     /// clears it then.
     async fn login(&self, account: &Account) -> Result<Session> {
+        let mut steps = crate::perf::Steps::new(|| format!("account {} login", account.id));
         let credential = self.credential(account).await?;
+        steps.mark("token");
         let res = imap::connect(&account.imap, &account.username, &credential).await;
+        steps.mark("connect");
         // A token the provider has just issued, refused all the same.
         let mut fresh_refused = false;
         let res = match (res, &credential) {
@@ -1063,7 +1073,10 @@ impl Engine {
             (Err(e), Credential::Token(used)) if new_token_cures(&e) => {
                 self.forget_token(account.id, Some(used.as_str()));
                 let credential = self.credential(account).await?;
-                match imap::connect(&account.imap, &account.username, &credential).await {
+                steps.mark("new token");
+                let again = imap::connect(&account.imap, &account.username, &credential).await;
+                steps.mark("connect again");
+                match again {
                     // The provider has just issued that token: the grant holds, the server is the
                     // one failing (an Outlook backend issue). Signing in again would give the same
                     // token: it is a passing refusal.
@@ -1080,7 +1093,10 @@ impl Engine {
                         let mut res = Err(Error::Refused(why));
                         for wait in REFUSED_RETRIES {
                             tokio::time::sleep(wait).await;
-                            res = match imap::connect(&account.imap, &account.username, &credential).await {
+                            steps.mark("refused, waited");
+                            let retried = imap::connect(&account.imap, &account.username, &credential).await;
+                            steps.mark("retry");
+                            res = match retried {
                                 // The same backend hiccup answered "AUTHENTICATE failed" with a
                                 // token just accepted: passing too, as above.
                                 Err(Error::Auth(why)) => {
@@ -1427,6 +1443,8 @@ impl Engine {
         };
         drop(_waiting);
         drop(_sync_waiting);
+        let mut steps = crate::perf::Steps::new(|| format!("account {account_id} {purpose:?} connection"));
+        steps.mark("busy");
         // Used a moment ago: still alive (TCP keepalive notices a dead one). After a while, a quick
         // NOOP; a server that takes more than 3 s to answer it is not worth waiting for.
         if let Some(conn) = guard.as_mut()
@@ -1435,15 +1453,41 @@ impl Engine {
         {
             *guard = None;
         }
+        steps.mark("check");
         match guard.as_mut() {
             Some(conn) => conn.used = Instant::now(),
+            // Opening a message does not wait for a sign-in (seconds at Gmail) while another
+            // connection of the account sits idle.
+            None if purpose == Purpose::Interactive && let Some(idle) = self.idle_connection(account_id).await => {
+                steps.mark("borrowed");
+                return Ok(idle);
+            }
             None => {
                 let account = self.store.account(account_id)?;
                 let session = self.login(&account).await?;
+                steps.mark("login");
                 *guard = Some(Pooled { session, caps: None, used: Instant::now() });
             }
         }
         Ok(guard)
+    }
+
+    /// Another open connection of the account, free and alive.
+    async fn idle_connection(&self, account_id: i64) -> Option<Conn> {
+        for purpose in [Purpose::Background, Purpose::Queue, Purpose::Sync] {
+            let Some(slot) = self.slots.lock().unwrap().get(&(account_id, purpose)).cloned() else { continue };
+            let Ok(mut guard) = slot.try_lock_owned() else { continue };
+            let Some(conn) = guard.as_mut() else { continue };
+            if conn.used.elapsed() > POOL_CHECK_AFTER
+                && !matches!(tokio::time::timeout(Duration::from_secs(3), conn.session.run_command_and_check_ok("NOOP")).await, Ok(Ok(_)))
+            {
+                *guard = None;
+                continue;
+            }
+            conn.used = Instant::now();
+            return Some(guard);
+        }
+        None
     }
 
     fn waiting_on(&self, account_id: i64) -> Arc<std::sync::atomic::AtomicUsize> {
@@ -2233,6 +2277,7 @@ impl Engine {
         let (raw, downloaded) = self.raw_unkept(id).await?;
         if let Some((mailbox, uid, validity)) = downloaded {
             crate::rt::offload(|| sync::keep_body(&self.store, id, &mailbox, uid, validity, &raw))?;
+            self.body_cached(id);
         }
         Ok(raw)
     }
@@ -2240,8 +2285,35 @@ impl Engine {
     /// Like [`Engine::raw`], but a body just downloaded is left for the caller to cache, with its
     /// folder, UID and UIDVALIDITY then (see [`sync::keep_body`]).
     async fn raw_unkept(&self, id: i64) -> Result<(Vec<u8>, Option<(String, u32, Option<u32>)>)> {
+        match self.body_download(id, Purpose::Interactive, false).await? {
+            (sync::Download::Whole(raw), downloaded) => Ok((raw, downloaded)),
+            (sync::Download::Partial(_), _) => unreachable!("only asked for reading"),
+        }
+    }
+
+    fn body_cached(&self, id: i64) {
+        let mut last = self.last_body.lock().unwrap();
+        if last.as_ref().is_some_and(|(kept, _)| *kept == id) {
+            *last = None;
+        }
+    }
+
+    /// `reading`: a large message may come without its large attachments (see [`crate::partial`]);
+    /// such a body is never cached.
+    async fn body_download(&self, id: i64, purpose: Purpose, reading: bool) -> Result<(sync::Download, Option<(String, u32, Option<u32>)>)> {
+        let lock = {
+            let mut downloads = self.body_downloads.lock().unwrap();
+            downloads.retain(|_, l| Arc::strong_count(l) > 1);
+            downloads.entry(id).or_default().clone()
+        };
+        let _one = lock.lock().await;
         if let Some(raw) = crate::rt::offload(|| self.store.body(id))? {
-            return Ok((raw, None));
+            return Ok((sync::Download::Whole(raw), None));
+        }
+        if let Some((kept, raw)) = self.last_body.lock().unwrap().as_ref()
+            && *kept == id
+        {
+            return Ok((sync::Download::Whole(raw.to_vec()), None));
         }
         let loc = self.store.location(id)?;
         let uid = loc.uid.ok_or_else(in_flight)?;
@@ -2249,13 +2321,20 @@ impl Engine {
         // every time it is opened.
         let size = self.store.message_size(id).unwrap_or(0);
         let secs = 120 + size / 50_000;
+        let mut steps = crate::perf::Steps::new(|| format!("account {} message {id} ({size} bytes)", loc.account_id));
         // A kept connection the server dropped meanwhile: once more on a new one.
         let mut attempt = 0;
         let res = loop {
             attempt += 1;
-            let mut guard = self.session(loc.account_id, Purpose::Interactive).await?;
+            let mut guard = self.session(loc.account_id, purpose).await?;
+            steps.mark("connection");
             let session = &mut guard.as_mut().expect("session open").session;
-            let res = bounded(secs, &crate::tr!("téléchargement du message", "downloading the message"), sync::download_body(&self.store, session, id, &loc.mailbox, uid)).await;
+            let what = crate::tr!("téléchargement du message", "downloading the message");
+            let res = if reading {
+                bounded(secs, &what, sync::download_for_reading(&self.store, session, id, &loc.mailbox, uid, u32::try_from(size).unwrap_or(u32::MAX))).await
+            } else {
+                bounded(secs, &what, sync::download_body(&self.store, session, id, &loc.mailbox, uid)).await.map(|(raw, v)| (sync::Download::Whole(raw), v))
+            };
             // A cut EXAMINE or FETCH must not leave the dead connection in the slot for the next message.
             if matches!(res, Err(Error::Io(_) | Error::Imap(_) | Error::Other(_) | Error::Dropped(_) | Error::Refused(_))) {
                 *guard = None;
@@ -2268,8 +2347,15 @@ impl Engine {
                 res => break res,
             }
         };
-        let (raw, validity) = res?;
-        Ok((raw, Some((loc.mailbox, uid, validity))))
+        let (download, validity) = res?;
+        steps.mark(match download {
+            sync::Download::Whole(_) => "whole",
+            sync::Download::Partial(_) => "shown parts",
+        });
+        if let sync::Download::Whole(raw) = &download {
+            *self.last_body.lock().unwrap() = Some((id, Arc::new(raw.clone())));
+        }
+        Ok((download, Some((loc.mailbox, uid, validity))))
     }
 
     /// Moved, and its new folder has not confirmed it yet (no UID).
@@ -2339,15 +2425,23 @@ impl Engine {
     /// when it was read (lookups happen on arrival, see [`Engine::check_dkim`]). A check still under
     /// way may change the trust afterwards ([`Event::TrustChanged`]).
     pub async fn message(self: &Arc<Self>, id: i64) -> Result<MessageDetail> {
-        let (raw, downloaded) = self.raw_unkept(id).await?;
+        let (raw, downloaded, whole) = match self.body_download(id, Purpose::Interactive, true).await? {
+            (sync::Download::Whole(raw), downloaded) => (raw, downloaded, true),
+            // The rest follows in the background: the attachments, then the signature check.
+            (sync::Download::Partial(raw), _) => {
+                self.complete_body(id);
+                (raw, None, false)
+            }
+        };
         let raw = Arc::new(raw);
         // Cached in the background: the message shows without waiting for the writer (a sync's batch
         // may hold it) nor for a second parse of the body.
         if let Some((mailbox, uid, validity)) = downloaded {
             let (this, raw) = (self.clone(), raw.clone());
             tokio::task::spawn_blocking(move || {
-                if let Err(e) = sync::keep_body(&this.store, id, &mailbox, uid, validity, &raw) {
-                    tracing::info!("body of message {id} not cached: {e}");
+                match sync::keep_body(&this.store, id, &mailbox, uid, validity, &raw) {
+                    Ok(()) => this.body_cached(id),
+                    Err(e) => tracing::info!("body of message {id} not cached: {e}"),
                 }
             });
         }
@@ -2379,6 +2473,7 @@ impl Engine {
         let mine = self.own_copy(id)?;
         // Before the images are allowed, so that a forged signature never loads them.
         if !mine
+            && whole
             && crate::dkim::wanted(&signals, &context)
             && let Some(verdict) = self.dkim_verdict(id, &raw, summary.from.as_ref().map(|a| a.email.as_str()), summary.date, self.lookup_on_open(sender_key.as_deref())?).await
         {
@@ -2407,13 +2502,16 @@ impl Engine {
             attachments: parsed.attachments,
             unsubscribe: parsed.unsubscribe,
             bulk: parsed.headers.bulk,
-            images_allowed: match &sender_key {
-                // Approved for the sender's domain: only for mail proven to come from it, or a
-                // From forged on a domain without DMARC would load them (a read receipt).
-                // One's own copy: its images come from the mail it quotes or forwards, not from us.
-                Some(key) => !mine && !trust.is_low() && sender_proven && self.store.images_trusted(key)?,
-                None => false,
-            },
+            // Shown by hand before: again, unless the message has since been found untrustworthy.
+            images_allowed: !trust.is_low()
+                && (self.images_remembered(id)?
+                    || match &sender_key {
+                        // Approved for the sender's domain: only for mail proven to come from it, or a
+                        // From forged on a domain without DMARC would load them (a read receipt).
+                        // One's own copy: its images come from the mail it quotes or forwards, not from us.
+                        Some(key) => !mine && sender_proven && self.store.images_trusted(key)?,
+                        None => false,
+                    }),
             sender_proven,
             own_copy: mine,
             images_covered: parsed.remote.any && !parsed.remote.unlisted && blocked_hosts.is_empty(),
@@ -2424,6 +2522,44 @@ impl Engine {
             invite,
             appointment,
         })
+    }
+
+    /// The whole of a message opened without its attachments, downloaded and cached in the
+    /// background; its DKIM signature, which covers the attachments, checked then.
+    fn complete_body(self: &Arc<Self>, id: i64) {
+        let this = self.clone();
+        self.spawn(async move {
+            let raw = match this.body_download(id, Purpose::Background, false).await {
+                Ok((sync::Download::Whole(raw), Some((mailbox, uid, validity)))) => {
+                    match crate::rt::offload(|| sync::keep_body(&this.store, id, &mailbox, uid, validity, &raw)) {
+                        Ok(()) => this.body_cached(id),
+                        Err(e) => tracing::info!("body of message {id} not cached: {e}"),
+                    }
+                    raw
+                }
+                Ok((sync::Download::Whole(raw), None)) => raw,
+                Ok((sync::Download::Partial(_), _)) => return,
+                Err(e) => return tracing::info!("rest of message {id} not downloaded: {e}"),
+            };
+            if let Err(e) = this.check_dkim_of(id, &raw).await {
+                tracing::info!("DKIM verdict of message {id} not kept: {e}");
+            }
+        });
+    }
+
+    async fn check_dkim_of(self: &Arc<Self>, id: i64, raw: &[u8]) -> Result<()> {
+        let (mut signals, context) = self.trust_parts(id, None)?;
+        if self.own_copy(id)? || !crate::dkim::wanted(&signals, &context) {
+            return Ok(());
+        }
+        let summary = self.store.summary(id)?;
+        let from = summary.from.as_ref().map(|a| a.email.as_str());
+        let lookup = self.lookup_on_open(from.and_then(crate::avatars::sender_key).as_deref())?;
+        let Some(verdict) = self.dkim_verdict(id, raw, from, summary.date, lookup).await else { return Ok(()) };
+        signals.dkim_local = Some(verdict);
+        let trust = self.trust(id, Some(&signals))?;
+        self.emit(Event::TrustChanged { message_id: id, trust });
+        Ok(())
     }
 
     /// `partstat`: `ACCEPTED`, `TENTATIVE` or `DECLINED`. Sent to the organizer from the invited
@@ -3360,6 +3496,15 @@ impl Engine {
         });
     }
 
+    /// Remote images shown by hand on a message: shown again at each opening.
+    pub fn remember_images(&self, id: i64) -> Result<()> {
+        self.store.remember_images(id)
+    }
+
+    fn images_remembered(&self, id: i64) -> Result<bool> {
+        self.store.images_remembered(id)
+    }
+
     /// The domains a message's remote content comes from, approved ones first (they load whoever
     /// sent it: the request goes to them, not to a forger), then the others. None approved for an
     /// untrustworthy message.
@@ -3737,9 +3882,10 @@ impl Engine {
     /// message trashed a moment ago and still shown elsewhere, deleted again, stays in the bin.
     pub fn trash(self: &Arc<Self>, ids: &[i64], purge: bool) -> Result<Option<u64>> {
         let mut undo = Undo::default();
-        // One query for the whole selection (it can hold thousands of messages).
+        // One query for the whole selection (it can hold thousands of messages). A message gone
+        // meanwhile (a sync took it out as the click came) is already out of here: nothing to do.
         let mut groups: Vec<(i64, Vec<(i64, crate::store::Location)>)> = Vec::new();
-        for (id, loc) in self.located(ids)? {
+        for (id, loc) in self.store.locations(ids)? {
             match groups.iter_mut().find(|(a, _)| *a == loc.account_id) {
                 Some((_, list)) => list.push((id, loc)),
                 None => groups.push((loc.account_id, vec![(id, loc)])),
@@ -7968,6 +8114,44 @@ mod tests {
         assert_eq!(r.every, secs(45));
     }
 
+    #[tokio::test]
+    async fn trashing_a_message_a_sync_just_removed_is_no_error() {
+        let (_dir, engine, acc) = test_engine();
+        let store = engine.store();
+        let inbox = store.upsert_mailbox(acc, "INBOX", Some("/"), Some(Role::Inbox), true).unwrap();
+        let trash = store.upsert_mailbox(acc, "Trash", Some("/"), Some(Role::Trash), true).unwrap();
+        let flags = ServerFlags { seen: true, flagged: false, answered: false, draft: false };
+        let header = |mid: &str| crate::mime::HeaderInfo { message_id: Some(mid.into()), subject: "x".into(), date: 1, ..Default::default() };
+        let gone = store.insert_header(acc, inbox, 1, &header("a@x"), flags, 10).unwrap();
+        let kept = store.insert_header(acc, inbox, 2, &header("b@x"), flags, 10).unwrap();
+        // Moved or deleted elsewhere: the sync took it out while the click was on its way.
+        store.delete_uids(inbox, &[1]).unwrap();
+        engine.trash(&[gone, kept], false).unwrap();
+        assert_eq!(store.location(kept).unwrap().mailbox_id, trash);
+        assert_eq!(engine.trash(&[gone], false).unwrap(), None, "nothing left to do");
+    }
+
+    #[test]
+    fn images_shown_once_stay_shown_for_that_message_and_its_copies() {
+        let (_dir, engine, acc) = test_engine();
+        let store = engine.store();
+        let drafts = store.upsert_mailbox(acc, "Drafts", Some("/"), Some(Role::Drafts), true).unwrap();
+        let inbox = store.upsert_mailbox(acc, "INBOX", Some("/"), Some(Role::Inbox), true).unwrap();
+        let flags = ServerFlags { seen: true, flagged: false, answered: false, draft: false };
+        let header = |mid: Option<&str>| crate::mime::HeaderInfo { message_id: mid.map(Into::into), subject: "Re".into(), date: 1, ..Default::default() };
+        let draft = store.insert_header(acc, drafts, 1, &header(Some("a@mli.immo")), flags, 10).unwrap();
+        let copy = store.insert_header(acc, inbox, 1, &header(Some("a@mli.immo")), flags, 10).unwrap();
+        let other = store.insert_header(acc, inbox, 2, &header(Some("b@mli.immo")), flags, 10).unwrap();
+        let bare = store.insert_header(acc, inbox, 3, &header(None), flags, 10).unwrap();
+        assert!(!engine.images_remembered(draft).unwrap());
+        engine.remember_images(draft).unwrap();
+        assert!(engine.images_remembered(draft).unwrap());
+        assert!(engine.images_remembered(copy).unwrap(), "the same message in another folder");
+        assert!(!engine.images_remembered(other).unwrap());
+        engine.remember_images(bare).unwrap();
+        assert!(!engine.images_remembered(bare).unwrap(), "no Message-ID: nothing to remember it by");
+    }
+
     #[test]
     fn images_load_from_an_approved_host_whoever_sent_them() {
         let (_dir, engine, _acc) = test_engine();
@@ -8568,6 +8752,127 @@ mod tests {
         (dir, engine, acc)
     }
 
+    /// Answers the commands opening a message needs, with `whole` as the message (UID 7) and
+    /// `sections` for BODY[...] items; records every command.
+    async fn scripted_imap(whole: &'static [u8], structure: &'static str, sections: Vec<(&'static str, &'static [u8])>) -> (u16, Arc<Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sections: Arc<HashMap<&str, &[u8]>> = Arc::new(sections.into_iter().collect());
+        let seen = log.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let (log, sections) = (seen.clone(), sections.clone());
+                tokio::spawn(async move {
+                    let (read, mut write) = tcp.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    write.write_all(b"* OK ready\r\n").await.unwrap();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let (tag, command) = line.split_once(' ').unwrap();
+                        log.lock().unwrap().push(command.to_string());
+                        let upper = command.to_ascii_uppercase();
+                        let mut out: Vec<u8> = Vec::new();
+                        if upper.starts_with("EXAMINE") || upper.starts_with("SELECT") {
+                            out.extend_from_slice(b"* 1 EXISTS\r\n* OK [UIDVALIDITY 1] ok\r\n");
+                        } else if upper.contains("BODYSTRUCTURE") {
+                            out.extend_from_slice(format!("* 1 FETCH (UID 7 BODYSTRUCTURE {structure})\r\n").as_bytes());
+                        } else if upper.starts_with("UID FETCH") {
+                            out.extend_from_slice(b"* 1 FETCH (UID 7");
+                            for item in command.split(' ').filter_map(|w| w.trim_matches(['(', ')']).strip_prefix("BODY.PEEK[")) {
+                                let section = item.trim_end_matches(']');
+                                let data: &[u8] = if section.is_empty() { whole } else { sections.get(section).copied().unwrap_or(b"") };
+                                out.extend_from_slice(format!(" BODY[{section}] {{{}}}\r\n", data.len()).as_bytes());
+                                out.extend_from_slice(data);
+                            }
+                            out.extend_from_slice(b")\r\n");
+                        } else if upper.starts_with("LOGOUT") {
+                            write.write_all(format!("* BYE\r\n{tag} OK bye\r\n").as_bytes()).await.ok();
+                            return;
+                        }
+                        out.extend_from_slice(format!("{tag} OK done\r\n").as_bytes());
+                        if write.write_all(&out).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, log)
+    }
+
+    fn engine_on(port: u16) -> (tempfile::TempDir, Arc<Engine>, i64) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let srv = ServerConfig { host: "127.0.0.1".into(), port, security: Security::None };
+        let acc = engine
+            .store()
+            .insert_account(&NewAccount {
+                name: "Y".into(), email: "y@example.org".into(), username: "y".into(), password: String::new(),
+                imap: srv.clone(), smtp: srv, auth: NewAuth::Password,
+            })
+            .unwrap();
+        engine.secret_cache.lock().unwrap().insert(acc, "secret".into());
+        (dir, engine, acc)
+    }
+
+    const QUOTE_HEADER: &[u8] = b"From: SARL <contact@example.fr>\r\nTo: y@example.org\r\nSubject: Devis 9597\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"mix\"\r\n\r\n";
+    const QUOTE_WHOLE: &[u8] = b"From: SARL <contact@example.fr>\r\nTo: y@example.org\r\nSubject: Devis 9597\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"mix\"\r\n\r\n--mix\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n<p>Voici le devis</p>\r\n--mix\r\nContent-Type: application/pdf; name=\"Devis.pdf\"\r\nContent-Disposition: attachment; filename=\"Devis.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQK\r\n--mix--\r\n";
+    const QUOTE_STRUCTURE: &str = r#"(("TEXT" "HTML" ("CHARSET" "UTF-8") NIL NIL "7BIT" 24 1 NIL NIL NIL)("APPLICATION" "PDF" ("NAME" "Devis.pdf") NIL NIL "BASE64" 5200000 NIL ("ATTACHMENT" ("FILENAME" "Devis.pdf")) NIL) "MIXED" ("BOUNDARY" "mix") NIL NIL)"#;
+
+    fn quote_sections() -> Vec<(&'static str, &'static [u8])> {
+        vec![
+            ("HEADER", QUOTE_HEADER),
+            ("1.MIME", b"Content-Type: text/html; charset=UTF-8\r\n\r\n"),
+            ("1", b"<p>Voici le devis</p>"),
+            ("2.MIME", b"Content-Type: application/pdf; name=\"Devis.pdf\"\r\nContent-Disposition: attachment; filename=\"Devis.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\n"),
+        ]
+    }
+
+    fn quote_in_inbox(engine: &Engine, acc: i64, size: u32) -> i64 {
+        let store = engine.store();
+        let inbox = store.upsert_mailbox(acc, "INBOX", Some("/"), Some(Role::Inbox), true).unwrap();
+        let flags = ServerFlags { seen: true, flagged: false, answered: false, draft: false };
+        let header = crate::mime::HeaderInfo { message_id: Some("devis@example.fr".into()), subject: "Devis 9597".into(), date: 1, ..Default::default() };
+        store.insert_header(acc, inbox, 7, &header, flags, size).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_large_message_shows_without_its_attachment_which_follows_once() {
+        let (port, log) = scripted_imap(QUOTE_WHOLE, QUOTE_STRUCTURE, quote_sections()).await;
+        let (_dir, engine, acc) = engine_on(port);
+        let id = quote_in_inbox(&engine, acc, 5_300_000);
+        let detail = engine.message(id).await.unwrap();
+        assert!(detail.html.contains("Voici le devis"), "{}", detail.html);
+        assert_eq!(detail.attachments.len(), 1);
+        assert_eq!((detail.attachments[0].filename.as_str(), detail.attachments[0].size), ("Devis.pdf", 5200000 / 78 * 57));
+        // Clicked at once: waits for the download already running instead of starting another.
+        let (name, _, data) = engine.attachment(id, 0).await.unwrap();
+        assert_eq!((name.as_str(), data.as_slice()), ("Devis.pdf", b"%PDF-1.4\n".as_slice()));
+        for _ in 0..100 {
+            if engine.store().body(id).unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(engine.store().body(id).unwrap().as_deref(), Some(QUOTE_WHOLE), "the whole message is cached");
+        let log = log.lock().unwrap();
+        assert_eq!(log.iter().filter(|c| c.contains("BODY.PEEK[]")).count(), 1, "{log:?}");
+        assert!(log.iter().any(|c| c.contains("BODY.PEEK[1]") && !c.contains("BODY.PEEK[2]")), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn opening_a_message_borrows_an_idle_connection_instead_of_signing_in() {
+        let (port, log) = scripted_imap(QUOTE_WHOLE, QUOTE_STRUCTURE, quote_sections()).await;
+        let (_dir, engine, acc) = engine_on(port);
+        let id = quote_in_inbox(&engine, acc, 400);
+        drop(engine.session(acc, Purpose::Sync).await.unwrap());
+        engine.message(id).await.unwrap();
+        let log = log.lock().unwrap();
+        assert_eq!(log.iter().filter(|c| c.to_ascii_uppercase().starts_with("LOGIN")).count(), 1, "{log:?}");
+        assert!(log.iter().any(|c| c.contains("BODY.PEEK[]")), "a small message is downloaded whole: {log:?}");
+    }
+
     #[test]
     fn the_developer_tools_follow_their_setting_and_come_back_at_launch() {
         let (dir, engine, _acc) = test_engine();
@@ -9087,7 +9392,8 @@ In-Reply-To: <parent@x>\r\nReferences: <root@x> <parent@x>\r\n\r\nBrouillon\r\n"
         assert_eq!(pending.len(), 1);
         let op: serde_json::Value = serde_json::from_str(&store.op_payload(pending[0].id).unwrap().unwrap()).unwrap();
         assert_eq!((op["kind"].as_str(), op["uids"].clone()), (Some("delete_set"), serde_json::json!([1, 2, 3])));
-        assert!(engine.trash(&ids, true).is_err(), "already gone");
+        assert_eq!(engine.trash(&ids, true).unwrap(), None, "already gone: nothing left to do");
+        assert_eq!(store.pending_ops(acc).unwrap().len(), 1, "and nothing more queued");
     }
 
     #[tokio::test]

@@ -135,6 +135,7 @@ pub async fn connect(server: &ServerConfig, username: &str, credential: &Credent
 }
 
 async fn connect_inner(server: &ServerConfig, username: &str, credential: &Credential) -> Result<Session> {
+    let mut steps = crate::perf::Steps::new(|| format!("{} sign-in", server.host));
     // Not even connected (offline, name not found, nothing answering): no session the server
     // dropped, which would count towards offering the single-connection mode.
     let tcp = tokio::time::timeout(std::time::Duration::from_secs(20), tcp_connect(&server.host, server.port))
@@ -142,6 +143,7 @@ async fn connect_inner(server: &ServerConfig, username: &str, credential: &Crede
         .map_err(|_| Error::Unreachable(crate::tr!("délai dépassé en se connectant à {}", "timed out connecting to {}", server.host)))?
         .map_err(|e| Error::Unreachable(format!("{}: {e}", server.host)))?;
     keepalive(&tcp);
+    steps.mark("tcp");
 
     let mut client = match server.security {
         Security::Tls => async_imap::Client::new(tls(&server.host, tcp).await?),
@@ -153,11 +155,18 @@ async fn connect_inner(server: &ServerConfig, username: &str, credential: &Crede
             let Stream::Plain(tcp) = plain.into_inner() else { unreachable!() };
             // No new greeting after STARTTLS.
             let client = async_imap::Client::new(tls(&server.host, tcp).await?);
-            return authenticate(client, username, credential).await;
+            steps.mark("starttls");
+            let session = authenticate(client, username, credential).await;
+            steps.mark("auth");
+            return session;
         }
     };
+    steps.mark("tls");
     client.read_response().await?;
-    authenticate(client, username, credential).await
+    steps.mark("greeting");
+    let session = authenticate(client, username, credential).await;
+    steps.mark("auth");
+    session
 }
 
 /// The server's addresses raced in the manner of Happy Eyeballs (RFC 8305): IPv6 and IPv4

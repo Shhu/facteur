@@ -703,6 +703,16 @@ ON CONFLICT (email) DO UPDATE SET
     seen = MAX(contacts.seen, excluded.seen),
     last = MAX(contacts.last, excluded.last);
 "#,
+    // Remote images shown by hand on a message: kept by its Message-ID, so its copies in other
+    // folders (and the copy a move makes) show them too.
+    r#"
+CREATE TABLE images_shown (
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (account_id, message_id)
+);
+"#,
 ];
 
 /// A move into folder ?1 still on its way. With Gmail's labels, a move out of the bin or spam
@@ -4096,6 +4106,24 @@ impl Store {
         Ok(())
     }
 
+    /// Nothing kept for a message without a Message-ID.
+    pub fn remember_images(&self, id: i64) -> Result<()> {
+        self.db().execute(
+            "INSERT OR IGNORE INTO images_shown (account_id, message_id, created_at)
+             SELECT account_id, message_id, ?2 FROM messages WHERE id = ?1 AND message_id IS NOT NULL",
+            params![id, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn images_remembered(&self, id: i64) -> Result<bool> {
+        Ok(self.read().query_row(
+            "SELECT EXISTS (SELECT 1 FROM messages m JOIN images_shown s ON s.account_id = m.account_id AND s.message_id = m.message_id WHERE m.id = ?1)",
+            [id],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn images_trusted(&self, key: &str) -> Result<bool> {
         Ok(self.read().query_row("SELECT EXISTS (SELECT 1 FROM trusted_images WHERE key = ?1)", [key], |r| r.get(0))?)
     }
@@ -4357,7 +4385,12 @@ impl Store {
         let db = self.read();
         // A message carrying `prefer` as a label is shown from there, as if it were its folder.
         let labelled = "EXISTS (SELECT 1 FROM labels l WHERE l.message_id = m.id AND l.mailbox_id = ?3)";
-        let cols = SUMMARY_COLS.replacen("m.mailbox_id", &format!("CASE WHEN {labelled} THEN ?3 ELSE m.mailbox_id END"), 1);
+        // Gmail: a draft is a row of All Mail labelled Drafts, rarely flagged as one.
+        let draft = "(m.draft OR EXISTS (SELECT 1 FROM labels l JOIN mailboxes d ON d.id = l.mailbox_id
+                                          WHERE l.message_id = m.id AND d.role = 'drafts'))";
+        let cols = SUMMARY_COLS
+            .replacen("m.mailbox_id", &format!("CASE WHEN {labelled} THEN ?3 ELSE m.mailbox_id END"), 1)
+            .replacen("m.draft", draft, 1);
         let mut st = db.prepare(&format!(
             "SELECT {cols}, m.message_id FROM messages m
              LEFT JOIN mailboxes b ON b.id = m.mailbox_id
@@ -7208,6 +7241,15 @@ mod tests {
 
         assert_eq!(s.recent_recipients(&[], 5).unwrap().iter().map(|a| a.email.as_str()).collect::<Vec<_>>(), vec!["cedric@example.org"]);
         assert!(s.draft_present(acc, "draft@x").unwrap() && !s.draft_present(acc, "held@x").unwrap());
+        // A draft in a thread, opened from any folder: labelled Drafts, its row in All Mail.
+        let is_draft = || {
+            let thread = s.summary(draft).unwrap().thread_id;
+            s.thread_messages(acc, thread, None).unwrap().iter().find(|m| m.id == draft).unwrap().flags.draft
+        };
+        assert!(is_draft());
+        s.set_labels(draft, &[sent]).unwrap();
+        assert!(!is_draft(), "sent: the same row, no longer a draft");
+        s.set_labels(draft, &[drafts]).unwrap();
         assert_eq!(s.held_senders(Some(acc)).unwrap().iter().map(|h| h.4).collect::<Vec<_>>(), vec![held]);
         assert_eq!(s.messages_from_pattern(acc, "@example.org", Role::Screener).unwrap(), vec![held]);
         let thread = s.summary(held).unwrap().thread_id;

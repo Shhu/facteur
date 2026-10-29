@@ -17,6 +17,7 @@ pub mod links;
 pub mod logs;
 pub mod mime;
 pub mod oauth;
+pub mod partial;
 pub mod perf;
 pub mod provider;
 pub mod repeat;

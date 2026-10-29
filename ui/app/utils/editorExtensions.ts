@@ -1,4 +1,5 @@
 import Image from '@tiptap/extension-image'
+import { Table, TableCell, TableHeader, TableRow } from '@tiptap/extension-table'
 import { FontSize, TextStyle } from '@tiptap/extension-text-style'
 import { Node } from '@tiptap/vue-3'
 import type { Editor } from '@tiptap/vue-3'
@@ -58,7 +59,8 @@ export const Columns = Node.create({
   group: 'block',
   content: 'column+',
   isolating: true,
-  parseHTML: () => [{ tag: 'table.facteur-columns', contentElement: 'tr' }],
+  // Before the data tables' own rule, which would take any table.
+  parseHTML: () => [{ tag: 'table.facteur-columns', contentElement: 'tr', priority: 60 }],
   renderHTML: () => [
     'table',
     { class: 'facteur-columns', role: 'presentation', cellpadding: '0', cellspacing: '0', border: '0', style: 'border-collapse:collapse' },
@@ -82,7 +84,7 @@ export const Column = Node.create({
       renderHTML: () => ({})
     }
   }),
-  parseHTML: () => [{ tag: 'td.facteur-column' }],
+  parseHTML: () => [{ tag: 'td.facteur-column', priority: 60 }],
   renderHTML: ({ node }) => {
     const attrs = node.attrs as ColumnAttrs
     return ['td', { class: 'facteur-column', ...(attrs.width ? { width: String(attrs.width) } : {}), style: columnStyle(attrs) }, 0]
@@ -156,7 +158,41 @@ export const Signature = Node.create({
   renderHTML: () => ['div', { class: SIGNATURE_CLASS }, 0]
 })
 
-export const editorExtensions = [ResizableImage, Columns, Column, Signature, TextStyle, FontSize]
+/** An attribute kept as written (the editor's tables drop what they do not know). */
+const kept = (name: string) => ({
+  default: null,
+  parseHTML: (el: HTMLElement) => el.getAttribute(name),
+  renderHTML: (attrs: Record<string, unknown>) => (attrs[name] == null ? {} : { [name]: attrs[name] })
+})
+const tableOf = (el: HTMLElement) => {
+  const table = el.closest('table')
+  return (name: string) => table?.getAttribute(name) ?? null
+}
+const style = (parse: (el: HTMLElement) => string | null) => ({
+  default: null,
+  parseHTML: parse,
+  renderHTML: (attrs: Record<string, unknown>) => (attrs.style ? { style: attrs.style } : {})
+})
+
+/** Tables pasted or quoted keep their grid; a bare one (data from a chat or a spreadsheet) gets
+ *  lines written inline, the quoted ones their author's layout. */
+const MailTable = Table.extend({
+  addAttributes() {
+    return {
+      ...this.parent?.(),
+      style: style(el => tableStyle(n => el.getAttribute(n))),
+      ...Object.fromEntries(['border', 'cellpadding', 'cellspacing', 'width', 'bgcolor', 'align', 'role'].map(n => [n, kept(n)]))
+    }
+  }
+}).configure({ resizable: false })
+const cellAttributes = {
+  style: style(el => cellStyle(n => el.getAttribute(n), tableOf(el))),
+  ...Object.fromEntries(['width', 'bgcolor', 'align', 'valign'].map(n => [n, kept(n)]))
+}
+const MailTableCell = TableCell.extend({ addAttributes() { return { ...this.parent?.(), ...cellAttributes } } })
+const MailTableHeader = TableHeader.extend({ addAttributes() { return { ...this.parent?.(), ...cellAttributes } } })
+
+export const editorExtensions = [ResizableImage, Columns, Column, Signature, TextStyle, FontSize, MailTable, TableRow, MailTableHeader, MailTableCell]
 
 const FONT_SIZES = [11, 12, 14, 16, 18, 22, 28, 36]
 const NORMAL_SIZE = 14

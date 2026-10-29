@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { draftIds, keptById, latestIn, replyTargetIn, newlySeen, reconcileLeaving, rowsLeft, seenPatched, whileCovered } from './listRows'
+import { draftIds, keptById, latestIn, replyTargetIn, staleDetails, newlySeen, reconcileLeaving, rowsLeft, seenPatched, whileCovered } from './listRows'
 import type { Mailbox, MessageSummary, Outgoing, ThreadSummary } from './types'
 
 const thread = (id: number, ids: number[], unread: number) => ({ thread_id: id, message_ids: ids, unread, count: ids.length }) as unknown as ThreadSummary
@@ -107,7 +107,7 @@ describe('whileCovered', () => {
 
 describe('drafts in a thread', () => {
   const boxes = [{ id: 1, role: 'inbox' }, { id: 2, role: 'drafts' }, { id: 3, role: 'sent' }] as unknown as Mailbox[]
-  const msg = (id: number, mailbox_id: number) => ({ id, mailbox_id }) as unknown as MessageSummary
+  const msg = (id: number, mailbox_id: number) => ({ id, mailbox_id, flags: { draft: false } }) as unknown as MessageSummary
   const thread = [msg(10, 1), msg(11, 3), msg(12, 2)]
 
   it('tells the unsent draft from the messages sent or received', () => {
@@ -117,5 +117,27 @@ describe('drafts in a thread', () => {
   it('replies to the latest real message, not to the draft', () => {
     expect(replyTargetIn(thread, draftIds(thread, boxes))?.id).toBe(11)
     expect(replyTargetIn([msg(12, 2)], new Set([12]))?.id).toBe(12)
+  })
+})
+
+describe('staleDetails', () => {
+  const msg = (id: number, mailbox_id: number, preview = 'Bonjour', draft = false) => ({ id, mailbox_id, preview, flags: { draft } }) as unknown as MessageSummary
+
+  it('reads again a draft saved since, or sent, whose text the cache no longer matches', () => {
+    const before = [msg(1, 1), msg(2, 2, 'J\'ai rajouté … si il')]
+    expect(staleDetails(before, [msg(1, 1), msg(2, 2, 'J\'ai rajouté … si il')], new Set([2]))).toEqual([2])
+    expect(staleDetails(before, [msg(1, 1), msg(2, 3, 'J\'ai rajouté … si il')], new Set())).toEqual([2])
+    expect(staleDetails(before, [msg(1, 1, 'Autre'), msg(2, 2)], new Set())).toEqual([1, 2])
+  })
+
+  it('reads again a Gmail draft sent: the same row in All Mail, its preview full long before', () => {
+    const typing = 'Donc c\'est t\'es en semi vacances ? :D Pour les devis'
+    const before = [msg(1, 21), msg(2, 21, typing, true)]
+    expect(staleDetails(before, [msg(1, 21), msg(2, 21, typing, false)], new Set())).toEqual([2])
+    expect(draftIds(before, [])).toEqual(new Set([2]))
+  })
+
+  it('keeps what nothing changed, and leaves new messages to their first read', () => {
+    expect(staleDetails([msg(1, 1)], [msg(1, 1), msg(9, 1)], new Set())).toEqual([])
   })
 })

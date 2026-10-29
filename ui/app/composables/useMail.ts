@@ -93,6 +93,7 @@ export const api = {
   fetchAllHistory: (accountId: number) => invoke<number>('fetch_all_history', { accountId }),
   trustedImages: () => invoke<string[]>('trusted_images'),
   addTrustedImages: (entry: string) => invoke<string>('add_trusted_images', { entry }),
+  rememberImages: (id: number) => invoke<void>('remember_images', { id }),
   removeTrustedImages: (key: string) => invoke<void>('remove_trusted_images', { key }),
   getSetting: (key: string) => invoke<string | null>('get_setting', { key }),
   setSetting: (key: string, value: string) => invoke<void>('set_setting', { key, value }),

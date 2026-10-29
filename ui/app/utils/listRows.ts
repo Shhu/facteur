@@ -66,12 +66,25 @@ export function latestIn(messages: MessageSummary[], mailboxId: number): Message
 /** The thread's messages saved in a Drafts folder: written, never sent. */
 export function draftIds(messages: MessageSummary[], mailboxes: Mailbox[]): Set<number> {
   const drafts = new Set(mailboxes.filter(b => b.role === 'drafts').map(b => b.id))
-  return new Set(messages.filter(m => drafts.has(m.mailbox_id)).map(m => m.id))
+  return new Set(messages.filter(m => m.flags.draft || drafts.has(m.mailbox_id)).map(m => m.id))
 }
 
 /** What reply and forward answer: the latest message, a draft aside. */
 export function replyTargetIn(messages: MessageSummary[], drafts: Set<number>): MessageSummary | undefined {
   return messages.findLast(m => !drafts.has(m.id)) ?? messages.at(-1)
+}
+
+/** Messages already read whose content may have changed since: moved (a draft sent is filed in
+ *  Sent under the same id), a draft sent (Gmail: the same row, relabelled), a new preview, or a
+ *  draft (saved again at each pause, its preview the same once past its first lines). */
+export function staleDetails(before: MessageSummary[], after: MessageSummary[], drafts: Set<number>): number[] {
+  const old = new Map(before.map(m => [m.id, m]))
+  return after
+    .filter((m) => {
+      const was = old.get(m.id)
+      return !!was && (drafts.has(m.id) || was.flags.draft !== m.flags.draft || was.mailbox_id !== m.mailbox_id || was.preview !== m.preview)
+    })
+    .map(m => m.id)
 }
 
 export interface Leaving { item: Outgoing, sentAt: number | null }

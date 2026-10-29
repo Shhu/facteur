@@ -2093,13 +2093,63 @@ pub fn keep_body(store: &Store, id: i64, mailbox: &str, uid: u32, validity: Opti
 pub async fn download_body(store: &Store, session: &mut Session, id: i64, mailbox: &str, uid: u32) -> Result<(Vec<u8>, Option<u32>)> {
     let validity = session.examine(mailbox).await?.uid_validity;
     check_still_there(store, id, mailbox, uid, validity)?;
+    Ok((whole_body(session, uid).await?, validity))
+}
+
+/// What opening a message downloaded: all of it, or its shown parts only (see [`crate::partial`]).
+pub enum Download {
+    Whole(Vec<u8>),
+    Partial(Vec<u8>),
+}
+
+/// For reading: a message of `size` bytes or more without its large attachments, when its
+/// structure has some; otherwise all of it.
+pub async fn download_for_reading(store: &Store, session: &mut Session, id: i64, mailbox: &str, uid: u32, size: u32) -> Result<(Download, Option<u32>)> {
+    let validity = session.examine(mailbox).await?.uid_validity;
+    check_still_there(store, id, mailbox, uid, validity)?;
+    if size >= crate::partial::PARTIAL_FROM {
+        match shown_parts(session, uid).await {
+            Ok(Some(raw)) => return Ok((Download::Partial(raw), validity)),
+            Ok(None) => {}
+            Err(e) if e.is_connection_drop() => return Err(e),
+            // A structure this parser cannot read: the whole message, as before.
+            Err(e) => tracing::info!("message {id}: structure unreadable ({e}), downloaded whole"),
+        }
+    }
+    Ok((Download::Whole(whole_body(session, uid).await?), validity))
+}
+
+async fn shown_parts(session: &mut Session, uid: u32) -> Result<Option<Vec<u8>>> {
+    use async_imap::imap_proto::{MessageSection, SectionPath};
+    let fetches: Vec<Fetch> = session.uid_fetch(uid.to_string(), "(UID BODYSTRUCTURE)").await?.try_collect().await?;
+    let Some(plan) = fetches.iter().find(|f| f.uid == Some(uid)).and_then(|f| f.bodystructure()).and_then(crate::partial::plan) else {
+        return Ok(None);
+    };
+    let fetches: Vec<Fetch> = session.uid_fetch(uid.to_string(), plan.query()).await?.try_collect().await?;
+    let Some(fetch) = fetches.iter().find(|f| f.uid == Some(uid)) else { return Ok(None) };
+    let path = |section: &str| section.split('.').map(str::parse).collect::<std::result::Result<Vec<u32>, _>>().ok();
+    let Some(header) = fetch.section(&SectionPath::Full(MessageSection::Header)) else { return Ok(None) };
+    let (mut mime, mut bodies) = (HashMap::new(), HashMap::new());
+    for section in plan.fetched().into_iter().chain(plan.deferred()) {
+        let Some(numbers) = path(&section) else { return Ok(None) };
+        if let Some(data) = fetch.section(&SectionPath::Part(numbers.clone(), Some(MessageSection::Mime))) {
+            mime.insert(section.clone(), data.to_vec());
+        }
+        if let Some(data) = fetch.section(&SectionPath::Part(numbers, None)) {
+            bodies.insert(section, data.to_vec());
+        }
+    }
+    Ok(plan.assemble(header, &mime, &bodies))
+}
+
+async fn whole_body(session: &mut Session, uid: u32) -> Result<Vec<u8>> {
     let fetches: Vec<Fetch> = session.uid_fetch(uid.to_string(), "(UID BODY.PEEK[])").await?.try_collect().await?;
     let Some(raw) = fetches.iter().find(|f| f.uid == Some(uid)).and_then(|f| f.body()).map(<[u8]>::to_vec) else {
         // A FETCH cut short ends quietly too: a dead connection, not a message gone.
         imap::still_open(session).await?;
         return Err(crate::Error::NotFound(crate::tr!("message {uid} absent du serveur", "message {uid} missing from the server")));
     };
-    Ok((raw, validity))
+    Ok(raw)
 }
 
 #[cfg(test)]
