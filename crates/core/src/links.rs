@@ -23,6 +23,10 @@ const CLICK_TRACKERS: &[(&str, &str)] = &[
     ("mlsend.com", "MailerLite"), ("convertkit-mail.com", "Kit"), ("customeriomail.com", "Customer.io"),
 ];
 
+/// Security gateways rewriting every link of the mail they let through (registrable domain, path,
+/// parameter holding the destination, service name): the gateway checks the link at click time.
+const GATEWAYS: &[(&str, &str, &str, &str)] = &[("mailinblack.com", "/securelink", "url", "Mailinblack")];
+
 /// Known tracking parameters, besides every `utm_*`.
 const TRACKING: &[&str] = &[
     "fbclid", "gclid", "dclid", "gbraid", "wbraid", "msclkid", "yclid", "twclid", "igshid", "mc_cid", "mc_eid",
@@ -51,6 +55,8 @@ pub struct LinkFacts {
     pub shortener: bool,
     /// Click tracker of a mailing service (its name): the address shown cannot be checked.
     pub tracker: Option<&'static str>,
+    /// Security gateway of a mail service (its name) carrying the link: judged by its destination.
+    pub gateway: Option<&'static str>,
     /// Destination embedded in the link (click-tracking redirectors: `?url=https://…`).
     pub redirect_to: Option<String>,
     pub redirect_domain: Option<String>,
@@ -135,7 +141,19 @@ pub fn analyze(href: &str, text: &str) -> Option<LinkFacts> {
     let domain_ascii = if ip { ascii.clone() } else { registrable(&ascii) };
     let domain = if ip { ascii.clone() } else { unicode(&domain_ascii) };
 
-    let differs = |s: &String| *s != host && !host.ends_with(&format!(".{s}")) && !s.ends_with(&format!(".{host}"));
+    // An address or a lookalike domain as destination is not vouched for: the link stays as it is.
+    let gateway = GATEWAYS
+        .iter()
+        .find(|(d, path, ..)| *d == domain_ascii && url.path().trim_end_matches('/') == *path)
+        .and_then(|(_, _, param, name)| {
+            let (_, to) = url.query_pairs().find(|(k, _)| k == param)?;
+            let to = url::Url::parse(&to).ok()?;
+            let url::Host::Domain(to_host) = to.host()? else { return None };
+            let to_host = bare(to_host);
+            (matches!(to.scheme(), "http" | "https") && !to_host.split('.').any(|l| l.starts_with("xn--"))).then_some((*name, to_host, to.scheme() == "https"))
+        });
+    let compared = gateway.as_ref().map_or(host.as_str(), |(_, to, _)| to.as_str());
+    let differs = |s: &String| *s != compared && !compared.ends_with(&format!(".{s}")) && !s.ends_with(&format!(".{compared}"));
     let candidates = shown_hosts(text);
     let mut deceptive = candidates.iter().any(differs);
     let mut shown = candidates.iter().find(|s| differs(s)).or(candidates.first()).cloned();
@@ -176,9 +194,10 @@ pub fn analyze(href: &str, text: &str) -> Option<LinkFacts> {
     Some(LinkFacts {
         url: url.to_string(),
         punycode: !ip && ascii.split('.').any(|l| l.starts_with("xn--")),
-        secure: url.scheme() == "https",
+        secure: url.scheme() == "https" && gateway.as_ref().is_none_or(|(_, _, secure)| *secure),
         shortener: SHORTENERS.contains(&ascii.as_str()),
         tracker: CLICK_TRACKERS.iter().find(|(d, _)| *d == domain_ascii).map(|(_, name)| *name),
+        gateway: gateway.map(|(name, ..)| name),
         host,
         domain,
         domain_ascii,
@@ -305,7 +324,12 @@ pub fn evaluate(f: &LinkFacts, c: &LinkContext) -> Trust {
     if f.shortener {
         note(-10, tr!("Lien raccourci : la destination finale est masquée", "Shortened link: the final destination is hidden"));
     }
-    if let Some(d) = &f.redirect_domain {
+    if let (Some(service), Some(d)) = (f.gateway, &f.redirect_domain) {
+        note(0, tr!(
+            "Lien réécrit par la passerelle de sécurité {service} : il annonce {d}, ce qui ne se vérifie qu'en cliquant",
+            "Link rewritten by the {service} security gateway: it announces {d}, which can only be checked by clicking"
+        ));
+    } else if let Some(d) = &f.redirect_domain {
         note(-5, tr!("Passe par un redirecteur vers {d}", "Goes through a redirector to {d}"));
     }
     match c.message_trust {
@@ -529,6 +553,39 @@ mod tests {
         let unproven = evaluate(&f, &LinkContext { sender_domain_unproven: Some("ecollectivites.fr".into()), ..Default::default() });
         assert_eq!(plain.score, unproven.score);
         assert!(unproven.reasons.iter().any(|r| r.text.contains("ecollectivites.fr")), "{unproven:?}");
+    }
+
+    #[test]
+    fn a_security_gateway_is_judged_by_the_destination_it_announces() {
+        let gateway = "https://mibc-fr-06.mailinblack.com/securelink/?url=https%3A%2F%2Fyoutube.com&key=abc";
+        let f = analyze(gateway, "https://youtube.com/watch?v=u3Q29svLrcU").unwrap();
+        assert_eq!(f.gateway, Some("Mailinblack"));
+        assert!(!f.deceptive);
+        let trust = evaluate(&f, &LinkContext::default());
+        assert_eq!(trust.level, Level::Medium, "{trust:?}");
+        assert!(trust.reasons.iter().any(|r| r.text.contains("Mailinblack") && r.text.contains("youtube.com")), "{trust:?}");
+
+        // Through the gateway to somewhere else than the text says: the forgery it always was.
+        let f = analyze("https://mibc-fr-06.mailinblack.com/securelink/?url=https%3A%2F%2Fevil.example&key=abc", "paypal.com").unwrap();
+        assert!(f.deceptive);
+        assert_eq!(evaluate(&f, &LinkContext::default()).level, Level::Low);
+
+        // Only the gateway's own address, and a destination that can be judged.
+        for other in [
+            "https://mailinblack.com.evil.example/securelink/?url=https%3A%2F%2Fyoutube.com",
+            "https://mibc-fr-06.mailinblack.com/elsewhere/?url=https%3A%2F%2Fyoutube.com",
+            "https://mibc-fr-06.mailinblack.com/securelink/?next=https%3A%2F%2Fyoutube.com",
+            "https://mibc-fr-06.mailinblack.com/securelink/?url=https%3A%2F%2F1.2.3.4%2F",
+            "https://mibc-fr-06.mailinblack.com/securelink/?url=https%3A%2F%2Fxn--pypal-4ve.com%2F",
+        ] {
+            let f = analyze(other, "youtube.com").unwrap();
+            assert_eq!(f.gateway, None, "{other}");
+            assert!(f.deceptive, "{other}");
+        }
+
+        // What is read in the text is not what is seen; an unencrypted destination still tells.
+        assert!(analyze(gateway, "\u{202E}moc.ebutuoy").unwrap().deceptive);
+        assert!(!analyze("https://mibc-fr-06.mailinblack.com/securelink/?url=http%3A%2F%2Fyoutube.com", "Voir").unwrap().secure);
     }
 
     #[test]

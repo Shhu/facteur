@@ -520,15 +520,23 @@ const toggleFlag = () => resetPending.value ? undefined : run(() => {
 const inJunk = computed(() => mailboxes.value.find(m => m.id === props.mailboxId)?.role === 'junk')
 const sender = computed(() => [...messages.value].reverse().find(m => m.from && !isMine(m.from.email, props.accountId))?.from ?? null)
 const inScreener = computed(() => mailboxes.value.find(m => m.id === props.mailboxId)?.role === 'screener')
-function screenSender(verdict: 'inbox' | 'block') {
+const SCREEN_DONE = {
+  inbox: { key: 'mail.screener.accepted', icon: 'i-lucide-user-round-check' },
+  block: { key: 'mail.screener.refused', icon: 'i-lucide-user-round-x' },
+  delete: { key: 'mail.screener.refusedDeleted', icon: 'i-lucide-trash-2' }
+}
+const refuseItems = computed(() => [
+  { label: t('mail.screener.refuseDelete'), icon: 'i-lucide-trash-2', onSelect: () => screenSender('delete') }
+])
+function screenSender(verdict: keyof typeof SCREEN_DONE) {
   const from = sender.value
   if (!from) return
   const name = from.name?.trim() || from.email
   run(
     () => api.screenSender(props.accountId, from.email, verdict, false),
     true,
-    t(verdict === 'block' ? 'mail.screener.refused' : 'mail.screener.accepted', { name }),
-    verdict === 'block' ? 'i-lucide-user-round-x' : 'i-lucide-user-round-check'
+    t(SCREEN_DONE[verdict].key, { name }),
+    SCREEN_DONE[verdict].icon
   )
 }
 
@@ -862,15 +870,27 @@ useEventListener('keydown', (e: KeyboardEvent) => {
           <UIcon :name="roleIcons.screener" class="size-4.5 shrink-0 text-primary" />
           <span class="min-w-0 flex-1 truncate text-sm text-default">{{ $t('mail.screener.held', { name: sender.name?.trim() || sender.email }) }}</span>
           <div class="flex items-center gap-2 max-sm:w-full">
-            <UButton
-              :label="$t('mail.screener.refuse')"
-              icon="i-lucide-user-round-x"
-              color="neutral"
-              variant="outline"
-              size="sm"
-              class="justify-center rounded-[9px] max-sm:min-h-11 max-sm:flex-1"
-              @click="screenSender('block')"
-            />
+            <UFieldGroup class="max-sm:flex-1">
+              <UButton
+                :label="$t('mail.screener.refuse')"
+                icon="i-lucide-user-round-x"
+                color="neutral"
+                variant="outline"
+                size="sm"
+                class="flex-1 justify-center rounded-s-[9px] max-sm:min-h-11"
+                @click="screenSender('block')"
+              />
+              <UDropdownMenu :items="refuseItems" :content="{ align: 'end' }">
+                <UButton
+                  icon="i-lucide-chevron-down"
+                  color="neutral"
+                  variant="outline"
+                  size="sm"
+                  class="rounded-e-[9px] max-sm:min-h-11"
+                  :aria-label="$t('mail.screener.refuseAs')"
+                />
+              </UDropdownMenu>
+            </UFieldGroup>
             <UButton
               :label="$t('mail.screener.accept')"
               icon="i-lucide-user-round-check"

@@ -30,6 +30,10 @@ const acceptItems = computed<DropdownMenuItem[]>(() => [
   { label: t('mail.screener.asNotification'), icon: 'i-lucide-bell', onSelect: () => emit('screen', 'notification') }
 ])
 
+const refuseItems = computed<DropdownMenuItem[]>(() => [
+  { label: t('mail.screener.refuseDelete'), icon: 'i-lucide-trash-2', onSelect: () => emit('screen', 'delete') }
+])
+
 /** Past this distance (px), letting go decides. */
 const THRESHOLD = 96
 const dx = ref(0)
@@ -157,14 +161,26 @@ watch(() => props.active, (on) => {
           @click.stop
         />
         <div class="ms-auto flex items-center gap-2 max-sm:w-full">
-          <UButton
-            :label="$t('mail.screener.refuse')"
-            icon="i-lucide-user-round-x"
-            color="neutral"
-            variant="outline"
-            class="justify-center rounded-[10px] max-sm:min-h-11 max-sm:flex-1"
-            @click.stop="emit('screen', 'block')"
-          />
+          <UFieldGroup class="max-sm:flex-1">
+            <UButton
+              :label="$t('mail.screener.refuse')"
+              icon="i-lucide-user-round-x"
+              color="neutral"
+              variant="outline"
+              class="flex-1 justify-center rounded-s-[10px] max-sm:min-h-11"
+              @click.stop="emit('screen', 'block')"
+            />
+            <UDropdownMenu :items="refuseItems" :content="{ align: 'end' }">
+              <UButton
+                icon="i-lucide-chevron-down"
+                color="neutral"
+                variant="outline"
+                class="rounded-e-[10px] max-sm:min-h-11"
+                :aria-label="$t('mail.screener.refuseAs')"
+                @click.stop
+              />
+            </UDropdownMenu>
+          </UFieldGroup>
           <UFieldGroup class="max-sm:flex-1">
             <UButton
               :label="$t('mail.screener.accept')"

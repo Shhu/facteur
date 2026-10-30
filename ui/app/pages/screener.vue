@@ -58,7 +58,8 @@ const DONE: Record<Screen, { key: string, icon: string }> = {
   inbox: { key: 'mail.screener.accepted', icon: 'i-lucide-user-round-check' },
   newsletter: { key: 'mail.screener.acceptedNewsletter', icon: 'i-lucide-newspaper' },
   notification: { key: 'mail.screener.acceptedNotification', icon: 'i-lucide-bell' },
-  block: { key: 'mail.screener.refused', icon: 'i-lucide-user-round-x' }
+  block: { key: 'mail.screener.refused', icon: 'i-lucide-user-round-x' },
+  delete: { key: 'mail.screener.refusedDeleted', icon: 'i-lucide-trash-2' }
 }
 
 async function screen(s: HeldSender, verdict: Screen) {

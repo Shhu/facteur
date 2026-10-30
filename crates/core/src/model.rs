@@ -746,6 +746,8 @@ pub enum Screen {
     Notification,
     /// Refused: to the "Screened out" folder, now and later.
     Block,
+    /// Refused: to the trash, now and later.
+    Delete,
 }
 
 /// A sender whose messages wait in the "New senders" folder.

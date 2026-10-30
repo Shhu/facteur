@@ -3721,6 +3721,7 @@ impl Store {
                     _ if proven => {}
                     Some("accept") => {}
                     Some("block") => out.push((id, Verdict::Refuse)),
+                    Some("delete") => out.push((id, Verdict::Delete)),
                     _ => out.push((id, Verdict::Hold)),
                 }
                 continue;
@@ -3728,6 +3729,10 @@ impl Store {
             match by_address.as_deref() {
                 Some("block") => {
                     out.push((id, Verdict::Refuse));
+                    continue;
+                }
+                Some("delete") => {
+                    out.push((id, Verdict::Delete));
                     continue;
                 }
                 _ if suspect => {
@@ -3749,6 +3754,10 @@ impl Store {
                 Some("accept") => continue,
                 Some("block") if !correspondent => {
                     out.push((id, Verdict::Refuse));
+                    continue;
+                }
+                Some("delete") if !correspondent => {
+                    out.push((id, Verdict::Delete));
                     continue;
                 }
                 _ => {}
@@ -6164,6 +6173,8 @@ pub enum Verdict {
     Hold,
     /// A refused sender: to "Screened out".
     Refuse,
+    /// A sender refused and deleted: to the trash.
+    Delete,
     /// Moved back to the inbox from the screener's folders by another device or client: the
     /// sender (this lowercased address) is accepted.
     Accept(String),

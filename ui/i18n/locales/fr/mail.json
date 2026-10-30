@@ -484,6 +484,8 @@
       "asNewsletter": "Accepter comme newsletter",
       "asNotification": "Accepter comme notification",
       "refuse": "Refuser",
+      "refuseDelete": "Refuser et supprimer",
+      "refuseAs": "Autres façons de refuser",
       "wholeDomain": "Tout le domaine ({domain})",
       "lowTrust": "Ce message présente des signes de fraude : vérifiez-le avant d'accepter cet expéditeur.",
       "openLatest": "Ouvrir le dernier message",
@@ -491,6 +493,7 @@
       "acceptedNewsletter": "Accepté comme newsletter : {name}",
       "acceptedNotification": "Accepté comme notification : {name}",
       "refused": "Refusé : {name}",
+      "refusedDeleted": "Refusé, messages à la corbeille : {name}",
       "banner": "{n} nouvel expéditeur | {n} nouveaux expéditeurs",
       "review": "Trier",
       "held": "Nouvel expéditeur : {name}"

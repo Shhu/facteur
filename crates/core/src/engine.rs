@@ -1788,11 +1788,12 @@ impl Engine {
             return Ok(Default::default());
         }
         let own = self.own_addresses()?;
-        let (mut held, mut refused) = (Vec::new(), Vec::new());
+        let (mut held, mut refused, mut deleted) = (Vec::new(), Vec::new(), Vec::new());
         for (id, verdict) in self.store.screen_verdicts(account_id, ids, since, &own)? {
             match verdict {
                 Verdict::Hold => held.push(id),
                 Verdict::Refuse => refused.push(id),
+                Verdict::Delete => deleted.push(id),
                 Verdict::Accept(sender) => {
                     if let Err(e) = self.accept_moved_back(account_id, id, &sender) {
                         tracing::warn!("screener of account {account_id}, {sender} accepted elsewhere: {e}");
@@ -1800,8 +1801,13 @@ impl Engine {
                 }
             }
         }
+        // No bin on the account: refused all the same, nothing being created for it.
+        if self.store.mailbox_by_role(account_id, Role::Trash)?.is_none() {
+            refused.append(&mut deleted);
+        }
         let held = self.screen_move(account_id, held, Role::Screener, &screener_folder());
-        let refused = self.screen_move(account_id, refused, Role::Refused, &refused_folder());
+        let mut refused = self.screen_move(account_id, refused, Role::Refused, &refused_folder());
+        refused.extend(self.screen_move(account_id, deleted, Role::Trash, ""));
         Ok((held, refused))
     }
 
@@ -1879,8 +1885,12 @@ impl Engine {
             )));
         }
         let pattern = if domain { format!("@{host}") } else { email.clone() };
-        let block = verdict == Screen::Block;
-        let sources: &[Role] = if block { &[Role::Screener, Role::Inbox] } else { &[Role::Screener, Role::Refused] };
+        let block = matches!(verdict, Screen::Block | Screen::Delete);
+        let sources: &[Role] = match verdict {
+            Screen::Block => &[Role::Screener, Role::Inbox],
+            Screen::Delete => &[Role::Screener, Role::Inbox, Role::Refused],
+            _ => &[Role::Screener, Role::Refused],
+        };
         let find = |pattern: &str| -> Result<Vec<i64>> {
             let mut ids = Vec::new();
             for role in sources {
@@ -1907,12 +1917,17 @@ impl Engine {
         if !targets.is_empty() {
             let dest = match verdict {
                 Screen::Block => self.special_mailbox(account_id, &[Role::Refused], Role::Refused, &refused_folder())?,
+                Screen::Delete => self.role_mailbox(account_id, Role::Trash)?,
                 _ => self.role_mailbox(account_id, Role::Inbox)?,
             };
             self.move_inner(&targets, dest, Some(&mut undo))?;
         }
         undo.screening.push((account_id, pattern.clone(), before));
-        self.store.set_screening(account_id, &pattern, Some(if block { "block" } else { "accept" }))?;
+        self.store.set_screening(account_id, &pattern, Some(match verdict {
+            Screen::Block => "block",
+            Screen::Delete => "delete",
+            _ => "accept",
+        }))?;
         if block {
             self.store.remember_screened(&targets)?;
         } else {
@@ -1922,7 +1937,7 @@ impl Engine {
             Screen::Inbox => Some(Category::People),
             Screen::Newsletter => Some(Category::Newsletter),
             Screen::Notification => Some(Category::Notification),
-            Screen::Block => None,
+            Screen::Block | Screen::Delete => None,
         };
         if let Some(category) = category {
             let mut senders: Vec<String> = self.store.senders_of(&targets)?;
@@ -1946,7 +1961,7 @@ impl Engine {
     /// keep refusing the sender). A domain's addresses decided on their own stay put.
     pub async fn forget_screening(self: &Arc<Self>, account_id: i64, pattern: &str) -> Result<()> {
         let pattern = pattern.trim().to_lowercase();
-        if self.store.screening_decision(account_id, &pattern)?.as_deref() == Some("block") {
+        if matches!(self.store.screening_decision(account_id, &pattern)?.as_deref(), Some("block" | "delete")) {
             let _ = self.settle_bounded(&self.store.messages_from_pattern(account_id, &pattern, Role::Refused)?).await;
             let mut ids = self.store.messages_from_pattern(account_id, &pattern, Role::Refused)?;
             if pattern.starts_with('@') {
@@ -9620,6 +9635,50 @@ In-Reply-To: <parent@x>\r\nReferences: <root@x> <parent@x>\r\n\r\nBrouillon\r\n"
         engine.forget_screening(acc, "bob@corp.example").await.unwrap();
         assert_eq!(store.location(bob).unwrap().mailbox_id, held);
         assert_eq!(store.screening_decision(acc, "bob@corp.example").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_sender_screened_out_and_deleted_goes_to_the_trash_now_and_later() {
+        let (_dir, engine, acc) = test_engine();
+        let store = engine.store();
+        let inbox = store.upsert_mailbox(acc, "INBOX", Some("/"), Some(Role::Inbox), true).unwrap();
+        let held = store.upsert_mailbox(acc, "New senders", Some("/"), Some(Role::Screener), true).unwrap();
+        let refused = store.upsert_mailbox(acc, "Screened out", Some("/"), Some(Role::Refused), true).unwrap();
+        let trash = store.upsert_mailbox(acc, "Trash", Some("/"), Some(Role::Trash), true).unwrap();
+        engine.set_screener(acc, true).unwrap();
+        let arrive = |mailbox, uid, mid: &str| store.insert_header(acc, mailbox, uid, &screened_header("spam@shop.example", mid, 10), UNSEEN, 10).unwrap();
+        let waiting = arrive(held, 1, "a@x");
+        let earlier = arrive(refused, 2, "b@x");
+
+        let token = engine.screen_sender(acc, "spam@shop.example", Screen::Delete, false).await.unwrap().expect("undoable");
+        assert_eq!((store.location(waiting).unwrap().mailbox_id, store.location(earlier).unwrap().mailbox_id), (trash, trash));
+        assert_eq!(store.screening_decision(acc, "spam@shop.example").unwrap().as_deref(), Some("delete"));
+
+        // The next one: straight to the trash, the decision outliving what it deleted.
+        store.set_screener_since(acc, Some(0)).unwrap();
+        let later = arrive(inbox, 3, "c@x");
+        let (_, gone) = engine.screen(acc, &[later]).unwrap();
+        assert!(gone.contains(&later));
+        assert_eq!(store.location(later).unwrap().mailbox_id, trash);
+
+        // Undone: the messages and the decision as they were.
+        engine.undo(token).await.unwrap();
+        assert_eq!((store.location(waiting).unwrap().mailbox_id, store.location(earlier).unwrap().mailbox_id), (held, refused));
+        assert_eq!(store.screening_decision(acc, "spam@shop.example").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn without_a_trash_folder_a_deleted_sender_is_only_screened_out() {
+        let (_dir, engine, acc) = test_engine();
+        let store = engine.store();
+        let inbox = store.upsert_mailbox(acc, "INBOX", Some("/"), Some(Role::Inbox), true).unwrap();
+        let refused = store.upsert_mailbox(acc, "Screened out", Some("/"), Some(Role::Refused), true).unwrap();
+        engine.set_screener(acc, true).unwrap();
+        store.set_screener_since(acc, Some(0)).unwrap();
+        store.set_screening(acc, "spam@shop.example", Some("delete")).unwrap();
+        let later = store.insert_header(acc, inbox, 1, &screened_header("spam@shop.example", "a@x", 10), UNSEEN, 10).unwrap();
+        engine.screen(acc, &[later]).unwrap();
+        assert_eq!(store.location(later).unwrap().mailbox_id, refused);
     }
 
     #[tokio::test]

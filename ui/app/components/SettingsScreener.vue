@@ -68,6 +68,19 @@ async function flip(d: Screening) {
   await load()
 }
 
+/** Refused → refused and deleted: what lies in "Screened out" goes to the trash, the next ones too. */
+async function alsoDelete(d: Screening) {
+  try {
+    const token = await api.screenSender(props.account.id, d.pattern, 'delete', isDomain(d))
+    done(token, t('settings.accounts.screener.nowDeleted', { pattern: d.pattern }), 'i-lucide-trash-2')
+  } catch (e) {
+    showError(e)
+  }
+  await load()
+}
+
+const badgeKey = (d: Screening) => d.decision === 'accept' ? 'accepted' : d.decision === 'delete' ? 'deleted' : 'blocked'
+
 async function forget(d: Screening) {
   try {
     await api.forgetScreening(props.account.id, d.pattern)
@@ -142,11 +155,22 @@ async function forget(d: Screening) {
             </span>
           </div>
           <UBadge
-            :label="d.decision === 'accept' ? $t('settings.accounts.screener.accepted') : $t('settings.accounts.screener.blocked')"
+            :label="$t(`settings.accounts.screener.${badgeKey(d)}`)"
             :color="d.decision === 'accept' ? 'success' : 'error'"
             variant="subtle"
             class="shrink-0"
           />
+          <UTooltip v-if="d.decision === 'block'" :text="$t('settings.accounts.screener.makeDelete')">
+            <UButton
+              icon="i-lucide-trash-2"
+              color="neutral"
+              variant="ghost"
+              :size="touch ? 'lg' : 'sm'"
+              :class="touch ? 'size-11 justify-center' : ''"
+              :aria-label="$t('settings.accounts.screener.makeDelete')"
+              @click="alsoDelete(d)"
+            />
+          </UTooltip>
           <UTooltip :text="d.decision === 'accept' ? $t('settings.accounts.screener.makeBlock') : $t('settings.accounts.screener.makeAccept')">
             <UButton
               :icon="d.decision === 'accept' ? 'i-lucide-user-round-x' : 'i-lucide-user-round-check'"

@@ -329,7 +329,7 @@ export interface MessageDetail {
 
 export type TrustLevel = 'low' | 'medium' | 'high'
 
-export type Screen = 'inbox' | 'newsletter' | 'notification' | 'block'
+export type Screen = 'inbox' | 'newsletter' | 'notification' | 'block' | 'delete'
 
 export interface HeldSender {
   account_id: number
@@ -345,7 +345,7 @@ export interface HeldSender {
 /** `address` is an address or a whole domain (`@example.org`). */
 export interface Screening {
   pattern: string
-  decision: 'accept' | 'block'
+  decision: 'accept' | 'block' | 'delete'
   created_at: number
 }
 

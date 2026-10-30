@@ -484,6 +484,8 @@
       "asNewsletter": "Accept as a newsletter",
       "asNotification": "Accept as a notification",
       "refuse": "Screen out",
+      "refuseDelete": "Screen out and delete",
+      "refuseAs": "Other ways to screen out",
       "wholeDomain": "Whole domain ({domain})",
       "lowTrust": "This message shows signs of fraud: check it before accepting this sender.",
       "openLatest": "Open the latest message",
@@ -491,6 +493,7 @@
       "acceptedNewsletter": "Accepted as a newsletter: {name}",
       "acceptedNotification": "Accepted as a notification: {name}",
       "refused": "Screened out: {name}",
+      "refusedDeleted": "Screened out, messages in the trash: {name}",
       "banner": "{n} new sender | {n} new senders",
       "review": "Review",
       "held": "New sender: {name}"
