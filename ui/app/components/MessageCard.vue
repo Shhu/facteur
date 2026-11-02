@@ -7,7 +7,7 @@ import type { MessageDetail, MessageSummary } from '~/utils/types'
 const props = defineProps<{ message: MessageSummary, detail?: MessageDetail, expanded: boolean, loading: boolean, latest?: boolean, draft?: boolean }>()
 defineEmits<{ toggle: [id: number] }>()
 
-const { reply, forward, composeMailto, resume, discardSaved } = useComposer()
+const { reply, replyAllCount: countReplyAll, forward, composeMailto, resume, discardSaved } = useComposer()
 const { quick } = useTemplates()
 const { accountById, accountColor, isMine } = useMail()
 const showError = useErrorToast()
@@ -222,12 +222,7 @@ const receivedAs = computed(() => {
 })
 const othersCount = computed(() => to.value.length + (props.detail?.cc.length ?? 0) - (ownRecipient.value ? 1 : 0))
 /** Shown on "Reply all": how many people it writes to, against a reply-all by mistake. */
-const replyAllCount = computed(() => {
-  const d = props.detail
-  if (!d) return 0
-  const all = [...(d.reply_to?.length ? d.reply_to : [d.summary.from]), ...d.summary.to, ...d.cc].filter((a): a is NonNullable<typeof a> => !!a)
-  return new Set(all.map(a => a.email.toLowerCase()).filter(e => !isMine(e, props.message.account_id))).size
-})
+const replyAllCount = computed(() => props.detail ? countReplyAll(props.detail) : 0)
 
 const invite = computed(() => props.detail?.invite ?? null)
 
@@ -606,7 +601,7 @@ const originalExcerpt = computed(() => {
             class="rounded-[10px] font-semibold max-lg:min-h-11"
             @click="reply(detail)"
           />
-          <UButton icon="i-lucide-reply-all" :label="replyAllCount > 1 ? `${$t('mail.messageCard.replyAll')} · ${replyAllCount}` : $t('mail.messageCard.replyAll')" size="lg" color="neutral" variant="outline" class="rounded-[10px] max-lg:min-h-11" @click="reply(detail, true)" />
+          <UButton v-if="replyAllCount" icon="i-lucide-reply-all" :label="replyAllCount > 1 ? `${$t('mail.messageCard.replyAll')} · ${replyAllCount}` : $t('mail.messageCard.replyAll')" size="lg" color="neutral" variant="outline" class="rounded-[10px] max-lg:min-h-11" @click="reply(detail, true)" />
           <UButton icon="i-lucide-forward" :label="$t('mail.messageCard.forward')" size="lg" color="neutral" variant="outline" class="rounded-[10px] max-lg:min-h-11" @click="forward(detail)" />
           <UDropdownMenu :items="moreItems">
             <UButton icon="i-lucide-ellipsis" size="lg" color="neutral" variant="ghost" class="hidden rounded-[10px] lg:inline-flex" :aria-label="$t('mail.threadView.more')" />

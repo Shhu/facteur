@@ -200,6 +200,10 @@ enum Purpose {
     Background,
 }
 
+fn pool_close_after(purpose: Purpose, host: &str) -> Duration {
+    if purpose == Purpose::Sync && oauth_host(OAuthProvider::Microsoft, host) { MICROSOFT_SYNC_CLOSE_AFTER } else { POOL_CLOSE_AFTER }
+}
+
 struct Pooled {
     session: Session,
     caps: Option<sync::Caps>,
@@ -327,6 +331,9 @@ const POOL_CHECK_AFTER: Duration = Duration::from_secs(60);
 /// Some hosts cap the connections of an address (OVH cut them and answered with empty folder
 /// lists). At rest, only IDLE stays open.
 const POOL_CLOSE_AFTER: Duration = Duration::from_secs(120);
+/// Microsoft turns down sign-ins for a while when connections open and close often: its sync
+/// connection waits for the next sync (every 5 minutes at rest).
+const MICROSOFT_SYNC_CLOSE_AFTER: Duration = Duration::from_secs(10 * 60);
 const SYNC_RETRY_AFTER: Duration = Duration::from_secs(5);
 /// A sign-in refused "for now" for this long is no longer passing: the user is asked to sign in again.
 /// The waits before the next tries of a sign-in Outlook turns down "for now".
@@ -414,7 +421,7 @@ pub struct Engine {
     /// download runs waits for it instead of fetching the message again.
     body_downloads: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
     /// The body downloaded last, until cached (the cache write may wait for a sync's batch).
-    last_body: Mutex<Option<(i64, Arc<Vec<u8>>)>>,
+    last_body: Mutex<Option<(i64, Option<u32>, Arc<Vec<u8>>)>>,
     /// Sends running per account (see `deliver_outgoing`).
     sending: Mutex<HashMap<i64, Arc<tokio::sync::Semaphore>>>,
     last_resume: Mutex<Option<Instant>>,
@@ -1525,10 +1532,11 @@ impl Engine {
     }
 
     async fn close_idle_connections(&self) {
-        let slots: Vec<Slot> = self.slots.lock().unwrap().values().cloned().collect();
-        for slot in slots {
+        let slots: Vec<((i64, Purpose), Slot)> = self.slots.lock().unwrap().iter().map(|(key, slot)| (*key, slot.clone())).collect();
+        for ((account_id, purpose), slot) in slots {
             let Ok(mut guard) = slot.try_lock_owned() else { continue };
-            if guard.as_ref().is_some_and(|c| c.used.elapsed() > POOL_CLOSE_AFTER)
+            let after = self.store.account(account_id).map_or(POOL_CLOSE_AFTER, |a| pool_close_after(purpose, &a.imap.host));
+            if guard.as_ref().is_some_and(|c| c.used.elapsed() > after)
                 && let Some(mut conn) = guard.take()
             {
                 drop(guard);
@@ -2308,7 +2316,7 @@ impl Engine {
 
     fn body_cached(&self, id: i64) {
         let mut last = self.last_body.lock().unwrap();
-        if last.as_ref().is_some_and(|(kept, _)| *kept == id) {
+        if last.as_ref().is_some_and(|(kept, ..)| *kept == id) {
             *last = None;
         }
     }
@@ -2325,12 +2333,14 @@ impl Engine {
         if let Some(raw) = crate::rt::offload(|| self.store.body(id))? {
             return Ok((sync::Download::Whole(raw), None));
         }
-        if let Some((kept, raw)) = self.last_body.lock().unwrap().as_ref()
+        let loc = self.store.location(id)?;
+        // By UID too: a row deleted last leaves its id to the next one (a draft, then what was sent).
+        if let Some((kept, kept_uid, raw)) = self.last_body.lock().unwrap().as_ref()
             && *kept == id
+            && *kept_uid == loc.uid
         {
             return Ok((sync::Download::Whole(raw.to_vec()), None));
         }
-        let loc = self.store.location(id)?;
         let uid = loc.uid.ok_or_else(in_flight)?;
         // Two minutes plus a second per 50 KB: a 40 MB message on a slow line must not be cut off
         // every time it is opened.
@@ -2368,7 +2378,7 @@ impl Engine {
             sync::Download::Partial(_) => "shown parts",
         });
         if let sync::Download::Whole(raw) = &download {
-            *self.last_body.lock().unwrap() = Some((id, Arc::new(raw.clone())));
+            *self.last_body.lock().unwrap() = Some((id, Some(uid), Arc::new(raw.clone())));
         }
         Ok((download, Some((loc.mailbox, uid, validity))))
     }
@@ -8886,6 +8896,19 @@ mod tests {
         let log = log.lock().unwrap();
         assert_eq!(log.iter().filter(|c| c.to_ascii_uppercase().starts_with("LOGIN")).count(), 1, "{log:?}");
         assert!(log.iter().any(|c| c.contains("BODY.PEEK[]")), "a small message is downloaded whole: {log:?}");
+    }
+
+    #[test]
+    fn only_the_sync_connection_at_microsoft_waits_for_the_next_sync() {
+        let microsoft = "outlook.office365.com";
+        assert_eq!(pool_close_after(Purpose::Sync, microsoft), MICROSOFT_SYNC_CLOSE_AFTER);
+        assert!(MICROSOFT_SYNC_CLOSE_AFTER > Duration::from_secs(5 * 60), "outlives the time between two syncs");
+        for purpose in [Purpose::Interactive, Purpose::Queue, Purpose::Background] {
+            assert_eq!(pool_close_after(purpose, microsoft), POOL_CLOSE_AFTER);
+        }
+        for host in ["imap.gmail.com", "ssl0.ovh.net", "outlook.office365.com.evil.example"] {
+            assert_eq!(pool_close_after(Purpose::Sync, host), POOL_CLOSE_AFTER, "{host}");
+        }
     }
 
     #[test]

@@ -166,9 +166,8 @@ export function useComposer() {
   }
 
   /** `body`: text to start the reply with (a quick reply), above the signature. */
-  function reply(m: MessageDetail, all = false, body = '') {
+  function replyRecipients(m: MessageDetail, all: boolean) {
     const account = m.summary.account_id
-    const from = aliasFor(m)
     // Each address once across To and Cc; ours (any account, any alias) are left out.
     const seen = new Set<string>()
     const pick = (list: (Address | null)[], dropMine: boolean) => list.filter((a): a is Address => {
@@ -188,6 +187,19 @@ export function useComposer() {
       to = pick(m.reply_to.length ? m.reply_to : [m.summary.from], false)
     }
     const cc = all ? pick(ownMessage ? m.cc : [...m.summary.to, ...m.cc], true) : []
+    return { to, cc }
+  }
+
+  /** People "Reply all" writes to; 0 when it would add nobody to a plain reply. */
+  function replyAllCount(m: MessageDetail) {
+    const { to, cc } = replyRecipients(m, true)
+    return cc.length ? to.length + cc.length : 0
+  }
+
+  function reply(m: MessageDetail, all = false, body = '') {
+    const account = m.summary.account_id
+    const from = aliasFor(m)
+    const { to, cc } = replyRecipients(m, all)
     show({
       ...blank(account),
       to: to.map(addressFull),
@@ -275,7 +287,7 @@ export function useComposer() {
     }
   }
 
-  return { open, draft, session, unsaved, compose, composeMailto, reply, forward, resume, discardSaved, reopen, editOutgoing, onBeforeReplace, onBeforeQuit }
+  return { open, draft, session, unsaved, compose, composeMailto, reply, replyAllCount, forward, resume, discardSaved, reopen, editOutgoing, onBeforeReplace, onBeforeQuit }
 }
 
 /** Strips every remote resource the editor would load (tracking pixels): non-embedded `img`

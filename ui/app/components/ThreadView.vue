@@ -14,7 +14,7 @@ const props = withDefaults(
 const emit = defineEmits<{ close: [], done: [], pinned: [] }>()
 
 const { tick, mailboxes, isMine, accountById, accountColor } = useMail()
-const { reply, forward, open: composing } = useComposer()
+const { reply, replyAllCount, forward, open: composing } = useComposer()
 const showError = useErrorToast()
 const listStale = useListStale()
 const { t } = useI18n()
@@ -128,9 +128,12 @@ function applyRefinedTrust(detail: MessageDetail) {
 }
 watch(refinedTrust, () => details.forEach(applyRefinedTrust))
 
+/** Messages whose reading again failed: tried at each reload. */
+const unreadable = new Set<number>()
+
 /** A message read before, read again in place (no spinner meanwhile); dropped if not open. */
 async function refreshDetail(id: number) {
-  if (!details.has(id)) return
+  if (!details.has(id) && !unreadable.has(id)) return
   if (!expanded.has(id)) {
     details.delete(id)
     return
@@ -139,9 +142,17 @@ async function refreshDetail(id: number) {
   try {
     const detail = await api.message(id)
     applyRefinedTrust(detail)
-    if (gen === generation) details.set(id, detail)
+    if (gen === generation) {
+      details.set(id, detail)
+      unreadable.delete(id)
+    }
   } catch {
-    // Gone meanwhile (a draft sent and deleted): the next reload drops its card.
+    // Gone meanwhile (a draft sent and deleted), or moved under a sync: never left showing the old
+    // text. The next reload reads it again, or drops its card.
+    if (gen === generation) {
+      details.delete(id)
+      unreadable.add(id)
+    }
   }
 }
 
@@ -224,7 +235,8 @@ async function load(reset: boolean) {
     const was = old.get(m.id)
     return was && sign(was) === sign(m) ? was : m
   })
-  const stale = wasReset ? [] : staleDetails(messages.value, list, draftIds(list, mailboxes.value))
+  const stale = wasReset ? [] : [...new Set([...staleDetails(messages.value, list, draftIds(list, mailboxes.value)), ...list.filter(m => unreadable.has(m.id)).map(m => m.id)])]
+  if (wasReset) unreadable.clear()
   if (wasReset || kept.length !== messages.value.length || kept.some((m, i) => m !== messages.value[i])) messages.value = kept
   for (const id of stale) refreshDetail(id)
   if (wasReset) {
@@ -983,6 +995,7 @@ useEventListener('keydown', (e: KeyboardEvent) => {
           @click="latestDetail() && reply(latestDetail()!)"
         />
         <UButton
+          v-if="!latestDetail() || replyAllCount(latestDetail()!)"
           icon="i-lucide-reply-all"
           color="neutral"
           variant="outline"
