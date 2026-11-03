@@ -6373,6 +6373,8 @@ fn local_day(ts: i64) -> i64 {
 
 /// The longest a zone is ahead of or behind UTC (whole-day events read in the local zone).
 const MAX_ZONE_OFFSET: i64 = 14 * 3600;
+/// Events a calendar search gives at most, as Google Calendar.
+const EVENT_SEARCH_LIMIT: usize = 200;
 
 // ── Calendars ──────────────────────────────────────────────────────────────
 
@@ -6417,6 +6419,67 @@ impl Store {
         rows.retain(|e| e.start < to && (e.end > from || e.start >= from));
         rows.sort_by_key(|e| (e.start, e.end, e.id));
         Ok(rows)
+    }
+
+    /// Events of the shown calendars matching `q` within what is synced, upcoming first (by
+    /// start), then those over (latest first). An empty query finds nothing.
+    pub fn search_calendar_events(&self, q: &EventQuery, now: i64) -> Result<EventSearch> {
+        let words = |s: &str| crate::ai::folded(s).split_whitespace().map(str::to_string).collect::<Vec<_>>();
+        let (mut text, who, place) = (Vec::new(), words(&q.who), words(&q.place));
+        let mut without = words(&q.without);
+        // `-word` in the main text leaves out what has it.
+        for w in words(&q.text) {
+            match w.strip_prefix('-') {
+                Some(rest) if !rest.is_empty() => without.push(rest.to_string()),
+                Some(_) => {}
+                None => text.push(w),
+            }
+        }
+        if text.is_empty() && who.is_empty() && place.is_empty() {
+            return Ok(EventSearch { hits: Vec::new(), more: false });
+        }
+        let events = self.calendar_events(q.from.unwrap_or(i64::MIN / 4), q.to.unwrap_or(i64::MAX / 4))?;
+        let has_all = |hay: &str, words: &[String]| words.iter().all(|w| hay.contains(w.as_str()));
+        let mut series: Vec<(CalendarEvent, usize)> = Vec::new();
+        let mut index: HashMap<(i64, String), usize> = HashMap::new();
+        for e in events {
+            if !q.calendars.is_empty() && !q.calendars.contains(&e.calendar_id) {
+                continue;
+            }
+            let people = crate::ai::folded(
+                &std::iter::once(e.organizer.clone().unwrap_or_default())
+                    .chain(e.attendees.iter().flat_map(|a| [a.email.clone(), a.name.clone().unwrap_or_default()]))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            let location = crate::ai::folded(e.location.as_deref().unwrap_or(""));
+            let all = format!("{}\n{location}\n{}\n{people}", crate::ai::folded(&e.summary), crate::ai::folded(e.description.as_deref().unwrap_or("")));
+            if !has_all(&all, &text) || !has_all(&people, &who) || !has_all(&location, &place) || without.iter().any(|w| all.contains(w.as_str())) {
+                continue;
+            }
+            // By start: the first occurrence not over stands for its series, else the last one.
+            let key = (e.calendar_id, if e.recurring { e.uid.clone() } else { format!("{}\n{}", e.uid, e.instance) });
+            match index.get(&key) {
+                Some(&i) => {
+                    let (kept, n) = &mut series[i];
+                    *n += 1;
+                    if kept.end <= now {
+                        *kept = e;
+                    }
+                }
+                None => {
+                    index.insert(key, series.len());
+                    series.push((e, 1));
+                }
+            }
+        }
+        let (mut hits, mut over): (Vec<_>, Vec<_>) = series.into_iter().partition(|(e, _)| e.end > now);
+        hits.sort_by_key(|(e, _)| (e.start, e.id));
+        over.sort_by_key(|(e, _)| std::cmp::Reverse((e.start, e.id)));
+        hits.extend(over);
+        let more = hits.len() > EVENT_SEARCH_LIMIT;
+        hits.truncate(EVENT_SEARCH_LIMIT);
+        Ok(EventSearch { hits: hits.into_iter().map(|(event, occurrences)| EventHit { event, occurrences }).collect(), more })
     }
 
     /// An event, with where it lives on the provider's side.
@@ -9624,6 +9687,51 @@ mod tests {
         s.set_calendar_enabled(c, false).unwrap();
         assert!(s.caldav_etags(c).unwrap().is_empty(), "no ETag left to skip its unchanged objects");
         assert_eq!(s.setting(&format!("caldav_whole:{c}")).unwrap(), None);
+    }
+
+    #[test]
+    fn calendar_search() {
+        use crate::calendar::{Instance, RemoteCalendar};
+        let (s, acc, _, _) = setup();
+        let cal = |id: &str, enabled: bool| RemoteCalendar {
+            remote_id: id.into(), name: id.into(), color: None, read_only: false, enabled, ctag: None,
+        };
+        let (rows, _) = s.sync_calendar_list(acc, CalendarSource::Caldav, &[cal("a", true), cal("b", true), cal("c", false)]).unwrap();
+        let (a, b, c) = (rows[0].id, rows[1].id, rows[2].id);
+        let ev = |uid: &str, instance: &str, summary: &str, start: i64| Instance {
+            uid: uid.into(), instance: instance.into(), summary: summary.into(), start, end: start + 10, busy: true,
+            recurring: !instance.is_empty(), ..Default::default()
+        };
+        let weekly = |n: i64| ev("weekly", &n.to_string(), "Point hebdo", n * 100);
+        let mut dentist = ev("dentist", "", "Dentiste", 450);
+        dentist.location = Some("Cabinet Écully".into());
+        let mut lunch = ev("lunch", "", "Déjeuner", 250);
+        lunch.attendees = vec![EventAttendee { email: "marie@example.org".into(), name: Some("Marie Dupont".into()), ..Default::default() }];
+        lunch.description = Some("Réserver la table".into());
+        s.replace_calendar_events(a, acc, "a", &[weekly(1), weekly(2), weekly(3), weekly(4), weekly(5), dentist, lunch], None).unwrap();
+        s.replace_calendar_events(b, acc, "b", &[ev("other", "", "Point budget", 120)], None).unwrap();
+        s.replace_calendar_events(c, acc, "c", &[ev("hidden", "", "Point caché", 300)], None).unwrap();
+
+        let find = |q: EventQuery| {
+            s.search_calendar_events(&q, 300).unwrap().hits.into_iter().map(|h| format!("{} {} {}", h.event.uid, h.event.start, h.occurrences)).collect::<Vec<_>>()
+        };
+        let text = |t: &str| EventQuery { text: t.into(), ..Default::default() };
+        // A series is one hit, at its next occurrence; upcoming first, then over, latest first;
+        // hidden calendars are left out.
+        assert_eq!(find(text("point")), ["weekly 300 5", "other 120 1"]);
+        assert_eq!(find(text("POINT -budget")), ["weekly 300 5"]);
+        assert_eq!(find(EventQuery { calendars: vec![b], ..text("point") }), ["other 120 1"]);
+        // Accents aside, in the location, the notes and the guests.
+        assert_eq!(find(text("ecully")), ["dentist 450 1"]);
+        assert_eq!(find(text("reserver")), ["lunch 250 1"]);
+        assert_eq!(find(EventQuery { who: "dupont".into(), ..Default::default() }), ["lunch 250 1"]);
+        assert!(find(EventQuery { place: "dupont".into(), ..Default::default() }).is_empty());
+        assert!(find(EventQuery { who: "écully".into(), ..Default::default() }).is_empty());
+        // A series over: its last occurrence; within dates, only what overlaps them.
+        assert_eq!(find(EventQuery { to: Some(250), ..text("hebdo") }), ["weekly 200 2"]);
+        assert_eq!(find(EventQuery { from: Some(400), ..text("hebdo") }), ["weekly 400 2"]);
+        assert!(find(EventQuery::default()).is_empty());
+        assert!(find(EventQuery { without: "point".into(), ..Default::default() }).is_empty());
     }
 
     #[test]

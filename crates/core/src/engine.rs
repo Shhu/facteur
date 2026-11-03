@@ -5824,6 +5824,11 @@ impl Engine {
         self.store.calendar_events(from, to)
     }
 
+    /// Events of the shown calendars matching `query`, within the synced window.
+    pub fn search_calendar_events(&self, query: &EventQuery) -> Result<EventSearch> {
+        self.store.search_calendar_events(query, crate::store::now())
+    }
+
     /// A calendar shown again has its events fetched at once.
     pub fn set_calendar_enabled(self: &Arc<Self>, id: i64, enabled: bool) -> Result<()> {
         let account_id = self.store.set_calendar_enabled(id, enabled)?;

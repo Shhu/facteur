@@ -522,6 +522,11 @@ async fn calendar_events(engine: Eng<'_>, from: i64, to: i64) -> Res<Vec<facteur
 }
 
 #[tauri::command]
+async fn search_calendar_events(engine: Eng<'_>, query: facteur_core::EventQuery) -> Res<facteur_core::EventSearch> {
+    blocking(&engine, move |e| e.search_calendar_events(&query)).await
+}
+
+#[tauri::command]
 async fn set_calendar_enabled(engine: Eng<'_>, id: i64, enabled: bool) -> Res<()> {
     blocking(&engine, move |e| e.set_calendar_enabled(id, enabled)).await
 }
@@ -1402,6 +1407,7 @@ pub fn run() {
             wake,
             calendars,
             calendar_events,
+            search_calendar_events,
             set_calendar_enabled,
             set_calendar_ignored,
             sync_calendars,

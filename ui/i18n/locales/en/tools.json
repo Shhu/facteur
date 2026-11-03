@@ -371,6 +371,27 @@
         "minutes": "Reminder {n} minute before | Reminder {n} minutes before",
         "hours": "Reminder {n} hour before | Reminder {n} hours before",
         "days": "Reminder {n} day before | Reminder {n} days before"
+      },
+      "search": {
+        "label": "Search the calendar",
+        "placeholder": "Search events",
+        "filters": "Search filters",
+        "who": "Who",
+        "whoHint": "Name or address of a guest or the organizer",
+        "where": "Where",
+        "without": "Without these words",
+        "calendars": "Calendars",
+        "allCalendars": "All calendars",
+        "period": "Dates",
+        "reset": "Clear filters",
+        "close": "Close search",
+        "upcoming": "Upcoming",
+        "past": "Past",
+        "none": "No event matches.",
+        "occurrences": "Repeats · {n} dates found",
+        "span": "Searching the synced events, from {from} to {to}.",
+        "more": "Only the first {n} results are shown: narrow the search.",
+        "apply": "Show"
       }
     }
   }

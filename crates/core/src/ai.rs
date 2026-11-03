@@ -613,16 +613,18 @@ pub fn without_thinking(text: &str) -> String {
 }
 
 /// Lowercase, accents folded: "Août" reads "aout".
-fn folded(text: &str) -> String {
+pub(crate) fn folded(text: &str) -> String {
     text.to_lowercase()
         .chars()
         .map(|c| match c {
-            'à' | 'â' | 'ä' => 'a',
+            'à' | 'â' | 'ä' | 'á' | 'ã' | 'å' => 'a',
             'é' | 'è' | 'ê' | 'ë' => 'e',
-            'î' | 'ï' => 'i',
-            'ô' | 'ö' => 'o',
-            'ù' | 'û' | 'ü' => 'u',
+            'î' | 'ï' | 'í' | 'ì' => 'i',
+            'ô' | 'ö' | 'ó' | 'ò' | 'õ' => 'o',
+            'ù' | 'û' | 'ü' | 'ú' => 'u',
             'ç' => 'c',
+            'ñ' => 'n',
+            'ÿ' => 'y',
             '’' => '\'',
             c => c,
         })

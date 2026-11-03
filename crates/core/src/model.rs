@@ -876,6 +876,37 @@ pub struct EventRef {
     pub instance: String,
 }
 
+/// A search of the calendars, case and accents aside. Every word of `text` is found somewhere in
+/// the event, every word of `who` among its organizer and guests, of `place` in its location;
+/// none of `without` anywhere. `calendars`: empty for every shown calendar. `from`, `to`: Unix
+/// seconds, the occurrences overlapping them.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct EventQuery {
+    pub text: String,
+    pub who: String,
+    pub place: String,
+    pub without: String,
+    pub calendars: Vec<i64>,
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+}
+
+/// An event found: a series is one hit, its next occurrence (or its last, all being over).
+#[derive(Debug, Clone, Serialize)]
+pub struct EventHit {
+    pub event: CalendarEvent,
+    /// Occurrences of that series found, 1 for a single event.
+    pub occurrences: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EventSearch {
+    pub hits: Vec<EventHit>,
+    /// More were found than given.
+    pub more: bool,
+}
+
 /// An event to create, or what an event becomes.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct EventDraft {

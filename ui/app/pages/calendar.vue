@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { useMediaQuery } from '@vueuse/core'
+import { useEventListener, useMediaQuery } from '@vueuse/core'
 import type { CalendarEvent } from '~/utils/types'
 
 const { accounts } = useMail()
@@ -160,6 +160,27 @@ function tapDay(d: Date) {
 }
 const listOpen = ref(false)
 
+const search = useCalendarSearch()
+const searchBar = useTemplateRef('searchBar')
+const touchSearchBar = useTemplateRef('touchSearchBar')
+const showResults = computed(() => search.open.value && search.active.value)
+function closeSearch() {
+  search.clear()
+}
+function openFound(e: CalendarEvent) {
+  search.open.value = false
+  asked.value = { id: e.id, start: e.start }
+  if (!desktop.value) nextTick(() => scrollToDay(dayStart(new Date(e.start * 1000))))
+}
+// Not through defineShortcuts: its preventDefault would stop a dialog's or menu's own Escape.
+useEventListener('keydown', (e: KeyboardEvent) => {
+  if (e.key === 'Escape' && !e.defaultPrevented && showResults.value && !overlayOpen()) closeSearch()
+})
+function focusSearch() {
+  search.open.value = true
+  nextTick(() => (desktop.value ? searchBar : touchSearchBar).value?.focus())
+}
+
 const troubled = computed(() => accounts.value.filter(a => !isIgnored(a.id) && (statusOf(a.id)?.state ?? 'ok') !== 'ok'))
 const empty = computed(() => loaded.value && !hasCalendars.value)
 
@@ -171,6 +192,7 @@ defineShortcuts({
   arrowright: () => free() && move(1),
   arrowleft: () => free() && move(-1),
   n: () => free() && newEvent(),
+  '/': () => free() && focusSearch(),
   m: () => free() && (view.value = 'month'),
   w: () => free() && (view.value = 'week'),
   d: () => free() && (view.value = 'day')
@@ -197,6 +219,7 @@ defineShortcuts({
             <span v-if="weekNumber" class="shrink-0 rounded-full bg-elevated px-2 py-0.5 text-xs font-medium text-muted">{{ weekNumber }}</span>
           </div>
           <SettingsSegmented v-model="view" :items="viewItems" :label="t('tools.calendar.view.label')" class="ms-2" />
+          <CalendarSearchBar ref="searchBar" class="ms-2 w-56 xl:w-64" @escape="closeSearch" />
         </template>
       </UDashboardNavbar>
 
@@ -221,6 +244,15 @@ defineShortcuts({
           class="size-11 justify-center rounded-xl"
           :aria-label="t('tools.calendar.event.newTitle')"
           @click="newEvent()"
+        />
+        <UButton
+          icon="i-lucide-search"
+          color="neutral"
+          variant="ghost"
+          size="lg"
+          class="size-11 justify-center rounded-xl"
+          :aria-label="t('tools.calendar.search.label')"
+          @click="focusSearch"
         />
         <UButton
           icon="i-lucide-refresh-cw"
@@ -261,6 +293,15 @@ defineShortcuts({
               class="max-w-md"
             />
           </div>
+          <div v-else-if="showResults" class="min-h-0 flex-1 overflow-y-auto">
+            <div class="mx-auto flex max-w-3xl flex-col gap-3 px-6 py-5">
+              <div class="flex items-center justify-between gap-2">
+                <h2 class="text-[15px] font-semibold text-highlighted">{{ t('tools.calendar.search.label') }}</h2>
+                <UButton icon="i-lucide-x" color="neutral" variant="ghost" :aria-label="t('tools.calendar.search.close')" @click="closeSearch" />
+              </div>
+              <CalendarSearchResults @select="openFound" />
+            </div>
+          </div>
           <CalendarMonth v-else-if="shownView === 'month'" :month="date" :days="days" :events="list" :selected="selected?.event.id ?? null" @select="select" @pick="pickDay" />
           <CalendarWeek v-else :key="shownView" :days="days" :events="list" :selected="selected?.event.id ?? null" @select="select" @pick="pickDay" @create="createAt" />
         </main>
@@ -276,6 +317,24 @@ defineShortcuts({
           </template>
         </UPopover>
       </div>
+
+      <template v-else-if="search.open.value">
+        <div class="sticky top-0 z-10 flex items-center gap-1 border-b border-default bg-default px-2 py-2 dark:bg-(--surface-side)">
+          <CalendarSearchBar ref="touchSearchBar" touch class="min-w-0 flex-1" @escape="closeSearch" />
+          <UButton
+            icon="i-lucide-x"
+            color="neutral"
+            variant="ghost"
+            size="lg"
+            class="size-11 shrink-0 justify-center rounded-xl"
+            :aria-label="t('tools.calendar.search.close')"
+            @click="closeSearch"
+          />
+        </div>
+        <div class="px-4 pt-3.5 pb-8">
+          <CalendarSearchResults v-if="search.active.value" @select="openFound" />
+        </div>
+      </template>
 
       <template v-else>
         <div class="sticky top-0 z-10 flex flex-col gap-1.5 border-b border-default bg-default px-2 pt-2 pb-2.5 dark:bg-(--surface-side)">

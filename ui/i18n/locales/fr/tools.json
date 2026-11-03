@@ -371,6 +371,27 @@
         "minutes": "Rappel {n} minute avant | Rappel {n} minutes avant",
         "hours": "Rappel {n} heure avant | Rappel {n} heures avant",
         "days": "Rappel {n} jour avant | Rappel {n} jours avant"
+      },
+      "search": {
+        "label": "Rechercher dans l'agenda",
+        "placeholder": "Rechercher un événement",
+        "filters": "Filtres de recherche",
+        "who": "Qui",
+        "whoHint": "Nom ou adresse d'un invité, de l'organisateur",
+        "where": "Où",
+        "without": "Sans ces mots",
+        "calendars": "Agendas",
+        "allCalendars": "Tous les agendas",
+        "period": "Période",
+        "reset": "Effacer les filtres",
+        "close": "Fermer la recherche",
+        "upcoming": "À venir",
+        "past": "Passés",
+        "none": "Aucun événement ne correspond.",
+        "occurrences": "Se répète · {n} dates trouvées",
+        "span": "Recherche dans les événements synchronisés, du {from} au {to}.",
+        "more": "Seuls les {n} premiers résultats sont affichés : précisez la recherche.",
+        "apply": "Afficher"
       }
     }
   }

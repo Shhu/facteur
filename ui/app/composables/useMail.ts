@@ -2,7 +2,7 @@ import { invoke } from '~/utils/ipc'
 import type { AccountColor, AccountColorName } from '~/utils/accountColors'
 import type { Diagnostics, LogLine } from '~/composables/usePerf'
 import type {
-  Account, AccountStats, AddressBookStatus, CalendarEvent, CalendarInfo, EventAnswer, EventDraft, SeriesRepeat, CalendarStatus, AiStatus, FoundEvent, OpsDetails, Address, Coverage, MailClientStatus, BackupManifest, BackupMessage, BackupStats, BackupStatus, Catalog, AttachmentReport, Category, CategoryUnread, Dashboard, Discovered, Draft, FolderSummary, FollowUp, HeldSender, Identity, Rule, RulePreview, LinkFacts, LinkReport, Outgoing, Mailbox, MessageDetail, MessageSummary, NewAccount, OAuthIdentity, OAuthProvider, OpsStatus, Unsubscribed,
+  Account, AccountStats, AddressBookStatus, CalendarEvent, CalendarInfo, EventAnswer, EventQuery, EventSearch, EventDraft, SeriesRepeat, CalendarStatus, AiStatus, FoundEvent, OpsDetails, Address, Coverage, MailClientStatus, BackupManifest, BackupMessage, BackupStats, BackupStatus, Catalog, AttachmentReport, Category, CategoryUnread, Dashboard, Discovered, Draft, FolderSummary, FollowUp, HeldSender, Identity, Rule, RulePreview, LinkFacts, LinkReport, Outgoing, Mailbox, MessageDetail, MessageSummary, NewAccount, OAuthIdentity, OAuthProvider, OpsStatus, Unsubscribed,
   RestoreFilter, RestoreRequest, RestoreStats, Screen, Screening, SimilarCriteria, SimilarFacets, SimilarResult, ThreadFilter, ThreadSummary
 } from '~/utils/types'
 
@@ -185,6 +185,7 @@ export const api = {
   calendars: () => invoke<CalendarInfo[]>('calendars'),
   /** Enabled calendars only, sorted by start. */
   calendarEvents: (from: number, to: number) => invoke<CalendarEvent[]>('calendar_events', { from, to }),
+  searchCalendarEvents: (query: EventQuery) => invoke<EventSearch>('search_calendar_events', { query }),
   setCalendarEnabled: (id: number, enabled: boolean) => invoke<void>('set_calendar_enabled', { id, enabled }),
   createEvent: (calendarId: number, draft: EventDraft, key: string) => invoke<number | null>('create_event', { calendarId, draft, key }),
   updateEvent: (e: CalendarEvent, draft: EventDraft, series: boolean) => invoke<void>('update_event', { event: eventRef(e), draft, series }),

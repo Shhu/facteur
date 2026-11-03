@@ -765,6 +765,31 @@ export interface CalendarEvent {
   zone: string | null
 }
 
+/** Case and accents aside: every word of `text` somewhere in the event (`-word` leaves out what
+ *  has it), of `who` among its organizer and guests, of `place` in its location; none of
+ *  `without`. `calendars` empty: every shown calendar. */
+export interface EventQuery {
+  text: string
+  who: string
+  place: string
+  without: string
+  calendars: number[]
+  from: number | null
+  to: number | null
+}
+
+/** A series is one hit, at its next occurrence (its last when all are over). */
+export interface EventHit {
+  event: CalendarEvent
+  occurrences: number
+}
+
+export interface EventSearch {
+  hits: EventHit[]
+  /** More were found than given. */
+  more: boolean
+}
+
 export interface EventAttendee {
   email: string
   name?: string | null

@@ -1,5 +1,5 @@
 import twColors from 'tailwindcss/colors'
-import type { Account, CalendarEvent, CalendarInfo, CalendarStatus } from '~/utils/types'
+import type { Account, CalendarEvent, CalendarInfo, CalendarStatus, EventQuery } from '~/utils/types'
 
 // The engine emits `calendar_changed` after a calendar sync (plugins/engine.client.ts bumps
 // `calendarTick`); the shared `tick` also reloads the events shown, spaced out.
@@ -208,4 +208,54 @@ export function useCalendarEvents(range: () => { from: number, to: number } | nu
   watch(tick, reloader.schedule)
 
   return { events, loadedRange, reload: reloader.now }
+}
+
+export interface CalendarSearchForm {
+  text: string
+  who: string
+  place: string
+  without: string
+  calendars: number[]
+  /** `YYYY-MM-DD`, empty for no bound; `to` included. */
+  from: string
+  to: string
+}
+
+const blankSearch = (): CalendarSearchForm => ({ text: '', who: '', place: '', without: '', calendars: [], from: '', to: '' })
+
+/** One search shared by the bar and the results (which load it). */
+export function useCalendarSearch() {
+  const form = useState<CalendarSearchForm>('calendar-search', blankSearch)
+  /** Results shown in place of the calendar. */
+  const open = useState('calendar-search-open', () => false)
+
+  const day = (v: string, after = 0) => {
+    const [y, m, d] = v.split('-').map(Number)
+    return y && m && d ? unix(new Date(y, m - 1, d + after)) : null
+  }
+  const query = computed<EventQuery>(() => ({
+    text: form.value.text.trim(),
+    who: form.value.who.trim(),
+    place: form.value.place.trim(),
+    without: form.value.without.trim(),
+    calendars: form.value.calendars,
+    from: day(form.value.from),
+    to: day(form.value.to, 1)
+  }))
+  /** Something to look for: dates or calendars alone find nothing, nor do left-out words. */
+  const active = computed(() => !!(query.value.text.replace(/(^|\s)-\S*/g, '').trim() || query.value.who || query.value.place))
+  const filtered = computed(() => {
+    const f = form.value
+    return !!(f.who.trim() || f.place.trim() || f.without.trim() || f.calendars.length || f.from || f.to)
+  })
+
+  function resetFilters() {
+    form.value = { ...blankSearch(), text: form.value.text }
+  }
+  function clear() {
+    form.value = blankSearch()
+    open.value = false
+  }
+
+  return { form, open, query, active, filtered, resetFilters, clear }
 }
