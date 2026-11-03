@@ -369,8 +369,11 @@
   /** All-day events: local midnights, the end exclusive. */
   const allDay = (calendar, summary, day, days = 1, extra = {}) => event(calendar, summary, day, 0, 0, 0, { all_day: true, end: local(day + days), ...extra })
   // Today is Tuesday: Monday is day -1.
-  const weekly = (calendar, summary, weekday, hh, mm, minutes, extra) =>
-    [-14, -7, 0, 7, 14, 21].map(w => event(calendar, summary, w + weekday, hh, mm, minutes, extra))
+  let seriesId = 0
+  const weekly = (calendar, summary, weekday, hh, mm, minutes, extra) => {
+    const uid = `demo-series-${++seriesId}@example.org`
+    return [-14, -7, 0, 7, 14, 21].map(w => event(calendar, summary, w + weekday, hh, mm, minutes, { uid, instance: String(w), recurring: true, ...extra }))
+  }
 
   const events = [
     // Personnel
@@ -411,6 +414,9 @@
     event(4, 'Shooting produit', 2, 10, 0, 150, { location: 'Studio Nova' }),
     allDay(4, 'Salon Graphisme Lyon', 2, 2, { location: 'Halle Tony Garnier' }),
     event(4, 'Rétro de sprint', 3, 16, 0, 60, { status: 'tentative' }),
+    ...weekly(5, 'Point d\'avancement Lumen', 2, 16, 0, 30, { location: 'https://meet.google.com/lum-enpo-int' }),
+    event(5, 'Lancement projet Lumen', -27, 10, 0, 120, { location: 'Lumen, 12 rue de la République, Lyon', organizer: 'Claire Fontaine <claire@lumen.example>' }),
+    event(5, 'Atelier pistes graphiques Lumen', -12, 14, 0, 90, { location: 'Salle Lumière' }),
     event(5, 'Livraison maquettes Maison Brune', 8, 11, 0, 60),
     event(4, 'Déjeuner d\'équipe', 9, 12, 30, 90, { location: 'Le Comptoir' }),
     // Les Roues Libres

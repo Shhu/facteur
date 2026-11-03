@@ -69,7 +69,13 @@
         },
         sender_key: m.from.email.split('@')[1],
         images_allowed: !m.remote,
-        invite: m.invite ?? null
+        sender_proven: true,
+        own_copy: false,
+        image_hosts: [],
+        blocked_hosts: m.remote ? [m.from.email.split('@')[1]] : [],
+        images_covered: false,
+        invite: m.invite ?? null,
+        appointment: null
       })
       summaries.push(summary)
     })
@@ -383,6 +389,37 @@
     calendar_events: ({ from, to }) => {
       const on = new Set(demo.calendar.calendars.filter(c => c.enabled).map(c => c.id))
       return demo.calendar.events.filter(e => on.has(e.calendar_id) && e.start < to && (e.end > from || (e.end === e.start && e.start >= from)))
+    },
+    // As the engine: accents and case aside, a series is one hit at its next occurrence.
+    search_calendar_events: ({ query: q }) => {
+      const fold = t => (t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      const words = t => fold(t).split(/\s+/).filter(Boolean)
+      const text = words(q.text).filter(w => !w.startsWith('-'))
+      const without = [...words(q.without), ...words(q.text).filter(w => w.startsWith('-')).map(w => w.slice(1)).filter(Boolean)]
+      const who = words(q.who)
+      const place = words(q.place)
+      if (!text.length && !who.length && !place.length) return { hits: [], more: false }
+      const now = Date.now() / 1000
+      const on = new Set(demo.calendar.calendars.filter(c => c.enabled && (!q.calendars.length || q.calendars.includes(c.id))).map(c => c.id))
+      const series = new Map()
+      for (const e of demo.calendar.events) {
+        if (!on.has(e.calendar_id) || (q.from !== null && e.end <= q.from) || (q.to !== null && e.start >= q.to)) continue
+        const people = fold([e.organizer, ...e.attendees.flatMap(a => [a.email, a.name])].join('\n'))
+        const loc = fold(e.location)
+        const all = [fold(e.summary), loc, fold(e.description), people].join('\n')
+        if (!text.every(w => all.includes(w)) || !who.every(w => people.includes(w)) || !place.every(w => loc.includes(w)) || without.some(w => all.includes(w))) continue
+        const key = `${e.calendar_id}\n${e.recurring ? e.uid : e.id}`
+        const hit = series.get(key)
+        if (!hit) series.set(key, { event: e, occurrences: 1 })
+        else {
+          hit.occurrences++
+          if (hit.event.end <= now) hit.event = e
+        }
+      }
+      const hits = [...series.values()]
+      const upcoming = hits.filter(h => h.event.end > now).sort((a, b) => a.event.start - b.event.start)
+      const past = hits.filter(h => h.event.end <= now).sort((a, b) => b.event.start - a.event.start)
+      return { hits: [...upcoming, ...past], more: false }
     },
     set_calendar_enabled: ({ id, enabled }) => {
       const c = demo.calendar.calendars.find(x => x.id === id)

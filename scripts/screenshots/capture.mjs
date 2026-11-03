@@ -59,7 +59,8 @@ const tab = label => async page => {
 
 /** The thread summed up by the local AI. */
 async function summarize(page) {
-  await page.getByRole('button', { name: 'Résumer le fil' }).first().click()
+  await page.getByRole('button', { name: 'IA locale' }).first().click()
+  await page.getByRole('menuitem', { name: 'Résumer le fil' }).first().click()
   const card = page.getByText('Résumé (IA locale)').first()
   await card.waitFor({ timeout: 5000 })
   await card.scrollIntoViewIfNeeded()
@@ -70,6 +71,13 @@ async function summarize(page) {
 const openEvent = title => async (page) => {
   await page.getByText(title, { exact: false }).first().click()
   await page.getByText('Rappel 30 minutes avant').first().waitFor({ timeout: 5000 })
+}
+
+/** A search in the calendar, typed in its field. */
+const searchCalendar = text => async (page) => {
+  await page.keyboard.press('/')
+  await page.keyboard.type(text, { delay: 40 })
+  await page.getByText('À venir').first().waitFor({ timeout: 5000 })
 }
 
 /** `width`: of the webp, in pixels (shots are taken at twice the viewport). */
@@ -88,6 +96,7 @@ const SHOTS = [
   { name: 'calendar-dark', path: '/calendar', scheme: 'dark', width: 1800 },
   { name: 'calendar-light', path: '/calendar', scheme: 'light', width: 1800 },
   { name: 'ai-dark', path: thread(1, 2), scheme: 'dark', steps: [tab('Tout'), summarize], width: 1800 },
+  { name: 'calendar-search-dark', path: '/calendar', scheme: 'dark', steps: [searchCalendar('Lumen')], width: 1800 },
   { name: 'event-dark', path: '/calendar', scheme: 'dark', steps: [openEvent('Présentation identité visuelle Lumen')], width: 1800 },
   { name: 'mobile-inbox-dark', path: '/mail/unified', viewport: MOBILE, scheme: 'dark', steps: [tab('Tout')], width: 780 },
   { name: 'mobile-message-dark', path: thread(4, 2), viewport: MOBILE, scheme: 'dark', width: 780 },
