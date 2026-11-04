@@ -1469,6 +1469,7 @@ dependencies = [
  "mail-auth",
  "mail-parser",
  "minisign-verify",
+ "percent-encoding",
  "psl",
  "rand 0.9.5",
  "reqwest",

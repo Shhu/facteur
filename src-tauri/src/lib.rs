@@ -992,6 +992,55 @@ async fn save_attachment(app: AppHandle, engine: Eng<'_>, id: i64, index: usize,
     Ok(Some(Saved { path, openable }))
 }
 
+/// Saves an image the message shows: in the Downloads folder (a number added to a name already
+/// there), or where the user picks (`ask`).
+#[tauri::command]
+async fn save_image(app: AppHandle, engine: Eng<'_>, id: i64, src: String, ask: bool) -> Res<Option<Saved>> {
+    let (name, data) = on_engine!(engine, |e| e.message_image(id, &src).await)?;
+    let ext = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
+    let path = if ask {
+        let Some(path) = save_as(&app, &name, ("", &[]), data).await? else { return Ok(None) };
+        path
+    } else {
+        let dir = app.path().download_dir().map_err(|e| Error::Other(e.to_string()))?;
+        tauri::async_runtime::spawn_blocking(move || write_new(&dir, &name, &data))
+            .await
+            .map_err(|e| Error::Other(e.to_string()))?
+            .map_err(|e| Error::Other(facteur_core::tr!("enregistrement impossible : {e}", "could not save: {e}")))?
+    };
+    // Opened from facteur only while it still has the image's own extension.
+    let openable = path.to_ascii_lowercase().ends_with(&format!(".{ext}")) && !ext.is_empty();
+    app.state::<SavedFiles>().0.lock().unwrap_or_else(|e| e.into_inner()).insert(path.clone(), openable);
+    Ok(Some(Saved { path, openable }))
+}
+
+/// `name` in `dir`, or `name (2)`, `name (3)`… when taken: an existing file is never replaced.
+fn write_new(dir: &Path, name: &str, data: &[u8]) -> std::io::Result<String> {
+    use std::io::Write;
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) => (stem, format!(".{ext}")),
+        None => (name, String::new()),
+    };
+    std::fs::create_dir_all(dir)?;
+    for n in 1..1000 {
+        let file = if n == 1 { name.to_string() } else { format!("{stem} ({n}){ext}") };
+        let path = dir.join(file);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut f) => {
+                f.write_all(data)?;
+                f.flush()?;
+                drop(f);
+                #[cfg(windows)]
+                mark_of_the_web(&path);
+                return Ok(path.to_string_lossy().into_owned());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other(facteur_core::tr!("trop de fichiers du même nom", "too many files with that name")))
+}
+
 #[derive(serde::Serialize)]
 struct Saved {
     path: String,
@@ -1474,6 +1523,7 @@ pub fn run() {
             sync,
             save_attachment,
             open_saved,
+            save_image,
             inspect_attachment,
             attachment_view,
         ])

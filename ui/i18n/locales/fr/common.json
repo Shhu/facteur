@@ -101,7 +101,12 @@
       "suspicious": "Pièce jointe suspecte",
       "saved": "Pièce jointe enregistrée",
       "open": "Ouvrir",
-      "previewFailed": "Aperçu impossible"
+      "previewFailed": "Aperçu impossible",
+      "imageSaved": "Image enregistrée",
+      "imageFailed": "Image non enregistrée",
+      "showInFolder": "Afficher dans le dossier",
+      "saveImage": "Enregistrer dans Téléchargements",
+      "saveImageAs": "Enregistrer sous…"
     },
     "backup": {
       "incomplete": "Sauvegarde incomplète",

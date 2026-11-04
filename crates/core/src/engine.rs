@@ -2445,6 +2445,25 @@ impl Engine {
         Ok(())
     }
 
+    /// An image the message shows, to save: its file name and bytes. A `data:` image of the body,
+    /// or one of its https images downloaded again; never an address the message does not hold.
+    pub async fn message_image(self: &Arc<Self>, id: i64, src: &str) -> Result<(String, Vec<u8>)> {
+        const MAX_IMAGE: usize = 50 * 1024 * 1024;
+        let detail = self.message(id).await?;
+        let not_found = || Error::Other(crate::tr!("cette image ne fait pas partie du message", "this image is not part of the message"));
+        if src.is_empty() || !html_escape::decode_html_entities(&detail.html).contains(src) {
+            return Err(not_found());
+        }
+        let (hint, data) = if src.starts_with("data:") {
+            ("", crate::attachments::data_url_image(src).ok_or_else(not_found)?)
+        } else {
+            (src, crate::http::get_image(src, MAX_IMAGE).await?)
+        };
+        let name = crate::attachments::image_filename(hint, &data)
+            .ok_or_else(|| Error::Other(crate::tr!("ce n'est pas une image", "this is not an image")))?;
+        Ok((name, data))
+    }
+
     /// Without a usable DKIM verdict from the provider, facteur checks the signatures itself with
     /// already known keys only: looking keys up when the message is opened would tell the sender
     /// when it was read (lookups happen on arrival, see [`Engine::check_dkim`]). A check still under

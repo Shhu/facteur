@@ -1,3 +1,4 @@
+import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { confirm } from '~/composables/useConfirm'
 import type { AttachmentReport } from '~/utils/types'
 
@@ -51,6 +52,28 @@ export function useAttachments() {
     }
   }
 
+  /** `ask`: where to save it is chosen; otherwise the Downloads folder. */
+  async function saveImage(messageId: number, src: string, ask: boolean) {
+    try {
+      const saved = await api.saveImage(messageId, src, ask)
+      if (!saved) return
+      const open = () => api.openSaved(saved.path).catch(showError)
+      const reveal = () => revealItemInDir(saved.path).catch(showError)
+      toast.add({
+        title: tr('common.attachment.imageSaved'),
+        description: saved.path,
+        icon: 'i-lucide-check',
+        ...(saved.openable && { onClick: open, class: 'cursor-pointer' }),
+        actions: [
+          ...(saved.openable ? [{ label: tr('common.attachment.open'), icon: 'i-lucide-external-link', color: 'neutral' as const, variant: 'outline' as const, onClick: open }] : []),
+          { label: tr('common.attachment.showInFolder'), icon: 'i-lucide-folder-open', color: 'neutral' as const, variant: 'outline' as const, onClick: reveal }
+        ]
+      })
+    } catch (e) {
+      showError(e, tr('common.attachment.imageFailed'))
+    }
+  }
+
   async function view(messageId: number, index: number, filename: string, mime: string) {
     const key = `${messageId}:${index}`
     opening.value = key
@@ -81,5 +104,5 @@ export function useAttachments() {
     viewed.value = null
   }
 
-  return { viewed, opening, download, view, close }
+  return { viewed, opening, download, saveImage, view, close }
 }

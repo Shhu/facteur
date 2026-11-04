@@ -101,7 +101,12 @@
       "suspicious": "Suspicious attachment",
       "saved": "Attachment saved",
       "open": "Open",
-      "previewFailed": "Preview unavailable"
+      "previewFailed": "Preview unavailable",
+      "imageSaved": "Image saved",
+      "imageFailed": "Image not saved",
+      "showInFolder": "Show in folder",
+      "saveImage": "Save to Downloads",
+      "saveImageAs": "Save as…"
     },
     "backup": {
       "incomplete": "Backup incomplete",

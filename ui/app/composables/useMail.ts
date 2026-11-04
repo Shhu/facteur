@@ -205,6 +205,8 @@ export const api = {
   /** `openable`: facteur may open the saved file with the system's program (`openSaved`). */
   saveAttachment: (id: number, index: number, confirmed = false) => invoke<{ path: string, openable: boolean } | null>('save_attachment', { id, index, confirmed }),
   openSaved: (path: string) => invoke<void>('open_saved', { path }),
+  /** An image the message shows (`src` as written in it): to Downloads, or where the user picks (`ask`). */
+  saveImage: (id: number, src: string, ask: boolean) => invoke<{ path: string, openable: boolean } | null>('save_image', { id, src, ask }),
   inspectAttachment: (id: number, index: number) => invoke<AttachmentReport>('inspect_attachment', { id, index }),
   /** Bytes to display, with the type sniffed from the content by the engine (never the sender's
    *  declared type). The response is framed as [n][n bytes of ASCII MIME][content]. */

@@ -502,9 +502,69 @@ pub fn view_mime(filename: &str, data: &[u8]) -> Option<&'static str> {
     inspect(filename, "", data, None).view_mime
 }
 
+/// The kind of image these bytes hold, as a file extension; `None`: not an image.
+fn image_extension(data: &[u8]) -> Option<&'static str> {
+    use image::ImageFormat as F;
+    match image::guess_format(data).ok() {
+        Some(F::Png) => Some("png"),
+        Some(F::Jpeg) => Some("jpg"),
+        Some(F::Gif) => Some("gif"),
+        Some(F::WebP) => Some("webp"),
+        Some(F::Bmp) => Some("bmp"),
+        Some(F::Ico) => Some("ico"),
+        Some(F::Avif) => Some("avif"),
+        Some(F::Tiff) => Some("tiff"),
+        _ => {
+            let head = String::from_utf8_lossy(&data[..data.len().min(1024)]).to_ascii_lowercase();
+            head.contains("<svg").then_some("svg")
+        }
+    }
+}
+
+/// The file an image of a message is saved as: named after its address (`hint`, the last part of
+/// its path), else "image", with the extension of what it really is. `None`: not an image.
+pub fn image_filename(hint: &str, data: &[u8]) -> Option<String> {
+    let ext = image_extension(data)?;
+    let last = hint.split(['?', '#']).next().unwrap_or("").rsplit('/').next().unwrap_or("");
+    let decoded = percent_encoding::percent_decode_str(last).decode_utf8_lossy();
+    let name = safe_filename(&decoded);
+    let stem = match name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => name.as_str(),
+    };
+    let stem = if stem.is_empty() { "image" } else { stem };
+    Some(safe_filename(&format!("{stem}.{ext}")))
+}
+
+/// The bytes of a `data:` image (base64); `None` for anything else.
+pub fn data_url_image(src: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    let (head, data) = src.strip_prefix("data:")?.split_once(',')?;
+    if !head.to_ascii_lowercase().starts_with("image/") || !head.to_ascii_lowercase().ends_with(";base64") {
+        return None;
+    }
+    let clean: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD.decode(clean).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mail_images_are_named_after_their_content() {
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+        let jpeg = b"\xff\xd8\xff\xe0\0\x10JFIF";
+        assert_eq!(super::image_filename("https://cdn.example/a/photo%20plage.PNG?w=600#x", jpeg).as_deref(), Some("photo plage.jpg"), "the content decides");
+        assert_eq!(super::image_filename("https://cdn.example/track/", png).as_deref(), Some("image.png"));
+        assert_eq!(super::image_filename("", png).as_deref(), Some("image.png"));
+        assert_eq!(super::image_filename("https://x.example/..%2F..%2Fevil.exe", png).as_deref(), Some("evil.png"), "no folder, no program");
+        assert_eq!(super::image_filename("https://x.example/logo", b"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\"/>").as_deref(), Some("logo.svg"));
+        assert_eq!(super::image_filename("https://x.example/a.png", b"<html>not an image</html>"), None);
+        assert_eq!(super::data_url_image("data:image/png;base64,iVBO\nRw=="), Some(vec![0x89, 0x50, 0x4e, 0x47]));
+        assert_eq!(super::data_url_image("data:text/html;base64,PGI+"), None);
+        assert_eq!(super::data_url_image("https://x.example/a.png"), None);
+    }
 
     #[test]
     fn long_program_extensions_are_recognised() {

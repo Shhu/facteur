@@ -63,6 +63,26 @@ pub async fn post_one_click(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// A remote image of a message, downloaded again to be saved.
+pub async fn get_image(url: &str, max: usize) -> Result<Vec<u8>> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| Error::Other(e.to_string()))?;
+    if !allowed(&parsed) {
+        return Err(Error::Other(crate::tr!("image refusée (https et adresse publique exigés)", "image rejected (https and a public address are required)")));
+    }
+    let response = client(true)?
+        .get(parsed)
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        // Without the URL: it may carry the recipient's tracking token, and the error ends up in the log.
+        .map_err(|e| Error::Other(crate::tr!("image injoignable : {}", "image unreachable: {}", e.without_url())))?;
+    if response.content_length().is_some_and(|n| n as usize > max) {
+        return Err(Error::Other(crate::tr!("image trop volumineuse", "image too large")));
+    }
+    read_capped(response, max).await
+}
+
 /// Creation date of a domain from RDAP (rdap.org redirects to the domain's registry). Only the
 /// domain name is sent.
 pub async fn domain_registered(domain: &str) -> Result<Option<i64>> {

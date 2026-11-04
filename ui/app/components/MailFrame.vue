@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import type { ContextMenuItem } from '@nuxt/ui'
 import type { LinkReport } from '~/utils/types'
 
 /** `cautious`: untrustworthy message, every link asks first. `messageId`: a cached message,
@@ -394,6 +395,14 @@ function prepare(doc: Document) {
       // A mark that cannot be placed never keeps the message from showing.
     }
   }
+  // A shown image of a cached message: its own menu (save it), placed where the click was.
+  doc.addEventListener('contextmenu', (e) => {
+    const img = (e.target as Element | null)?.closest('img') as HTMLImageElement | null
+    const src = img?.getAttribute('src') ?? ''
+    if (props.messageId === undefined || !img || !img.complete || !img.naturalWidth || !/^(?:data:image\/|https:)/i.test(src)) return
+    e.preventDefault()
+    openImageMenu(src, e.clientX, e.clientY)
+  })
   observer = new ResizeObserver(() => fitHeight(doc))
   observer.observe(doc.documentElement)
   fitHeight(doc)
@@ -530,6 +539,29 @@ onBeforeUnmount(() => {
 
 const openLink = useOpenLink()
 
+const { saveImage } = useAttachments()
+const box = useTemplateRef<HTMLElement>('box')
+const menuImage = ref<string | null>(null)
+const imageMenu = computed<ContextMenuItem[]>(() => {
+  const src = menuImage.value
+  const id = props.messageId
+  if (!src || id === undefined) return []
+  return [
+    { label: t('common.attachment.saveImage'), icon: 'i-lucide-download', onSelect: () => saveImage(id, src, false) },
+    { label: t('common.attachment.saveImageAs'), icon: 'i-lucide-folder-down', onSelect: () => saveImage(id, src, true) }
+  ]
+})
+/** The frame's events stay in its document: the menu around it is opened by the same click, in
+ *  the window's coordinates. Not bubbling: the window's own handler would cancel it (no browser
+ *  menu), and the menu opens only for an event left uncancelled. */
+async function openImageMenu(src: string, x: number, y: number) {
+  menuImage.value = src
+  await nextTick()
+  const r = frame.value?.getBoundingClientRect()
+  if (!r) return
+  box.value?.dispatchEvent(new MouseEvent('contextmenu', { cancelable: true, clientX: r.left + x, clientY: r.top + y }))
+}
+
 onBeforeUnmount(() => observer?.disconnect())
 </script>
 
@@ -546,22 +578,24 @@ onBeforeUnmount(() => observer?.disconnect())
     @leave="scheduleHide"
     @close="hide"
   />
-  <div v-bind="$attrs" class="relative">
-    <!-- An HTML mail sees a light page: its own dark-mode rules (Google Calendar has some) would
-         otherwise apply in a dark app, and facteur's inversion then turn their light text dark. -->
-    <iframe
-      ref="frame"
-      sandbox="allow-same-origin"
-      :srcdoc="srcdoc"
-      :style="{ height: `${height}px`, colorScheme: plain ? undefined : 'light' }"
-      class="block w-full rounded-md border-0"
-      :class="[plain || darken ? '' : 'bg-white', ready ? '' : 'opacity-0']"
-      :title="$t('mail.mailFrame.frameTitle')"
-      @load="onLoad"
-    />
-    <div v-if="!ready && slow" class="pointer-events-none absolute inset-0 flex items-center justify-center" role="status">
-      <UIcon name="i-lucide-loader-circle" class="size-5 animate-spin text-muted" />
-      <span class="sr-only">{{ $t('mail.mailFrame.loading') }}</span>
+  <UContextMenu :items="imageMenu" :disabled="!menuImage" @update:open="(open: boolean) => { if (!open) menuImage = null }">
+    <div ref="box" v-bind="$attrs" class="relative">
+      <!-- An HTML mail sees a light page: its own dark-mode rules (Google Calendar has some) would
+           otherwise apply in a dark app, and facteur's inversion then turn their light text dark. -->
+      <iframe
+        ref="frame"
+        sandbox="allow-same-origin"
+        :srcdoc="srcdoc"
+        :style="{ height: `${height}px`, colorScheme: plain ? undefined : 'light' }"
+        class="block w-full rounded-md border-0"
+        :class="[plain || darken ? '' : 'bg-white', ready ? '' : 'opacity-0']"
+        :title="$t('mail.mailFrame.frameTitle')"
+        @load="onLoad"
+      />
+      <div v-if="!ready && slow" class="pointer-events-none absolute inset-0 flex items-center justify-center" role="status">
+        <UIcon name="i-lucide-loader-circle" class="size-5 animate-spin text-muted" />
+        <span class="sr-only">{{ $t('mail.mailFrame.loading') }}</span>
+      </div>
     </div>
-  </div>
+  </UContextMenu>
 </template>
