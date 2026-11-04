@@ -65,6 +65,21 @@ export function withoutSignature(html: string, legacy = ''): string {
   return legacy ? html.replace(legacy, '') : html
 }
 
+/** What the writer typed: the draft without its signature, nor the quoted or forwarded message
+ *  below. */
+export function ownPart(html: string, legacy = ''): string {
+  const doc = new DOMParser().parseFromString(withoutSignature(html, legacy), 'text/html')
+  const start = quotedStart(doc.body)
+  if (start) {
+    for (let el: Element | null = start; el;) {
+      const next: Element | null = el.nextElementSibling
+      el.remove()
+      el = next
+    }
+  }
+  return doc.body.innerHTML
+}
+
 /** Without a signature block, falls back to the previous signature's exact HTML; with no previous
  *  signature, the new one goes above the quoted message, else at the end (never above what was
  *  typed). */
@@ -248,7 +263,10 @@ export function useComposer() {
 
   async function resume(messageId: number) {
     try {
-      await reopen(await api.openDraft(messageId))
+      const d = await api.openDraft(messageId)
+      // Already in the window: kept as it is, newer than its last save.
+      if (open.value && d.draft_id && draft.value?.draft_id === d.draft_id) return
+      await reopen(d)
     } catch (e) {
       showError(e, tr('common.toast.draftUnreadable'))
     }

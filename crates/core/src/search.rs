@@ -202,7 +202,8 @@ mod tests {
         assert_eq!(q.from, ["marie"]);
         assert_eq!(q.subject, ["facture mars"]);
         assert!(q.has_attachment && q.unread == Some(true));
-        assert!(q.before.is_some() && q.after.is_none());
+        // Midnight of 1 March in Paris (the tests run there), not of 3 January.
+        assert_eq!((q.before, q.after), (Some(1_772_319_600), None));
         assert_eq!(q.folder.as_deref(), Some("envoyés"));
         assert_eq!(q.words, ["devis", "10:30"]);
         assert_eq!(folder_role("Envoyés"), Some(crate::model::Role::Sent));
@@ -236,7 +237,7 @@ mod tests {
     #[test]
     fn two_digit_years_are_this_century() {
         let march = day("2026-03-01");
-        assert!(march.is_some());
+        assert_eq!(march, Some(1_772_319_600));
         assert_eq!(parse("après:1/3/26").after, march);
         assert_eq!(parse("avant:01/03/26").before, march);
         assert_eq!(parse("avant:01/03/2026").before, march);

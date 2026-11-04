@@ -560,12 +560,12 @@ tokio::task_local! {
     static ACTIVITY: std::sync::Arc<std::sync::atomic::AtomicU64>;
 }
 
+/// The deadline moves on at every batch, so a first sync of a large folder is never cut short
+/// while it advances.
 fn alive() {
     let _ = ACTIVITY.try_with(|a| a.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
 }
 
-/// The deadline moves on at every batch, so a first sync of a large folder is never cut short
-/// while it advances.
 /// The messages gone since the last sync, and those that arrived after the SELECT (at or above
 /// its UIDNEXT, found by the search that followed): in no count the SELECT gave.
 fn arrival_counts(cached: i64, arrived: &HashSet<u32>, uid_next: Option<u32>, exists: u32) -> (i64, i64) {
@@ -1073,7 +1073,7 @@ async fn refresh_flags(
     // folder is taken as read as far as it goes (until a restart).
     // Only full reads count, in a row: a whole one starts the count over, and a partial
     // CHANGEDSINCE read always asks for a full one.
-    let given_up = full.is_some() && partial_full_reads(state.id, whole) >= PARTIAL_FULL_READS;
+    let given_up = full_reads_given_up(state.id, full.is_some(), whole);
     if !whole && !given_up {
         force_full_flags(state.id);
     }
@@ -1103,6 +1103,12 @@ async fn refresh_flags(
 
 /// Full flag reads of a folder in a row that came back partial before it is taken as read.
 const PARTIAL_FULL_READS: u8 = 3;
+
+/// After this read (`full`: of the whole folder; `whole`: every message answered), the folder is
+/// taken as read as far as it goes. Only full reads count.
+fn full_reads_given_up(mailbox_id: i64, full: bool, whole: bool) -> bool {
+    full && partial_full_reads(mailbox_id, whole) >= PARTIAL_FULL_READS
+}
 
 /// A full flag read of the folder: the count of those in a row that came back partial (0 once
 /// one came back whole).
@@ -2189,11 +2195,16 @@ mod tests {
     }
 
     #[test]
-    fn partial_full_reads_count_in_a_row() {
+    fn a_folder_always_answered_in_part_is_given_up_after_three_full_reads() {
         let folder = -77;
-        assert_eq!((partial_full_reads(folder, false), partial_full_reads(folder, false)), (1, 2));
-        assert_eq!(partial_full_reads(folder, true), 0, "a whole read starts over");
-        assert_eq!(partial_full_reads(folder, false), 1);
+        // Two full reads come back partial: read again. The third: taken as read as far as it goes.
+        assert!(!full_reads_given_up(folder, true, false) && !full_reads_given_up(folder, true, false));
+        assert!(!full_reads_given_up(folder, false, false), "a partial CHANGEDSINCE read does not count");
+        assert!(full_reads_given_up(folder, true, false));
+        // A whole read starts over: three partial ones again before giving up.
+        assert!(!full_reads_given_up(folder, true, true));
+        assert!(!full_reads_given_up(folder, true, false) && !full_reads_given_up(folder, true, false));
+        assert!(full_reads_given_up(folder, true, false));
     }
 
     #[test]
@@ -2301,7 +2312,7 @@ mod tests {
         // and the search.
         let arrived = HashSet::from([11, 12]);
         assert_eq!(arrival_counts(10, &arrived, Some(12), 11), (0, 1), "nothing gone, one late");
-        // Saved as EXISTS + 1 = 12: a deletion on the phone next is seen (EXISTS 11 against 12).
+        // 11 arrived while one of the 10 was deleted elsewhere (EXISTS 10): one gone, none late.
         assert_eq!(arrival_counts(10, &HashSet::from([11]), Some(12), 10), (1, 0), "one gone meanwhile");
     }
 
@@ -2429,7 +2440,10 @@ mod tests {
 
     #[test]
     fn periodic_checks_are_remembered_across_launches() {
-        let (s, id) = store_with_folder();
+        let (s, inbox) = store_with_folder();
+        // The checks are kept per folder id for the whole test run: an id no other test uses.
+        let id = 7_000_431;
+        s.renumber_mailbox(inbox, id).unwrap();
         let t = due(&s, FULL_LIST, id, 3600).expect("never run: due");
         done(&s, t);
         // A new launch: the process-wide map starts empty, the base remembers.

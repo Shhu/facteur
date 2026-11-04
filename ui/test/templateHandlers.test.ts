@@ -16,7 +16,10 @@ describe('template event handlers', () => {
     // `@update="htmlFor(session)"` runs htmlFor at each event and drops the handler it returns:
     // the composer's text never reached the draft that way.
     const found: string[] = []
-    for (const file of vueFiles(join(__dirname, '..', 'app'))) {
+    const files = vueFiles(join(__dirname, '..', 'app'))
+    // The components moved elsewhere: this would check nothing.
+    expect(files.some(f => f.endsWith('Composer.vue'))).toBe(true)
+    for (const file of files) {
       const source = readFileSync(file, 'utf8')
       const curried = [...source.matchAll(/const (\w+) = \([^)]*\)\s*=>\s*\(/g)].map(m => m[1]!)
       for (const name of curried) {

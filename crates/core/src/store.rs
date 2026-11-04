@@ -713,6 +713,13 @@ CREATE TABLE images_shown (
     PRIMARY KEY (account_id, message_id)
 );
 "#,
+    // The last id given out per table (`next_id`): a deleted row's id is never given again.
+    r#"
+CREATE TABLE id_floors (
+    name TEXT PRIMARY KEY,
+    id   INTEGER NOT NULL
+);
+"#,
 ];
 
 /// A move into folder ?1 still on its way. With Gmail's labels, a move out of the bin or spam
@@ -960,6 +967,48 @@ impl Boxes {
 /// Message `alias` is in a folder matching `cond` (on `rb`, a `mailboxes` row): its own folder,
 /// or one of its labels. Written as one list of ids: an OR of the two would have SQLite walk the
 /// whole account instead of the folders' index.
+/// A message moved here, waiting for its UID: `?1` the folder, `?2` the Message-ID, `?3` the
+/// account, `?4` the size, `?5` the date, `?6` the sender.
+const ADOPT_PLACEHOLDER: &str = "SELECT id FROM messages WHERE account_id = ?3 AND message_id = ?2 AND mailbox_id = ?1 AND uid IS NULL
+       AND date = ?5 AND from_addr IS ?6
+     ORDER BY size = ?4 DESC, id LIMIT 1";
+
+/// [`Store::list_mailboxes`]: `?1` the account.
+const LIST_MAILBOXES: &str = "SELECT b.id, b.account_id, b.name, b.delimiter, b.role, b.selectable,
+            (SELECT COUNT(*) FROM messages m WHERE m.mailbox_id = b.id AND m.seen = 0)
+              - (SELECT COUNT(*) FROM messages m WHERE m.unscreened = 1 AND m.mailbox_id = b.id AND m.seen = 0)
+              + (SELECT COUNT(*) FROM labels l JOIN messages m ON m.id = l.message_id WHERE l.mailbox_id = b.id AND m.seen = 0 AND m.unscreened = 0),
+            (SELECT COUNT(*) FROM messages m WHERE m.mailbox_id = b.id)
+              + (SELECT COUNT(*) FROM labels l WHERE l.mailbox_id = b.id),
+            b.server_count, b.count_base,
+            (SELECT COUNT(*) FROM (SELECT thread_id FROM messages WHERE mailbox_id = b.id
+                                   UNION SELECT m.thread_id FROM labels l JOIN messages m ON m.id = l.message_id
+                                         WHERE l.mailbox_id = b.id)),
+            (SELECT COUNT(*) FROM (SELECT thread_id FROM messages WHERE mailbox_id = b.id AND seen = 0 AND unscreened = 0
+                                   UNION SELECT m.thread_id FROM labels l JOIN messages m ON m.id = l.message_id
+                                         WHERE l.mailbox_id = b.id AND m.seen = 0 AND m.unscreened = 0)),
+            b.is_label
+     FROM mailboxes b
+     WHERE b.account_id = ?1
+     ORDER BY CASE b.role
+         WHEN 'inbox' THEN 0 WHEN 'screener' THEN 1 WHEN 'flagged' THEN 2 WHEN 'snoozed' THEN 3
+         WHEN 'drafts' THEN 4 WHEN 'sent' THEN 5 WHEN 'archive' THEN 6 WHEN 'all' THEN 7
+         WHEN 'refused' THEN 8 WHEN 'junk' THEN 9 WHEN 'trash' THEN 10 ELSE 11 END, b.name";
+
+/// [`Store::inbox_from_blocked`]: `?1` the account.
+fn inbox_from_blocked_sql() -> String {
+    format!(
+        "SELECT m.id FROM blocked_senders s
+         CROSS JOIN messages m ON lower(m.from_addr) = lower(s.email) AND m.account_id = ?1
+         WHERE {} AND m.uid IS NOT NULL",
+        in_folder_where("m", "rb.account_id = ?1 AND rb.role = 'inbox'")
+    )
+}
+
+/// [`Store::latest_from_many`]: `?1` the addresses, a JSON array.
+const LATEST_FROM_MANY: &str = "SELECT j.value, (SELECT m.id FROM messages m WHERE lower(m.from_addr) = lower(j.value) ORDER BY m.date DESC LIMIT 1)
+     FROM json_each(?1) j";
+
 fn in_folder_where(alias: &str, cond: &str) -> String {
     format!(
         "{alias}.id IN (SELECT x.id FROM messages x WHERE x.mailbox_id IN (SELECT rb.id FROM mailboxes rb WHERE {cond}) \
@@ -1424,6 +1473,13 @@ impl Store {
     }
 
     #[track_caller]
+    /// Tests sharing process-wide state by folder id: a folder of their own, out of the others' range.
+    #[cfg(test)]
+    pub(crate) fn renumber_mailbox(&self, from: i64, to: i64) -> Result<()> {
+        self.db().execute("UPDATE mailboxes SET id = ?2 WHERE id = ?1", [from, to])?;
+        Ok(())
+    }
+
     fn db(&self) -> Conn<'_> {
         let (started, at) = (std::time::Instant::now(), std::panic::Location::caller());
         // A panic mid-query leaves the connection consistent (SQLite rolls the transaction back),
@@ -1484,20 +1540,24 @@ impl Store {
     // ── Accounts ───────────────────────────────────────────────────────────
 
     pub fn insert_account(&self, a: &NewAccount) -> Result<i64> {
-        let db = self.db();
-        db.execute(
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        let id = next_id(&tx, "accounts")?;
+        tx.execute(
             "INSERT INTO accounts (name, email, username, imap_host, imap_port, imap_security,
-                                   smtp_host, smtp_port, smtp_security, auth, oauth_provider)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                   smtp_host, smtp_port, smtp_security, auth, oauth_provider, id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 a.name, a.email, a.username,
                 a.imap.host, a.imap.port, a.imap.security.as_str(),
                 a.smtp.host, a.smtp.port, a.smtp.security.as_str(),
                 match a.auth { NewAuth::Password => "password", NewAuth::OAuth2 { .. } => "oauth2" },
                 match &a.auth { NewAuth::Password => None, NewAuth::OAuth2 { provider, .. } => Some(provider.as_str()) },
+                id,
             ],
         )?;
-        Ok(db.last_insert_rowid())
+        tx.commit()?;
+        Ok(id)
     }
 
     pub fn list_accounts(&self) -> Result<Vec<Account>> {
@@ -1921,28 +1981,7 @@ impl Store {
         // narrowest index on mailbox_id. No pass over the rows of the whole account. A label's
         // messages are counted through the labels table. Arrivals the screener has not seen yet
         // are not counted as unread: shown, then filed away, they would make the count jump.
-        let mut st = db.prepare(
-            "SELECT b.id, b.account_id, b.name, b.delimiter, b.role, b.selectable,
-                    (SELECT COUNT(*) FROM messages m WHERE m.mailbox_id = b.id AND m.seen = 0)
-                      - (SELECT COUNT(*) FROM messages m WHERE m.unscreened = 1 AND m.mailbox_id = b.id AND m.seen = 0)
-                      + (SELECT COUNT(*) FROM labels l JOIN messages m ON m.id = l.message_id WHERE l.mailbox_id = b.id AND m.seen = 0 AND m.unscreened = 0),
-                    (SELECT COUNT(*) FROM messages m WHERE m.mailbox_id = b.id)
-                      + (SELECT COUNT(*) FROM labels l WHERE l.mailbox_id = b.id),
-                    b.server_count, b.count_base,
-                    (SELECT COUNT(*) FROM (SELECT thread_id FROM messages WHERE mailbox_id = b.id
-                                           UNION SELECT m.thread_id FROM labels l JOIN messages m ON m.id = l.message_id
-                                                 WHERE l.mailbox_id = b.id)),
-                    (SELECT COUNT(*) FROM (SELECT thread_id FROM messages WHERE mailbox_id = b.id AND seen = 0 AND unscreened = 0
-                                           UNION SELECT m.thread_id FROM labels l JOIN messages m ON m.id = l.message_id
-                                                 WHERE l.mailbox_id = b.id AND m.seen = 0 AND m.unscreened = 0)),
-                    b.is_label
-             FROM mailboxes b
-             WHERE b.account_id = ?1
-             ORDER BY CASE b.role
-                 WHEN 'inbox' THEN 0 WHEN 'screener' THEN 1 WHEN 'flagged' THEN 2 WHEN 'snoozed' THEN 3
-                 WHEN 'drafts' THEN 4 WHEN 'sent' THEN 5 WHEN 'archive' THEN 6 WHEN 'all' THEN 7
-                 WHEN 'refused' THEN 8 WHEN 'junk' THEN 9 WHEN 'trash' THEN 10 ELSE 11 END, b.name",
-        )?;
+        let mut st = db.prepare(LIST_MAILBOXES)?;
         let rows = st
             .query_map([account_id], |r| {
                 let name: String = r.get(2)?;
@@ -3003,11 +3042,7 @@ fn insert_header_tx(
             // (`drop_orphan_placeholders`); adopting another message's UID would show one under
             // the other's header and body.
             let placeholder: Option<i64> = tx
-                .prepare_cached(
-                    "SELECT id FROM messages WHERE account_id = ?3 AND message_id = ?2 AND mailbox_id = ?1 AND uid IS NULL
-                       AND date = ?5 AND from_addr IS ?6
-                     ORDER BY size = ?4 DESC, id LIMIT 1",
-                )?
+                .prepare_cached(ADOPT_PLACEHOLDER)?
                 .query_row(params![mailbox_id, mid, account_id, size, h.date, from_addr], |r| r.get(0))
                 .optional()?;
             if let Some(id) = placeholder {
@@ -3025,20 +3060,20 @@ fn insert_header_tx(
             Some(a) => (a.name.clone(), Some(a.email.clone())),
             None => (None, None),
         };
+        let id = next_id(tx, "messages")?;
         tx.execute(
             "INSERT INTO messages (account_id, mailbox_id, uid, message_id, in_reply_to, refs, subject,
                                    from_name, from_addr, to_list, cc_list, date, size,
-                                   seen, flagged, answered, draft, received_at, bulk, signals, list_id, category)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                                   seen, flagged, answered, draft, received_at, bulk, signals, list_id, category, id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             params![
                 account_id, mailbox_id, uid, h.message_id, h.in_reply_to, h.references.join(" "),
                 h.subject, from_name, from_addr,
                 serde_json::to_string(&h.to)?, serde_json::to_string(&h.cc)?,
                 h.date, size, flags.seen, flags.flagged, flags.answered, flags.draft, h.received_at, h.bulk,
-                serde_json::to_string(&h.signals)?, h.list_id, category_of(tx, account_id, h)?.as_str(),
+                serde_json::to_string(&h.signals)?, h.list_id, category_of(tx, account_id, h)?.as_str(), id,
             ],
         )?;
-        let id = tx.last_insert_rowid();
         {
             let mut st = tx.prepare_cached("INSERT INTO message_refs (account_id, ref, message_id) VALUES (?1, ?2, ?3)")?;
             for r in thread_refs(h) {
@@ -3560,12 +3595,7 @@ impl Store {
         let db = self.read();
         // From the (few) blocked addresses into the messages_from_lc index (CROSS JOIN keeps
         // that order): never a scan of the whole inbox, run after every sync.
-        let mut st = db.prepare_cached(&format!(
-            "SELECT m.id FROM blocked_senders s
-             CROSS JOIN messages m ON lower(m.from_addr) = lower(s.email) AND m.account_id = ?1
-             WHERE {} AND m.uid IS NOT NULL",
-            in_folder_where("m", "rb.account_id = ?1 AND rb.role = 'inbox'")
-        ))?;
+        let mut st = db.prepare_cached(&inbox_from_blocked_sql())?;
         let rows = st.query_map([account_id], |r| r.get(0))?.collect::<Result<_, _>>()?;
         Ok(rows)
     }
@@ -4279,10 +4309,7 @@ impl Store {
             return Ok(HashMap::new());
         }
         let db = self.read();
-        let mut st = db.prepare_cached(
-            "SELECT j.value, (SELECT m.id FROM messages m WHERE lower(m.from_addr) = lower(j.value) ORDER BY m.date DESC LIMIT 1)
-             FROM json_each(?1) j",
-        )?;
+        let mut st = db.prepare_cached(LATEST_FROM_MANY)?;
         let rows = st
             .query_map([serde_json::to_string(emails)?], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)))?
             .filter_map(|r| r.map(|(e, id)| id.map(|id| (e, id))).transpose())
@@ -5234,13 +5261,16 @@ impl Store {
     // ── Outbox ─────────────────────────────────────────────────────────────
 
     pub fn queue_outgoing(&self, draft: &Draft, send_at: i64, scheduled: bool, remind_after: Option<i64>) -> Result<i64> {
-        let db = self.db();
-        db.execute(
-            "INSERT INTO outbox (account_id, draft, send_at, scheduled, remind_after, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![draft.account_id, serde_json::to_string(draft)?, send_at, scheduled, remind_after, now()],
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        let id = next_id(&tx, "outbox")?;
+        tx.execute(
+            "INSERT INTO outbox (id, account_id, draft, send_at, scheduled, remind_after, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, draft.account_id, serde_json::to_string(draft)?, send_at, scheduled, remind_after, now()],
         )?;
-        Ok(db.last_insert_rowid())
+        tx.commit()?;
+        Ok(id)
     }
 
     pub fn outbox(&self) -> Result<Vec<Outgoing>> {
@@ -5582,13 +5612,16 @@ impl Store {
             to: Option<String>,
         }
         let head: Head = serde_json::from_str(op).unwrap_or_default();
-        let db = self.db();
-        db.execute(
-            "INSERT INTO pending_ops (account_id, op, created_at, label, not_before, kind, mailbox, dest, op_size)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, length(?2))",
-            params![account_id, op, now(), label, not_before, head.kind, head.mailbox.or(head.from), head.dest.or(head.to)],
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        let id = next_id(&tx, "pending_ops")?;
+        tx.execute(
+            "INSERT INTO pending_ops (account_id, op, created_at, label, not_before, kind, mailbox, dest, op_size, id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, length(?2), ?9)",
+            params![account_id, op, now(), label, not_before, head.kind, head.mailbox.or(head.from), head.dest.or(head.to), id],
         )?;
-        Ok(db.last_insert_rowid())
+        tx.commit()?;
+        Ok(id)
     }
 
     /// Queued moves into `dest` become permanent deletes at the source, replayed at once (the
@@ -5812,7 +5845,8 @@ impl Store {
         Ok(())
     }
 
-    /// A server refusal: counted; beyond `max` the operation becomes failed.
+    /// A failed try that is no refusal (the connection cut, the server out of reach): counted;
+    /// beyond `max` the operation becomes failed.
     /// `true` when it has just become failed: its folders should then be read again in full
     /// (`op_folders`, `sync::recheck_op_folders`).
     pub fn fail_op(&self, id: i64, error: &str, max: i64) -> Result<bool> {
@@ -6079,9 +6113,10 @@ fn queue_pending_flags(tx: &Transaction, id: i64, server: Option<ServerFlags>) -
             continue;
         }
         let op = crate::ops::Op::Store { mailbox: mailbox.clone(), uid, flag: kind.imap().into(), value, uidvalidity };
+        let op_id = next_id(tx, "pending_ops")?;
         tx.execute(
-            "INSERT INTO pending_ops (account_id, op, created_at, label, kind, mailbox, op_size) VALUES (?1, ?2, ?3, ?4, 'store', ?5, length(?2))",
-            params![account_id, serde_json::to_string(&op)?, now(), crate::i18n::both(|| crate::tr!("Drapeau changé pendant un déplacement", "Flag changed during a move")), mailbox],
+            "INSERT INTO pending_ops (account_id, op, created_at, label, kind, mailbox, op_size, id) VALUES (?1, ?2, ?3, ?4, 'store', ?5, length(?2), ?6)",
+            params![account_id, serde_json::to_string(&op)?, now(), crate::i18n::both(|| crate::tr!("Drapeau changé pendant un déplacement", "Flag changed during a move")), mailbox, op_id],
         )?;
     }
     tx.execute("UPDATE messages SET pending_flags = NULL WHERE id = ?1", [id])?;
@@ -6373,6 +6408,23 @@ fn local_day(ts: i64) -> i64 {
 
 /// The longest a zone is ahead of or behind UTC (whole-day events read in the local zone).
 const MAX_ZONE_OFFSET: i64 = 14 * 3600;
+
+/// An id for a new row of `table` (`messages`, `outbox`, `pending_ops`, `accounts`, `calendars`)
+/// never given before. SQLite hands the
+/// highest id out again once its row is deleted: a draft replaced, then sent, left its id to the
+/// reply arriving next, and everything kept by id (the interface's messages, a body downloaded)
+/// showed the draft under the reply.
+fn next_id(db: &Connection, table: &'static str) -> Result<i64> {
+    Ok(db.query_row(
+        &format!(
+            "INSERT INTO id_floors (name, id) VALUES (?1, (SELECT COALESCE(MAX(id), 0) FROM {table}) + 1)
+             ON CONFLICT (name) DO UPDATE SET id = MAX(id_floors.id + 1, excluded.id)
+             RETURNING id"
+        ),
+        [table],
+        |r| r.get(0),
+    )?)
+}
 /// Events a calendar search gives at most, as Google Calendar.
 const EVENT_SEARCH_LIMIT: usize = 200;
 
@@ -6623,15 +6675,17 @@ impl Store {
         let mut changed = false;
         {
             let mut upsert = tx.prepare(
-                "INSERT INTO calendars (account_id, remote_id, name, color, source, enabled, read_only)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "INSERT INTO calendars (account_id, remote_id, name, color, source, enabled, read_only, id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT (account_id, remote_id) DO UPDATE SET
                      name = excluded.name, color = excluded.color, source = excluded.source, read_only = excluded.read_only
                  WHERE name IS NOT excluded.name OR color IS NOT excluded.color OR source IS NOT excluded.source
                      OR read_only IS NOT excluded.read_only",
             )?;
             for c in list {
-                changed |= upsert.execute(params![account_id, c.remote_id, c.name, c.color, source.as_str(), c.enabled, c.read_only])? > 0;
+                // Taken only by a calendar new here: one already known keeps its id.
+                let id = next_id(&tx, "calendars")?;
+                changed |= upsert.execute(params![account_id, c.remote_id, c.name, c.color, source.as_str(), c.enabled, c.read_only, id])? > 0;
             }
             let keep: HashSet<&str> = list.iter().map(|c| c.remote_id.as_str()).collect();
             let mut st = tx.prepare("SELECT id, remote_id FROM calendars WHERE account_id = ?1")?;
@@ -7043,6 +7097,31 @@ mod tests {
         assert!(s.refuse_op(op, "NO busy", 5).unwrap(), "the fifth refusal is");
     }
 
+    thread_local! {
+        static COMMITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// From now on, the transactions the writer commits on this thread (the store's calls run on
+    /// the caller's): work in steps commits once per step.
+    fn count_commits(s: &Store) {
+        use rusqlite::trace::{TraceEvent, TraceEventCodes};
+        COMMITS.with(|c| c.set(0));
+        s.db().trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(|event: TraceEvent<'_>| {
+                if let TraceEvent::Stmt(_, sql) = event
+                    && sql.trim().eq_ignore_ascii_case("COMMIT")
+                {
+                    COMMITS.with(|c| c.set(c.get() + 1));
+                }
+            }),
+        );
+    }
+
+    fn commits() -> usize {
+        COMMITS.with(std::cell::Cell::get)
+    }
+
     #[test]
     fn a_large_folder_goes_in_steps_its_bodies_kept_for_copies_elsewhere() {
         let (s, acc, inbox, sent) = setup();
@@ -7055,10 +7134,13 @@ mod tests {
         let copy = s.insert_header(acc, sent, 1, &header("k@x", None, "Gardé", 2), FLAGS, 10).unwrap();
         let raw = b"Subject: Garde\r\n\r\nBonjour";
         s.store_body(kept, raw, &crate::mime::body_info(raw)).unwrap();
+        count_commits(&s);
         assert_eq!(s.purge_local(archive).unwrap(), n as usize + 1);
+        assert!(commits() >= 3, "{} rows in {} transactions", n + 1, commits());
         assert!(s.mailbox_message_ids(archive).unwrap().is_empty());
         assert_eq!(s.body(copy).unwrap().as_deref(), Some(&raw[..]), "the body passed to the copy that stays");
-        assert_eq!(s.mailbox_message_ids(inbox).unwrap().len(), 0);
+        assert_eq!(s.mailbox_message_ids(sent).unwrap(), [copy]);
+        assert!(s.mailbox_message_ids(inbox).unwrap().is_empty());
     }
 
     #[test]
@@ -7242,6 +7324,23 @@ mod tests {
         let inbox = s.upsert_mailbox(acc, "INBOX", Some("/"), Some(Role::Inbox), true).unwrap();
         let sent = s.upsert_mailbox(acc, "Sent", Some("/"), Some(Role::Sent), true).unwrap();
         (s, acc, inbox, sent)
+    }
+
+    #[test]
+    fn a_deleted_message_leaves_its_id_to_nobody() {
+        let (s, acc, inbox, _) = setup();
+        let drafts = s.upsert_mailbox(acc, "Drafts", Some("/"), Some(Role::Drafts), true).unwrap();
+        let old = s.insert_header(acc, inbox, 1, &header("old@x", None, "Avant", 5), FLAGS, 10).unwrap();
+        // A draft saved last, then sent: its row goes; the reply arriving next is another message.
+        let draft = s.insert_header(acc, drafts, 1, &header("draft@x", None, "Brouillon", 6), FLAGS, 10).unwrap();
+        s.delete_message(draft).unwrap();
+        let reply = s.insert_header(acc, inbox, 2, &header("reply@x", None, "Réponse", 7), FLAGS, 10).unwrap();
+        assert!(reply > draft && draft > old, "{old} {draft} {reply}");
+        // Waiting to be sent, then sent or cancelled: the next one has its own id too.
+        let draft = Draft { account_id: acc, ..Default::default() };
+        let first = s.queue_outgoing(&draft, 100, false, None).unwrap();
+        s.db().execute("DELETE FROM outbox WHERE id = ?1", [first]).unwrap();
+        assert!(s.queue_outgoing(&draft, 100, false, None).unwrap() > first);
     }
 
     #[test]
@@ -7523,6 +7622,11 @@ mod tests {
         s.insert_header(acc, archive, 1, &header("a@x", None, "a", 1), pinned, 10).unwrap();
         s.insert_header(acc, archive, 2, &header("b@x", None, "b", 2), pinned, 10).unwrap();
         s.insert_header(acc, inbox, 3, &header("c@x", None, "c", 3), FLAGS, 10).unwrap();
+        // Pinned too, but in the bin or the spam: not counted.
+        let trash = s.upsert_mailbox(acc, "Trash", Some("/"), Some(Role::Trash), true).unwrap();
+        let junk = s.upsert_mailbox(acc, "Junk", Some("/"), Some(Role::Junk), true).unwrap();
+        s.insert_header(acc, trash, 4, &header("d@x", None, "d", 4), pinned, 10).unwrap();
+        s.insert_header(acc, junk, 5, &header("e@x", None, "e", 5), pinned, 10).unwrap();
         let (count, list) = s.flagged_messages(6).unwrap();
         assert_eq!((count, list.len()), (2, 2));
         let (count, list) = s.flagged_messages(1).unwrap();
@@ -8014,18 +8118,6 @@ mod tests {
     }
 
     #[test]
-    fn the_french_no_identifier_marker_becomes_english() {
-        let (s, acc, inbox, _) = setup();
-        let id = s.insert_header(acc, inbox, 1, &header("a@x", None, "a", 1), FLAGS, 10).unwrap();
-        s.db().execute("UPDATE messages SET signals = '{\"authserv\":\"(sans identifiant)\",\"dkim\":true}' WHERE id = ?1", [id]).unwrap();
-        let migration = MIGRATIONS.iter().find(|m| m.contains("'(no identifier)'")).unwrap();
-        s.db().execute_batch(migration).unwrap();
-        let signals: String = s.db().query_row("SELECT signals FROM messages WHERE id = ?1", [id], |r| r.get(0)).unwrap();
-        let json: serde_json::Value = serde_json::from_str(&signals).unwrap();
-        assert_eq!((json["authserv"].as_str(), json["dkim"].as_bool()), (Some("(no identifier)"), Some(true)));
-    }
-
-    #[test]
     fn a_mostly_empty_file_is_compacted() {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(&dir.path().join("t.db")).unwrap();
@@ -8043,9 +8135,9 @@ mod tests {
 
         // A reader busy: no compaction now (Windows would not shorten a file it maps), nor a wait.
         s.db().execute_batch("CREATE TABLE junk(b BLOB); WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) INSERT INTO junk SELECT zeroblob(4000) FROM n; DROP TABLE junk;").unwrap();
-        if let Some(reader) = s.readers.first() {
-            let _busy = reader.lock().unwrap();
-            assert_eq!(s.compact_above(0).unwrap(), None);
+        {
+            let _busy = s.readers.first().expect("readers on disk").lock().unwrap();
+            assert_eq!(s.compact_above(0).unwrap(), None, "a reader busy holds the compaction back");
         }
         assert!(s.compact_above(0).unwrap().is_some());
     }
@@ -8166,15 +8258,15 @@ mod tests {
         assert_eq!(s.undo(&[(held, text.clone())], &[], &[], &[], true).unwrap(), Undone::Done);
         assert!(s.pending_ops(acc).unwrap().is_empty());
 
-        // Replayed early, its id taken by the next operation queued: that one is not undone.
+        // Replayed early: too late, and the next operation queued (its own id) is not undone.
         let first = s.push_op(acc, &text, "", Some(now() + 60)).unwrap();
         s.finish_op(first).unwrap();
         let pin = r#"{"kind":"store","mailbox":"Archive","uids":[3],"flag":"\\Flagged","add":true}"#;
-        assert_eq!(s.push_op(acc, pin, "", None).unwrap(), first, "SQLite reuses the id");
+        assert_ne!(s.push_op(acc, pin, "", None).unwrap(), first, "a finished operation's id is never given again");
         assert_eq!(s.undo(&[(first, text.clone())], &[], &[], &[], false).unwrap(), Undone::TooLate);
         assert_eq!(s.pending_ops(acc).unwrap().len(), 1, "the pin stays queued");
 
-        // A replay cut midway may have moved it on the server: too late; refused, it did nothing.
+        // A replay cut midway, started, or refused (a first chunk may have gone): too late.
         let cut = s.push_op(acc, &text, "", None).unwrap();
         s.fail_replayed(cut, &text, "connection lost", 10).unwrap();
         assert_eq!(s.undo(&[(cut, text.clone())], &[], &[], &[], false).unwrap(), Undone::TooLate);
@@ -8189,22 +8281,23 @@ mod tests {
     }
 
     #[test]
-    fn a_replay_finishes_its_own_operation_not_the_one_that_took_its_id() {
+    fn a_replay_finishes_only_its_own_operation() {
         let (s, acc, _, _) = setup();
         let d1 = r#"{"kind":"save_draft","raw":"D1"}"#;
         let d2 = r#"{"kind":"save_draft","raw":"D2"}"#;
-        // D1 replays; meanwhile the composer saves again: D1's row goes, D2 takes its id.
+        // D1 replays; meanwhile the composer saves again: D1's row goes, D2 comes under its own id.
         let id = s.push_op(acc, d1, "", None).unwrap();
         assert_eq!(s.replay_payload(id, now()).unwrap().as_deref(), Some(d1));
         s.finish_op(id).unwrap();
-        assert_eq!(s.push_op(acc, d2, "", None).unwrap(), id, "SQLite reuses the id");
+        let next = s.push_op(acc, d2, "", None).unwrap();
+        assert_ne!(next, id);
         // D1's upload ends, or fails: D2 stays queued, untouched.
         s.finish_replayed(id, d1).unwrap();
         assert!(!s.fail_replayed(id, d1, "cut", 1).unwrap() && !s.refuse_replayed(id, d1, "NO", 1).unwrap());
         let left = s.pending_ops(acc).unwrap();
         assert_eq!((left.len(), left[0].attempts), (1, 0));
-        assert_eq!(s.op_payload(id).unwrap().as_deref(), Some(d2));
-        s.finish_replayed(id, d2).unwrap();
+        assert_eq!(s.op_payload(next).unwrap().as_deref(), Some(d2));
+        s.finish_replayed(next, d2).unwrap();
         assert!(s.pending_ops(acc).unwrap().is_empty());
         // An id taken by an operation still held for undo is not replayed early.
         let held = s.push_op(acc, d1, "", Some(now() + 60)).unwrap();
@@ -8327,7 +8420,8 @@ mod tests {
         // My own follow-up in the thread does not count as a reply.
         s.insert_header(acc, sent, 2, &mine("relance@x", Some("devis@x"), 1_800), FLAGS, 10).unwrap();
 
-        // Nor the sent message itself (its Sent copy, appended later), nor one written from an alias.
+        // Nor the sent message itself (a copy of it, appended later, known by its Message-ID wherever
+        // it is filed), nor one written from an alias.
         s.set_identities(acc, &[crate::model::Identity { email: "Alias@Example.org".into(), ..Default::default() }]).unwrap();
         let copy = HeaderInfo {
             from: Some(Address { name: None, email: "removed-alias@example.org".into() }),
@@ -8373,7 +8467,7 @@ mod tests {
     }
 
     #[test]
-    fn imported_old_mail_does_not_set_the_usual_authentication_server() {
+    fn imported_old_mail_does_not_outvote_the_inbox_provider() {
         let (s, acc, inbox, _) = setup();
         let archive = s.upsert_mailbox(acc, "Old Gmail", Some("/"), None, true).unwrap();
         let h = |mailbox: i64, uid: u32, date: i64, server: &str| {
@@ -8562,7 +8656,9 @@ mod tests {
         for uid in 1..=2500 {
             s.insert_header(acc, inbox, uid, &header(&format!("m{uid}@x"), None, "Sujet", i64::from(uid)), FLAGS, 10).unwrap();
         }
+        count_commits(&s);
         s.delete_account(acc).unwrap();
+        assert!(commits() >= 2, "2500 rows in {} transactions", commits());
         let left = |table: &str| s.read().query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get::<_, i64>(0)).unwrap();
         assert_eq!((left("messages"), left("accounts"), left("handled"), left("handled_quiet")), (0, 0, 0, 0));
     }
@@ -8746,7 +8842,7 @@ mod tests {
         let save = |raw: &str| format!(r#"{{"kind":"save_draft","mailbox":"Drafts","message_id":"d1@x","raw":"{raw}"}}"#);
         // An older save that failed goes too: retried later, it would put back an old text.
         let failed = s.push_op(acc, &save("v0"), "", None).unwrap();
-        assert!(s.fail_replayed(failed, &save("v0"), "too large", 0).unwrap());
+        assert!(s.refuse_replayed(failed, &save("v0"), "too large", 0).unwrap());
         s.push_op(acc, &save("v1"), "", None).unwrap();
         s.push_op(acc, r#"{"kind":"save_draft","mailbox":"Drafts","message_id":"autre@x","raw":"a"}"#, "", None).unwrap();
         s.drop_pending_draft(acc, "d1@x").unwrap();
@@ -8846,25 +8942,21 @@ mod tests {
         assert_ne!(thread(other), thread(r1));
     }
 
+    /// SQLite's plan for `sql`, its parameters left NULL.
+    fn query_plan(s: &Store, sql: &str) -> String {
+        let db = s.db();
+        let mut st = db.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let nulls = vec![rusqlite::types::Value::Null; st.parameter_count()];
+        st.query_map(rusqlite::params_from_iter(nulls), |r| r.get::<_, String>(3)).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>().join(" | ")
+    }
+
     #[test]
     fn sender_lookups_use_the_address_indexes() {
         let (s, ..) = setup();
-        let plan = |sql: &str| -> String {
-            let db = s.db();
-            let mut st = db.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-            st.query_map([], |r| r.get::<_, String>(3)).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>().join(" | ")
-        };
-        let blocked = plan(
-            "SELECT m.id FROM blocked_senders s
-             CROSS JOIN messages m ON lower(m.from_addr) = lower(s.email) AND m.account_id = 1
-             JOIN mailboxes b ON b.id = m.mailbox_id
-             WHERE b.role = 'inbox' AND m.uid IS NOT NULL",
-        );
+        // The queries the store runs, not copies of them.
+        let blocked = query_plan(&s, &inbox_from_blocked_sql());
         assert!(blocked.contains("SEARCH m USING INDEX messages_from") && !blocked.contains("SCAN m"), "{blocked}");
-        let latest = plan(
-            "SELECT j.value, (SELECT m.id FROM messages m WHERE lower(m.from_addr) = lower(j.value) ORDER BY m.date DESC LIMIT 1)
-             FROM json_each('[\"a@x\"]') j",
-        );
+        let latest = query_plan(&s, LATEST_FROM_MANY);
         assert!(latest.contains("messages_from_date") && !latest.contains("SCAN m"), "{latest}");
     }
 
@@ -9003,7 +9095,7 @@ mod tests {
         s.push_op(acc, "{}", "Déplacer vers Archive · Facture", None).unwrap();
         let id = s.pending_ops(acc).unwrap()[0].id;
         for _ in 0..5 {
-            s.fail_op(id, "NO refusé", 5).unwrap();
+            s.refuse_op(id, "NO refusé", 5).unwrap();
         }
         assert!(s.pending_ops(acc).unwrap().is_empty(), "no longer replayed automatically");
         let failed = s.failed_ops().unwrap();
@@ -9104,7 +9196,7 @@ mod tests {
         assert_eq!(thread(c), first);
         assert_ne!(thread(b), first, "another Gmail thread: another number");
         assert!(s.uids_without_gmail_thread(all, 10).unwrap().is_empty());
-        // A later reply referencing both stays where Gmail puts it, and merges neither.
+        // A later reply referencing b stays where Gmail puts it (b's thread), and merges nothing.
         let d = s.insert_header(acc, all, 4, &header("d@x", Some("b@x"), "Re: Re: Devis", 4), FLAGS, 10).unwrap();
         s.set_gmail_threads(acc, all, &[(4, 200)]).unwrap();
         assert_eq!(thread(d), thread(b));
@@ -9126,14 +9218,14 @@ mod tests {
         let held = |id| s.pending_ops(acc).unwrap().into_iter().find(|p| p.id == id).unwrap().not_before;
         assert_eq!(held(mine), None);
         assert_eq!(held(other), Some(later), "another undo window is left alone");
-        // Released behind an action still undoable: that one goes first, the later one waits.
+        // Released behind moves still undoable: every one queued before it goes with it, the later one waits.
         let after = push(&crate::ops::Op::MoveSet { mailbox: "INBOX".into(), uids: vec![7], dest: "Archive".into(), uidvalidity: None });
         let mine = push(&crate::ops::Op::MoveSet { mailbox: "INBOX".into(), uids: vec![6], dest: "Archive".into(), uidvalidity: None });
         let last = push(&crate::ops::Op::MoveSet { mailbox: "INBOX".into(), uids: vec![8], dest: "Archive".into(), uidvalidity: None });
         let moved: HashSet<(String, u32)> = [("INBOX".to_string(), 6)].into_iter().collect();
         assert_eq!(s.release_moves_of(acc, &moved, &[]).unwrap(), 3);
         assert_eq!((held(other), held(after), held(mine), held(last)), (None, None, None, Some(later)));
-        // A screener move (no undo window) into "New senders", behind one: that one goes.
+        // A screener move (no undo window) into "New senders", behind one: both go.
         let undoable = push(&crate::ops::Op::MoveSet { mailbox: "INBOX".into(), uids: vec![9], dest: "Archive".into(), uidvalidity: None });
         let screened = crate::ops::Op::MoveSet { mailbox: "INBOX".into(), uids: vec![10], dest: "New".into(), uidvalidity: None };
         s.push_op(acc, &serde_json::to_string(&screened).unwrap(), "x", None).unwrap();
@@ -9153,7 +9245,7 @@ mod tests {
         s.mark_op_started(op).unwrap();
         assert!(tried(op));
         for _ in 0..5 {
-            s.fail_op(op, "NO", 5).unwrap();
+            s.refuse_op(op, "NO", 5).unwrap();
         }
         // Failed: no longer in flight (the message comes back), but known as refused.
         assert!(s.in_flight_uids(acc, "INBOX").unwrap().is_empty());
@@ -9402,9 +9494,9 @@ mod tests {
         let mut folders = s.op_folders(mv).unwrap();
         folders.sort();
         assert_eq!(folders, [inbox, trash], "source and destination to read again");
-        assert!(!s.fail_op(mv, "NO", 2).unwrap());
-        assert!(s.fail_op(mv, "NO", 2).unwrap(), "failed now");
-        s.fail_op(purge, "NO", 1).unwrap();
+        assert!(!s.refuse_op(mv, "NO", 2).unwrap());
+        assert!(s.refuse_op(mv, "NO", 2).unwrap(), "failed now");
+        s.refuse_op(purge, "NO", 1).unwrap();
         assert!(s.in_flight_uids(acc, "INBOX").unwrap().is_empty());
         assert_eq!(s.purge_pending_below(acc, "Trash").unwrap(), None);
     }
@@ -9474,26 +9566,16 @@ mod tests {
     #[test]
     fn placeholder_lookups_use_the_message_id_index() {
         let (s, ..) = setup();
-        let plan = |sql: &str| -> String {
-            let db = s.db();
-            let mut st = db.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-            st.query_map([], |r| r.get::<_, String>(3)).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>().join(" | ")
-        };
-        let adopt = plan("SELECT id FROM messages WHERE account_id = 1 AND message_id = 'x' AND mailbox_id = 1 AND uid IS NULL");
+        // The queries the store runs, not copies of them.
+        let plan = |sql: &str| query_plan(&s, sql);
+        let adopt = plan(ADOPT_PLACEHOLDER);
         assert!(adopt.contains("messages_msgid") || adopt.contains("sqlite_autoindex_messages_1"), "{adopt}");
-        let copy = plan(&format!(
-            "SELECT m.id, (SELECT o.id FROM messages o WHERE {SAME_COPY} AND o.mailbox_id = m.mailbox_id AND o.uid IS NOT NULL LIMIT 1)
-             FROM messages m WHERE m.mailbox_id = 1 AND m.uid IS NULL AND m.message_id IS NOT NULL"
-        ));
-        // (account_id, message_id) or (account_id, date), depending on the statistics: never a
-        // pass over the folder for each placeholder.
-        assert!(copy.contains("SEARCH o USING INDEX messages_") && !copy.contains("SCAN o"), "{copy}");
-        let mailboxes = plan("SELECT (SELECT COUNT(*) FROM messages m WHERE m.mailbox_id = 1 AND m.seen = 0) FROM mailboxes");
-        assert!(mailboxes.contains("messages_unread"), "{mailboxes}");
+        let mailboxes = plan(LIST_MAILBOXES);
+        assert!(mailboxes.contains("messages_unread") && !mailboxes.contains("SCAN m "), "{mailboxes}");
         // At every sync of a server without CONDSTORE: indexes only, no folder rows read.
-        let known = plan(&UID_COUNT.replace("?1", "1"));
+        let known = plan(UID_COUNT);
         assert!(known.contains("COVERING INDEX"), "{known}");
-        let unseen = plan(&UID_UNSEEN.replace("?1", "1"));
+        let unseen = plan(UID_UNSEEN);
         assert!(unseen.contains("messages_unread"), "{unseen}");
     }
 
@@ -9538,7 +9620,7 @@ mod tests {
         let ib = boxes.iter().find(|m| m.id == inbox).unwrap();
         assert_eq!((ib.total, ib.unread), (2, 1));
         assert_eq!(boxes.iter().find(|m| m.id == sent).unwrap().total, 0);
-        // UIDNEXT seen earlier lags behind what the cache holds.
+        // No UIDNEXT yet: the highest UID the cache holds, plus one.
         assert_eq!(s.uid_cutoff(inbox).unwrap(), Some(8));
         let mut state = s.mailbox_state(inbox).unwrap();
         state.uidnext = Some(20);
@@ -9618,7 +9700,7 @@ mod tests {
         s.set_calendar_ignored(acc, true).unwrap();
         assert_eq!(s.sync_calendar_list(acc, CalendarSource::Caldav, &[cal("b", true)]).unwrap(), (Vec::new(), false));
         assert!(!s.replace_calendar_events(b, acc, "b", &[ev("late", 1, 2)], None).unwrap());
-        // Nor once another account's calendar has been handed the freed id.
+        // Nor once another account has a calendar: it has its own id, the stale writes find none.
         let srv = ServerConfig { host: "localhost".into(), port: 143, security: Security::None };
         let other = s
             .insert_account(&NewAccount {
@@ -9628,12 +9710,12 @@ mod tests {
             })
             .unwrap();
         let taken = s.sync_calendar_list(other, CalendarSource::Caldav, &[cal("c", true)]).unwrap().0;
-        assert_eq!(taken[0].id, a, "a freed id handed out again");
+        assert_ne!(taken[0].id, a, "a removed calendar's id is never given again");
         assert!(!s.replace_calendar_events(a, acc, "a", &[ev("late", 1, 2)], Some("stale")).unwrap());
         assert!(!s.set_calendar_error(a, acc, "a", Some("stale")).unwrap());
         assert!(uids(0, 1000).is_empty());
         assert_eq!(s.calendars().unwrap()[0].error, None);
-        let ctag: Option<String> = s.read().query_row("SELECT ctag FROM calendars WHERE id = ?1", [a], |r| r.get(0)).unwrap();
+        let ctag: Option<String> = s.read().query_row("SELECT ctag FROM calendars WHERE id = ?1", [taken[0].id], |r| r.get(0)).unwrap();
         assert_eq!(ctag, None);
         s.set_calendar_ignored(acc, false).unwrap();
         assert_eq!(s.calendars().unwrap().len(), 1);
@@ -9659,7 +9741,7 @@ mod tests {
         // b changed (a new ETag), a did not: only b is read again; a keeps its row.
         let listed = vec![(a.clone(), "\"1\"".to_string()), (b.clone(), "\"2\"".to_string())];
         let known = s.caldav_etags(c).unwrap();
-        let to_read: HashSet<String> = listed.iter().filter(|(h, e)| known.get(h) != Some(e)).map(|(h, _)| h.clone()).collect();
+        let to_read: HashSet<String> = crate::caldav::changed_objects(&listed, &known).into_iter().collect();
         assert_eq!(to_read, [b.clone()].into());
         let mut moved = ev(&b, "b", 250);
         moved.summary = "b (moved)".into();
@@ -9852,8 +9934,9 @@ mod tests {
         assert!(!s.set_calendar_state(acc, CalendarState::Error, Some("old"), 0).unwrap());
         assert_eq!(s.calendar_account(acc).unwrap(), manual);
         assert!(s.set_calendar_home(acc, Some(("https://cal.example.org/home/", "example.org")), 1).unwrap());
-        // Partial: some calendars synced, the time moves on.
+        // Partial: some calendars synced, the time moves on (from an old one, to see it move).
+        s.db().execute("UPDATE calendar_accounts SET last_sync = 1 WHERE account_id = ?1", [acc]).unwrap();
         assert!(s.set_calendar_state(acc, CalendarState::Partial, Some("calendars not synced: b"), 1).unwrap());
-        assert!(s.calendar_account(acc).unwrap().last_sync.is_some());
+        assert!(s.calendar_account(acc).unwrap().last_sync.is_some_and(|t| t > 1));
     }
 }

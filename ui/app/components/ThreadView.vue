@@ -14,7 +14,7 @@ const props = withDefaults(
 const emit = defineEmits<{ close: [], done: [], pinned: [] }>()
 
 const { tick, mailboxes, isMine, accountById, accountColor } = useMail()
-const { reply, replyAllCount, forward, open: composing } = useComposer()
+const { reply, replyAllCount, forward, resume, open: composing } = useComposer()
 const showError = useErrorToast()
 const listStale = useListStale()
 const { t } = useI18n()
@@ -102,6 +102,13 @@ function scrollTo(id: number | undefined) {
  *  saved in the thread is not what one replies to). */
 const drafts = computed(() => draftIds(messages.value, mailboxes.value))
 const replyTarget = computed(() => replyTargetIn(messages.value, drafts.value))
+/** The reply already begun: a draft after the message replies go to. Reply resumes it rather than
+ *  starting a second one. */
+const pendingDraft = computed(() => {
+  const target = replyTarget.value
+  const list = messages.value
+  return target ? list.slice(list.indexOf(target) + 1).findLast(m => drafts.value.has(m.id)) : undefined
+})
 /** Another thread was asked for and its messages aren't in yet: `messages` still holds the
  *  previous one, which no action (button or shortcut) may target meanwhile. */
 const resetPending = ref(false)
@@ -252,8 +259,11 @@ async function load(reset: boolean) {
     for (const m of [lastUnread, list.at(-1), replyTarget.value]) if (m) expanded.add(m.id)
     expanded.forEach(loadDetail)
     // Opens on the first unread message, else on the latest one (at the top when newest first).
+    // A reply begun: opened on it, where the writing goes on.
     const firstUnread = list.find(m => !m.flags.seen)
-    scrollTo(order.value === 'newest' ? (lastUnread ?? list.at(-1))?.id : (firstUnread ?? list.at(-1))?.id)
+    const begun = pendingDraft.value
+    if (begun) expanded.add(begun.id)
+    scrollTo(begun?.id ?? (order.value === 'newest' ? (lastUnread ?? list.at(-1))?.id : (firstUnread ?? list.at(-1))?.id))
     const unread = list.filter(m => !m.flags.seen).map(m => m.id)
     if (unread.length) markRead(unread)
   } else if (hadHere && !here.value.length && !leaving) {
@@ -693,6 +703,13 @@ watch(replyTarget, (m) => {
   if (m) loadDetail(m.id)
 })
 
+/** Reply and reply all: the reply already begun is resumed instead. */
+function answer(all: boolean) {
+  if (pendingDraft.value) return resume(pendingDraft.value.id)
+  const d = latestDetail()
+  if (d) reply(d, all)
+}
+
 /** Shortcuts of the open thread, inactive while the list has a multiple selection. */
 const when = (fn: () => unknown) => () => {
   // While composing, these keys do not target the thread behind the window; nor behind an open
@@ -706,8 +723,8 @@ defineShortcuts({
   s: when(toggleFlag),
   b: when(() => (inSnoozed.value ? unsnooze() : snooze())),
   u: when(markUnread),
-  r: when(() => { const d = latestDetail(); if (d) reply(d) }),
-  a: when(() => { const d = latestDetail(); if (d) reply(d, true) }),
+  r: when(() => answer(false)),
+  a: when(() => answer(true)),
   f: when(() => { const d = latestDetail(); if (d) forward(d) }),
   l: when(openLabels)
 })
@@ -947,6 +964,7 @@ useEventListener('keydown', (e: KeyboardEvent) => {
               :loading="loadingIds.has(row.message.id)"
               :latest="row.message.id === replyTarget?.id"
               :draft="drafts.has(row.message.id)"
+              :pending-draft="row.message.id === replyTarget?.id ? pendingDraft?.id : undefined"
               @toggle="toggle"
             />
           </div>
@@ -987,15 +1005,15 @@ useEventListener('keydown', (e: KeyboardEvent) => {
     <template #footer>
       <div class="flex shrink-0 gap-2 border-t border-default bg-default px-3 pt-2.5 pb-[calc(0.75rem+env(safe-area-inset-bottom))] lg:hidden dark:bg-(--surface-side)">
         <UButton
-          icon="i-lucide-reply"
-          :label="$t('mail.messageCard.reply')"
+          :icon="pendingDraft ? 'i-lucide-file-pen' : 'i-lucide-reply'"
+          :label="pendingDraft ? $t('mail.messageCard.resumeDraft') : $t('mail.messageCard.reply')"
           size="xl"
           class="h-12 flex-1 justify-center rounded-[14px] font-semibold"
-          :disabled="!latestDetail()"
-          @click="latestDetail() && reply(latestDetail()!)"
+          :disabled="!pendingDraft && !latestDetail()"
+          @click="answer(false)"
         />
         <UButton
-          v-if="!latestDetail() || replyAllCount(latestDetail()!)"
+          v-if="!pendingDraft && (!latestDetail() || replyAllCount(latestDetail()!))"
           icon="i-lucide-reply-all"
           color="neutral"
           variant="outline"

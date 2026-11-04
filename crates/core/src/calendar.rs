@@ -2484,6 +2484,15 @@ pub fn respond_event(ics: &str, me: &[String], partstat: &str, original: Option<
 mod tests {
     use super::*;
 
+    /// Local-time tests here and elsewhere prove nothing in UTC (`.cargo/config.toml` sets Paris).
+    #[test]
+    fn the_tests_run_on_paris_time() {
+        use chrono::TimeZone;
+        let summer = chrono::Local.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+        let winter = chrono::Local.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+        assert_eq!((summer.offset().local_minus_utc(), winter.offset().local_minus_utc()), (7200, 3600));
+    }
+
     #[test]
     fn a_flood_of_crafted_time_zones_is_read_quickly() {
         let mut ics = String::from("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\n");
@@ -2496,8 +2505,10 @@ TZOFFSETFROM:+0100\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n"
         ics.push_str("BEGIN:VEVENT\r\nUID:u\r\nDTSTART;TZID=x1:20261110T090000\r\nDTEND;TZID=x1:20261110T100000\r\nSUMMARY:x\r\n\
 ORGANIZER:mailto:a@example.org\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n");
         let started = std::time::Instant::now();
-        let _ = parse(&ics);
+        let invite = parse(&ics).expect("still read");
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "took {:?}", started.elapsed());
+        // Quick, and right: 09:00 at +0100.
+        assert_eq!((invite.uid.as_str(), invite.start), ("u", Some(1_794_297_600)));
     }
 
     #[test]
@@ -2513,8 +2524,9 @@ ORGANIZER:mailto:a@example.org\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n");
         }
         ics.push_str("END:VCALENDAR\r\n");
         let started = std::time::Instant::now();
-        let _ = parse(&ics);
+        let invite = parse(&ics).expect("still read");
         assert!(started.elapsed() < std::time::Duration::from_secs(10), "rules: {:?}", started.elapsed());
+        assert_eq!(invite.uid, "x");
         // 32 custom zones of 16 observances each, every day a change since year 1.
         let mut ics = String::from("BEGIN:VCALENDAR\r\n");
         for z in 0..32 {
@@ -2526,8 +2538,10 @@ ORGANIZER:mailto:a@example.org\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n");
         }
         ics.push_str("BEGIN:VEVENT\r\nUID:u\r\nDTSTART;TZID=z1:20261110T090000\r\nDTEND;TZID=z1:20261110T100000\r\nSUMMARY:x\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n");
         let started = std::time::Instant::now();
-        let _ = parse(&ics);
+        let invite = parse(&ics).expect("still read");
         assert!(started.elapsed() < std::time::Duration::from_secs(10), "zones: {:?}", started.elapsed());
+        // 09:00 at +0200, the offset the zone's observances give.
+        assert_eq!((invite.uid.as_str(), invite.start), ("u", Some(1_794_294_000)));
     }
 
     #[test]
@@ -2837,8 +2851,9 @@ SUMMARY:Spam\r\nDESCRIPTION:{description}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
             ));
         }
         ics.push_str("END:VCALENDAR\r\n");
-        let _ = parse(&ics);
+        let invite = parse(&ics).expect("still read");
         assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+        assert!(invite.uid == "x" && invite.recurring);
     }
 
     #[test]
@@ -2863,7 +2878,7 @@ SUMMARY:Point\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT10M\r\nEND:VALARM\
         assert_eq!((first_start, day), (start, monday));
 
         // Moved to another zone at the same wall time: still Mondays, though the occurrence
-        // was a Sunday in that zone.
+        // (Monday 20:00 in Paris) fell on a Tuesday in that zone.
         let paris = Zone::Named(chrono_tz::Europe::Paris).timestamp(monday.and_hms_opt(20, 0, 0).unwrap()).unwrap();
         let tokyo = Zone::Named(chrono_tz::Asia::Tokyo).timestamp(monday.and_hms_opt(20, 0, 0).unwrap()).unwrap();
         let moved = crate::model::EventDraft { start: tokyo, end: tokyo + 3600, zone: Some("Asia/Tokyo".into()), ..Default::default() };
@@ -3049,7 +3064,7 @@ ATTENDEE;CN=Marie;PARTSTAT=ACCEPTED:mailto:marie@example.org\r\n\
 ATTENDEE;PARTSTAT=TENTATIVE:mailto:Y@example.org\r\n\
 ATTENDEE;CUTYPE=ROOM;PARTSTAT=ACCEPTED:mailto:salle@example.org\r\n\
 DESCRIPTION:Rejoindre : https://teams.microsoft.com/l/meetup-join/abc).\\nMerci\r\n\
-BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\n\
+BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Rappel\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\n\
 BEGIN:VALARM\r\nACTION:EMAIL\r\nTRIGGER:-P1D\r\nEND:VALARM\r\n\
 BEGIN:VALARM\r\nACTION:AUDIO\r\nTRIGGER;VALUE=DATE-TIME:20261020T110000Z\r\nEND:VALARM\r\n\
 BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER;RELATED=END:-PT5M\r\nEND:VALARM\r\n\
@@ -3129,7 +3144,7 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
         assert!(r.contains("DTSTART;TZID=Europe/Paris:20261020T140000\r\n"));
         assert!(r.contains("ATTENDEE;PARTSTAT=ACCEPTED;CN=\"Yann\":mailto:y@example.org"));
         assert!(!r.contains("VALARM") && !r.contains("LOCATION"), "only what identifies the event");
-        assert!(r.lines().all(|l| l.len() <= 76));
+        assert!(r.lines().all(|l| l.len() <= 75));
         let back = parse(&r).unwrap();
         assert_eq!((back.method.as_str(), back.attendees[0].partstat.as_deref()), ("REPLY", Some("ACCEPTED")));
     }

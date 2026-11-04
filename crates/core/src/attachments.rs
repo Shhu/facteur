@@ -611,7 +611,7 @@ mod tests {
         assert!(!openable(&macro_doc, "devis.docm"));
         let svg = inspect("facture.svg", "image/svg+xml", br#"<svg xmlns="http://www.w3.org/2000/svg" onload="location='https://x/'">"#, None);
         assert!(!openable(&svg, "facture.svg"), "a browser would run its script");
-        assert!(!svg.trust.reasons.is_empty(), "event handlers count as code");
+        assert!(svg.trust.reasons.iter().any(|r| !r.positive), "event handlers count as code: {:?}", svg.trust.reasons);
         let python = inspect("outil.py", "text/plain", b"import os\nprint(1)\n", None);
         assert!(!openable(&python, "outil.py"));
         let rdp = inspect("acces-vpn.rdp", "application/x-rdp", b"full address:s:evil.example\nredirectdrives:i:1\n", None);

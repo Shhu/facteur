@@ -1642,7 +1642,8 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert_eq!(h.message_id.as_deref(), Some("b@example.org"));
         assert_eq!(h.in_reply_to.as_deref(), Some("a@example.org"));
         assert_eq!(h.references, ["root@example.org", "a@example.org"]);
-        assert!(h.date > 0);
+        // 10:00 at +0200: 08:00 UTC.
+        assert_eq!(h.date, 1_792_051_200);
     }
 
     #[test]
@@ -1894,8 +1895,10 @@ Subject: Votre compte\r\n\r\n.\r\n";
         // Formatting tags never closed by `>`: one pass, not one per tag.
         let open = format!("{}{}", "<b>".repeat(1001), "<b ".repeat(1_000_000));
         let started = std::time::Instant::now();
-        defused(&open);
+        let kept = defused(&open);
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        // Nothing follows them to blow up: left as they are, scanned once.
+        assert!(matches!(kept, std::borrow::Cow::Borrowed(_)));
     }
 
     #[test]
@@ -1923,8 +1926,10 @@ Subject: Votre compte\r\n\r\n.\r\n";
     fn tag_names_are_read_once() {
         let html = "<x".repeat(1_000_000);
         let started = std::time::Instant::now();
-        defused(&html);
+        let kept = defused(&html);
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        // No tag ever closed: nothing to take out.
+        assert!(matches!(kept, std::borrow::Cow::Borrowed(_)));
     }
 
     #[test]

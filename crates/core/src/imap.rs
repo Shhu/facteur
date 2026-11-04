@@ -694,8 +694,8 @@ pub(crate) mod tests {
 
     #[test]
     fn long_uid_sets_are_cut() {
-        assert_eq!(crate::imap::uid_set(&[5, 1, 2, 3, 9]), "1:3,5,9");
-        assert_eq!(crate::imap::uid_set(&[]), "");
+        assert_eq!(crate::imap::uid_set(&[9, 1, 2, 3, 7, 10]), "1:3,7,9:10");
+        assert_eq!((crate::imap::uid_set(&[5]), crate::imap::uid_set(&[])), ("5".to_string(), String::new()));
         let scattered: Vec<u32> = (0..20_000).map(|n| n * 2).collect();
         let sets = uid_sets(&scattered, 8000);
         assert!(sets.len() > 1 && sets.iter().all(|s| s.len() <= 8000));
@@ -764,12 +764,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn uid_set() {
-        assert_eq!(super::uid_set(&[9, 1, 2, 3, 7, 10]), "1:3,7,9:10");
-        assert_eq!(super::uid_set(&[5]), "5");
-    }
-
-    #[test]
     fn server_reason_drops_the_code() {
         assert_eq!(
             super::server_reason("code: None, info: Some(\"[AUTHENTICATIONFAILED] Authentication failed.\")"),
@@ -831,7 +825,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn folder_statuses_are_asked_all_at_once() {
+    async fn folder_statuses_of_several_folders_leave_the_refused_out() {
         let (mut session, log) = scripted_with_log(vec![
             ("* STATUS INBOX (MESSAGES 3 UIDNEXT 9 UIDVALIDITY 1 UNSEEN 1)\r\n{tag} OK done", false),
             ("{tag} NO [NONEXISTENT] gone", false),
@@ -842,7 +836,7 @@ pub(crate) mod tests {
         let found = folder_statuses(&mut session, &names, "(MESSAGES UIDNEXT UIDVALIDITY UNSEEN)").await.unwrap();
         assert_eq!((found["INBOX"].messages, found["INBOX"].unseen), (Some(3), Some(1)));
         assert_eq!(found["Clients/Jill & Joy"].uidvalidity, Some(2));
-        assert!(!found.contains_key("Old"), "refused: asked again alone");
+        assert!(!found.contains_key("Old"), "refused: left out");
         assert_eq!(log.lock().unwrap()[2], "STATUS \"Clients/Jill & Joy\" (MESSAGES UIDNEXT UIDVALIDITY UNSEEN)");
     }
 

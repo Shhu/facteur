@@ -335,7 +335,6 @@ const POOL_CLOSE_AFTER: Duration = Duration::from_secs(120);
 /// connection waits for the next sync (every 5 minutes at rest).
 const MICROSOFT_SYNC_CLOSE_AFTER: Duration = Duration::from_secs(10 * 60);
 const SYNC_RETRY_AFTER: Duration = Duration::from_secs(5);
-/// A sign-in refused "for now" for this long is no longer passing: the user is asked to sign in again.
 /// The waits before the next tries of a sign-in Outlook turns down "for now".
 const REFUSED_RETRIES: [Duration; 3] = [Duration::from_secs(5), Duration::from_secs(15), Duration::from_secs(30)];
 /// The longest a keychain write is waited for.
@@ -346,6 +345,7 @@ const REFRESH_TURN_WAIT: Duration = Duration::from_secs(45);
 const KEYCHAIN_READ_WAIT: Duration = Duration::from_secs(120);
 /// After a failed read, the keychain is left alone that long (no prompt every minute).
 const KEYCHAIN_RETRY: Duration = Duration::from_secs(300);
+/// A sign-in refused "for now" for this long is no longer passing: the user is asked to sign in again.
 const REFUSED_FOR_NOW_LIMIT: Duration = Duration::from_secs(30 * 60);
 /// Refusals "for now" further apart are no run: a sleep or an evening between them.
 const REFUSED_FOR_NOW_GAP: Duration = Duration::from_secs(10 * 60);
@@ -715,9 +715,6 @@ fn series_repeat(rule: Option<crate::repeat::Repeat>) -> SeriesRepeat {
     SeriesRepeat { custom: rule.is_none(), repeat: rule }
 }
 
-/// What a change to a whole series does: `None` moves its times (and changes its texts) and keeps
-/// its rule; `Some(repeat)` rebuilds it from a new first date, repeating as `repeat`. A rule
-/// facteur cannot write back keeps the series' days.
 /// A keychain read of one account: the one under way, and when the last one failed.
 #[derive(Default)]
 struct SecretRead {
@@ -731,12 +728,14 @@ enum AiKind {
     Event,
 }
 
-/// The From is the sender's own: a DMARC pass (no other server's verdict mixed in), or the
-/// message's DKIM signature checked here and aligned with it.
+/// Written from the account: in its Sent or Drafts folder, from one of its own addresses. No
+/// signature needed: the server holds what the account sent.
 fn written_by_me(role: Option<Role>, from: Option<&str>, own: &[String]) -> bool {
     matches!(role, Some(Role::Sent | Role::Drafts)) && from.is_some_and(|f| own.iter().any(|o| o.eq_ignore_ascii_case(f.trim())))
 }
 
+/// The From is the sender's own: a DMARC pass (no other server's verdict mixed in), or the
+/// message's DKIM signature checked here and aligned with it.
 fn from_proven(signals: &crate::trust::Signals, context: &crate::trust::Context) -> bool {
     (signals.dmarc == Some(true) && context.foreign_results.is_none()) || signals.dkim_local.as_ref().is_some_and(|d| d.pass && d.aligned)
 }
@@ -747,6 +746,9 @@ fn tells_guests(changes: &crate::calendar::EventChanges, rebuilt: bool) -> bool 
     rebuilt || !changes.only_reminders()
 }
 
+/// What a change to a whole series does: `None` moves its times (and changes its texts) and keeps
+/// its rule; `Some(repeat)` rebuilds it from a new first date, repeating as `repeat`. A rule
+/// facteur cannot write back keeps the series' days.
 fn series_plan(e: &CalendarEvent, draft: &EventDraft, changes: &crate::calendar::EventChanges, now: &SeriesRepeat, first: chrono::NaiveDate) -> Result<Option<Option<crate::repeat::Repeat>>> {
     // Another zone: the series is written again in it.
     // Days compared in the event's zone: a time change across the computer's midnight is no move.
@@ -6922,7 +6924,7 @@ impl Engine {
             Err(_) => return Ok(None),
         };
         let known = if whole { HashMap::new() } else { self.store.caldav_etags(calendar_id)? };
-        let fetched: Vec<String> = listed.iter().filter(|(href, etag)| known.get(href) != Some(etag)).map(|(href, _)| href.clone()).collect();
+        let fetched = crate::caldav::changed_objects(&listed, &known);
         let events = client.objects(url, &fetched, from, to, me).await?;
         Ok(Some((listed, fetched.into_iter().collect(), events)))
     }
@@ -7895,7 +7897,6 @@ async fn logout(session: &mut Session) {
     let _ = bounded(10, "logout", async { Ok(session.logout().await?) }).await;
 }
 
-/// See [`Engine::uid_cutoff`].
 /// The local AI's two parts, each with its own model.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum AiSide {
@@ -7928,6 +7929,7 @@ fn deserves_follow_up(e: &Error) -> bool {
     e.is_connection_drop() || matches!(e, Error::Unreachable(_))
 }
 
+/// See [`Engine::uid_cutoff`].
 fn cutoff(uidnext: Option<u32>, highest_cached: Option<u32>) -> Option<u32> {
     let past_cache = highest_cached.map(|u| u.saturating_add(1));
     match (uidnext, past_cache) {
@@ -8258,8 +8260,8 @@ mod tests {
         let reminders = crate::calendar::EventChanges { reminders: Some(vec![15]), ..Default::default() };
         assert!(!tells_guests(&reminders, false), "the organizer's own reminders only");
         assert!(tells_guests(&reminders, true), "another rule, written again: the guests' copies follow");
-        let moved = crate::calendar::EventChanges { summary: Some("Point".into()), ..reminders };
-        assert!(tells_guests(&moved, false));
+        let retitled = crate::calendar::EventChanges { summary: Some("Point".into()), ..reminders };
+        assert!(tells_guests(&retitled, false));
     }
 
     #[test]
@@ -8458,8 +8460,8 @@ mod tests {
             ..Default::default()
         };
         assert!(remembered_home(&settings("https://dav.ovh.net/home/", Some("ovh.net")), &client).is_some());
-        // Stored by an older version (no site), on another site than the one stored, or on a site the
-        // password does not go to: looked for again instead.
+        // Stored by an older version (no site), on another site than the one stored, on a site the
+        // password does not go to, or in plain http: looked for again instead.
         assert!(remembered_home(&settings("https://dav.ovh.net/home/", None), &client).is_none());
         assert!(remembered_home(&settings("https://dav.ovh.net/home/", Some("shop.fr")), &client).is_none());
         assert!(remembered_home(&settings("https://attacker.example/home/", Some("attacker.example")), &client).is_none());
@@ -8540,16 +8542,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discarding_an_operation_never_drops_the_one_that_took_its_id() {
+    async fn discarding_an_operation_already_replayed_drops_nothing_else() {
         let (_dir, engine, acc) = test_engine();
         let store = engine.store();
         let first = store.push_op(acc, r#"{"kind":"save_draft","raw":"D1"}"#, "", None).unwrap();
         let shown = store.op_row(first).unwrap().unwrap().created_at;
-        // Replayed while the confirmation was open, its id given to the next one queued.
+        // Replayed while the confirmation was open; the next one queued has its own id.
         store.finish_op(first).unwrap();
-        tokio::time::sleep(Duration::from_millis(1100)).await;
         let next = store.push_op(acc, r#"{"kind":"save_draft","raw":"D2"}"#, "", None).unwrap();
-        assert_eq!(next, first);
+        assert_ne!(next, first);
         assert!(engine.discard_op(first, shown).is_err());
         assert_eq!(store.pending_ops(acc).unwrap().len(), 1, "the new one stays queued");
         let now_shown = store.op_row(next).unwrap().unwrap().created_at;
@@ -8721,7 +8722,7 @@ mod tests {
         store.push_op(acc, r#"{"kind":"store_set","mailbox":"INBOX","uids":[3],"flag":"\\Seen","value":true}"#, "Read", None).unwrap();
         let refused = store.push_op(acc, r#"{"kind":"append","mailbox":"Sent","flags":"","raw":""}"#, "Sent copy", None).unwrap();
         for _ in 0..5 {
-            store.fail_op(refused, "NO [OVERQUOTA]", 5).unwrap();
+            store.refuse_op(refused, "NO [OVERQUOTA]", 5).unwrap();
         }
         let d = engine.ops_details().unwrap();
         let states: Vec<String> = d.ops.iter().map(|o| serde_json::to_value(o.state).unwrap().as_str().unwrap().to_string()).collect();
@@ -8937,6 +8938,7 @@ mod tests {
 
     #[test]
     fn the_developer_tools_follow_their_setting_and_come_back_at_launch() {
+        let _switch = crate::perf::SWITCH.lock().unwrap_or_else(|e| e.into_inner());
         let (dir, engine, _acc) = test_engine();
         engine.set_setting(crate::perf::SETTING, "1").unwrap();
         assert!(crate::perf::enabled());
@@ -9009,7 +9011,7 @@ mod tests {
         engine.signed_in.lock().unwrap().insert(acc);
         engine.advised.lock().unwrap().insert(acc);
         assert!(engine.auth_problems().contains_key(&acc));
-        // Removed then added again: SQLite hands out the same id.
+        // Removed then added again: under a new id, which nothing of the old account follows.
         engine.store().delete_account(acc).unwrap();
         let srv = ServerConfig { host: "localhost".into(), port: 143, security: Security::None };
         let again = engine
@@ -9019,9 +9021,8 @@ mod tests {
                 imap: srv.clone(), smtp: srv, auth: NewAuth::Password,
             })
             .unwrap();
-        assert_eq!(again, acc);
-        engine.forget_account_state(again);
-        assert!(engine.auth_problems().is_empty());
+        assert_ne!(again, acc);
+        assert!(!engine.auth_problems().contains_key(&again));
         assert!(!engine.unsaved_secrets.lock().unwrap().contains(&again));
         assert!(!engine.calendar_tokens.lock().unwrap().contains_key(&again), "the old account's calendar token");
         assert!(!engine.calendar_read_only.lock().unwrap().contains(&again));
@@ -9090,14 +9091,18 @@ mod tests {
         let (_dir, engine, acc) = test_engine();
         let root = PathBuf::from("/backups/y@example.org");
         let first = engine.restore_folder(&root, acc);
-        // Interrupted: a minute later, the retry fills the same folder.
-        assert_eq!(engine.restore_folder(&root, acc), first);
+        assert_eq!(engine.store().setting(&restore_folder_key(&root, acc)).unwrap().as_deref(), Some(first.as_str()));
+        // Interrupted, the retry fills the same folder, the one noted, even hours later (a name made
+        // again would carry another time).
+        let noted = "Restauration 2026-01-05 09h12";
+        engine.store().set_setting(&restore_folder_key(&root, acc), noted).unwrap();
+        assert_eq!(engine.restore_folder(&root, acc), noted);
         // Even after a restart (a quit, an update).
         let again = Engine::open(_dir.path()).unwrap();
-        assert_eq!(again.restore_folder(&root, acc), first);
-        // Finished: the next restore is a new one.
+        assert_eq!(again.restore_folder(&root, acc), noted);
+        // Finished, the note gone: the next restore is a new folder.
         again.store().delete_setting(&restore_folder_key(&root, acc)).unwrap();
-        assert_eq!(again.store().setting(&restore_folder_key(&root, acc)).unwrap(), None);
+        assert_ne!(again.restore_folder(&root, acc), noted);
     }
 
     #[tokio::test]
@@ -9111,7 +9116,11 @@ mod tests {
         let h = HeaderInfo { message_id: Some("m@x".into()), subject: "x".into(), date: 1, ..Default::default() };
         let id = store.insert_header(acc, inbox, 4, &h, flags, 10).unwrap();
         // "Show in IMAP" off for All Mail: never converted, its folders moved as folders.
-        assert!(engine.move_to(&[id], trash, None).is_ok());
+        engine.move_to(&[id], trash, None).unwrap();
+        assert_eq!(store.location(id).unwrap().mailbox_id, trash, "moved here at once");
+        let queued = store.pending_ops(acc).unwrap();
+        let to_trash = queued.iter().any(|o| o.kind == "move_set" && store.op_payload(o.id).unwrap().is_some_and(|p| p.contains("[Gmail]/Trash")));
+        assert!(to_trash, "and on the server: {queued:?}");
         // With All Mail, the conversion is only waiting for the first sync.
         let other = store.insert_header(acc, inbox, 5, &HeaderInfo { message_id: Some("n@x".into()), ..h }, flags, 10).unwrap();
         store.upsert_mailbox(acc, "[Gmail]/All Mail", Some("/"), Some(Role::All), true).unwrap();
@@ -9354,7 +9363,9 @@ In-Reply-To: <parent@x>\r\nReferences: <root@x> <parent@x>\r\n\r\nBrouillon\r\n"
         engine.secret_writes.lock().unwrap().insert(acc, false);
         engine.unsaved_secrets.lock().unwrap().insert(acc);
         engine.secret_cache.lock().unwrap().insert(acc, "jeton".into());
-        assert!(engine.store_secret(acc, "jeton", KEYCHAIN_WAIT).await.is_err(), "not a second prompt");
+        // Refused before the keychain is reached: no second prompt (nor a keychain failure passing for one).
+        let refused = engine.store_secret(acc, "jeton", KEYCHAIN_WAIT).await;
+        assert!(matches!(&refused, Err(Error::Secret(m)) if m.contains("en attente du déverrouillage")), "{refused:?}");
         engine.persist_unsaved_secrets().await;
         assert!(engine.unsaved_secrets.lock().unwrap().contains(&acc));
         assert_eq!(engine.secret_writes.lock().unwrap().get(&acc), Some(&false), "the first write still owns it");
@@ -9376,10 +9387,10 @@ In-Reply-To: <parent@x>\r\nReferences: <root@x> <parent@x>\r\n\r\nBrouillon\r\n"
         let id = store.insert_header(acc, inbox, 1, &h("a@x"), flags, 10).unwrap();
         let draft = Draft { account_id: acc, in_reply_to: Some(id), reply_ids: Some(("a@x".into(), vec![])), ..Default::default() };
         assert!(engine.replied_message(&draft).is_some());
-        // Gone before the scheduled send left, its id handed to another message.
+        // Gone before the scheduled send left; its id is never handed to another message.
         store.delete_uids(inbox, &[1]).unwrap();
         let other = store.insert_header(acc, inbox, 2, &h("b@x"), flags, 10).unwrap();
-        assert_eq!(other, id);
+        assert_ne!(other, id);
         assert!(engine.replied_message(&draft).is_none(), "not flagged answered");
     }
 
@@ -9764,7 +9775,7 @@ In-Reply-To: <parent@x>\r\nReferences: <root@x> <parent@x>\r\n\r\nBrouillon\r\n"
         let other_text = part(crate::ai::MODELS[1].file);
         std::fs::write(&other_text, b"GGUF").unwrap();
         engine.ai_forget_others(AiSide::Text);
-        assert!(!text_part.exists() && !other_text.exists(), "another text model chosen: those go");
+        assert!(!text_part.exists() && !other_text.exists(), "no text model in use: the text downloads go");
     }
 
     #[tokio::test]

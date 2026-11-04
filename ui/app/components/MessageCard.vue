@@ -3,8 +3,9 @@ import { confirm } from '~/composables/useConfirm'
 import type { MessageDetail, MessageSummary } from '~/utils/types'
 
 /** `latest`: last message of the thread; on mobile its reply buttons sit in the thread's bottom bar.
- *  `draft`: saved in Drafts, never sent; it is resumed instead of answered. */
-const props = defineProps<{ message: MessageSummary, detail?: MessageDetail, expanded: boolean, loading: boolean, latest?: boolean, draft?: boolean }>()
+ *  `draft`: saved in Drafts, never sent; it is resumed instead of answered. `pendingDraft`: the
+ *  reply to this message already begun, resumed by Reply instead of a second one. */
+const props = defineProps<{ message: MessageSummary, detail?: MessageDetail, expanded: boolean, loading: boolean, latest?: boolean, draft?: boolean, pendingDraft?: number }>()
 defineEmits<{ toggle: [id: number] }>()
 
 const { reply, replyAllCount: countReplyAll, forward, composeMailto, resume, discardSaved } = useComposer()
@@ -576,7 +577,7 @@ const originalExcerpt = computed(() => {
           </UDropdownMenu>
         </div>
 
-        <div v-else-if="latest && !fromMe && quick.length" class="mt-4.5 flex flex-wrap items-center gap-2">
+        <div v-else-if="latest && !fromMe && quick.length && pendingDraft === undefined" class="mt-4.5 flex flex-wrap items-center gap-2">
           <UButton
             v-for="tpl in quick"
             :key="tpl.id"
@@ -593,6 +594,15 @@ const originalExcerpt = computed(() => {
 
         <div v-if="!draft" class="mt-4.5 flex-wrap gap-2" :class="latest ? 'hidden lg:flex' : 'flex'">
           <UButton
+            v-if="pendingDraft !== undefined"
+            icon="i-lucide-file-pen"
+            :label="$t('mail.messageCard.resumeDraft')"
+            size="lg"
+            class="rounded-[10px] font-semibold max-lg:min-h-11"
+            @click="resume(pendingDraft)"
+          />
+          <UButton
+            v-else
             icon="i-lucide-reply"
             :label="$t('mail.messageCard.reply')"
             size="lg"
@@ -601,7 +611,7 @@ const originalExcerpt = computed(() => {
             class="rounded-[10px] font-semibold max-lg:min-h-11"
             @click="reply(detail)"
           />
-          <UButton v-if="replyAllCount" icon="i-lucide-reply-all" :label="replyAllCount > 1 ? `${$t('mail.messageCard.replyAll')} · ${replyAllCount}` : $t('mail.messageCard.replyAll')" size="lg" color="neutral" variant="outline" class="rounded-[10px] max-lg:min-h-11" @click="reply(detail, true)" />
+          <UButton v-if="replyAllCount && pendingDraft === undefined" icon="i-lucide-reply-all" :label="replyAllCount > 1 ? `${$t('mail.messageCard.replyAll')} · ${replyAllCount}` : $t('mail.messageCard.replyAll')" size="lg" color="neutral" variant="outline" class="rounded-[10px] max-lg:min-h-11" @click="reply(detail, true)" />
           <UButton icon="i-lucide-forward" :label="$t('mail.messageCard.forward')" size="lg" color="neutral" variant="outline" class="rounded-[10px] max-lg:min-h-11" @click="forward(detail)" />
           <UDropdownMenu :items="moreItems">
             <UButton icon="i-lucide-ellipsis" size="lg" color="neutral" variant="ghost" class="hidden rounded-[10px] lg:inline-flex" :aria-label="$t('mail.threadView.more')" />

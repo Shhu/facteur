@@ -1,0 +1,4 @@
+# Tests reading local times expect the computer in Paris, where the clocks change: in UTC they
+# could not tell local time from UTC.
+[env]
+TZ = { value = "Europe/Paris", force = true }

@@ -22,6 +22,10 @@ pub fn set_enabled(on: bool) {
     ON.store(on, Ordering::Relaxed);
 }
 
+/// Held by the tests that switch the tools: `ON` is one for the whole test run.
+#[cfg(test)]
+pub(crate) static SWITCH: Mutex<()> = Mutex::new(());
+
 pub const SLOW_SQL: Duration = Duration::from_millis(30);
 pub const SLOW_WAIT: Duration = Duration::from_millis(20);
 pub const SLOW_HOLD: Duration = Duration::from_millis(50);
@@ -192,6 +196,7 @@ mod tests {
 
     #[test]
     fn slow_operations_are_kept_with_the_tools_off() {
+        let _switch = SWITCH.lock().unwrap_or_else(|e| e.into_inner());
         set_enabled(false);
         record("sql", "SELECT launch_marker", Duration::from_millis(40));
         assert!(since(0).iter().any(|e| e.what == "SELECT launch_marker"), "launch measured before the setting is read");

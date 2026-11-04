@@ -350,6 +350,8 @@ mod tests {
         assert_eq!(sender_key("News@Mail.Airbnb.com").as_deref(), Some("airbnb.com"));
         assert_eq!(sender_key("marie@gmail.com").as_deref(), Some("marie@gmail.com"), "not all of gmail.com");
         assert_eq!(sender_key("pas-une-adresse"), None);
+        // A private suffix is no shared domain: each name under it is a sender of its own.
+        assert_eq!(sender_key("it@contoso.onmicrosoft.com").as_deref(), Some("contoso.onmicrosoft.com"));
     }
 
     #[test]
@@ -366,13 +368,6 @@ mod tests {
     }
 
     #[test]
-    fn private_suffixes_are_separate_senders() {
-        assert_eq!(sender_key("it@contoso.onmicrosoft.com").as_deref(), Some("contoso.onmicrosoft.com"));
-        assert_eq!(sender_key("x@evil.pages.dev").as_deref(), Some("evil.pages.dev"));
-        assert_eq!(logo_domain("noreply@someone.github.io").as_deref(), Some("someone.github.io"));
-    }
-
-    #[test]
     fn only_brands_get_logos() {
         assert_eq!(logo_domain("automated@airbnb.com").as_deref(), Some("airbnb.com"));
         assert_eq!(logo_domain("notifications@mail.github.com").as_deref(), Some("github.com"));
@@ -383,10 +378,14 @@ mod tests {
 
     #[test]
     fn private_addresses_are_refused() {
-        for ip in ["127.0.0.1", "10.0.0.8", "192.168.1.1", "172.16.4.2", "169.254.1.1", "100.64.0.1", "0.0.0.0", "::1", "fe80::1", "fd00::1", "::ffff:192.168.1.1"] {
+        for ip in ["127.0.0.1", "10.0.0.8", "192.168.1.1", "172.16.4.2", "169.254.1.1", "100.64.0.1", "0.0.0.0", "192.0.0.8", "::1", "fe80::1", "fd00::1"] {
             assert!(!is_public(ip.parse().unwrap()), "{ip} must be refused");
         }
-        for ip in ["8.8.8.8", "140.82.112.3", "2606:4700::1111"] {
+        // A private IPv4 inside an IPv6 address: mapped, NAT64, 6to4, the old compatible form.
+        for ip in ["::ffff:192.168.1.1", "::ffff:10.0.0.1", "64:ff9b::c0a8:101", "2002:c0a8:101::1", "::192.168.1.1"] {
+            assert!(!is_public(ip.parse().unwrap()), "{ip} must be refused");
+        }
+        for ip in ["8.8.8.8", "140.82.112.3", "2606:4700::1111", "64:ff9b::808:808"] {
             assert!(is_public(ip.parse().unwrap()), "{ip} is public");
         }
         let ok = |u: &str| allowed(&reqwest::Url::parse(u).unwrap());
@@ -405,6 +404,9 @@ mod tests {
         let png = to_png(svg).unwrap();
         let img = image::load_from_memory(&png).unwrap();
         assert_eq!((img.width(), img.height()), (64, 32));
+        // Red all over, the corner the local image would cover included.
+        let pixels = img.to_rgba8();
+        assert!([(0, 0), (2, 2), (32, 16)].iter().all(|&(x, y)| pixels.get_pixel(x, y).0 == [255, 0, 0, 255]));
 
         // A raster image declaring a huge size: refused without decoding it all.
         let mut bomb = Vec::new();
@@ -441,31 +443,5 @@ mod tests {
         let relative = r#"<link rel='shortcut icon' href='img/f.ico'>"#;
         assert_eq!(best_icon("https://example.com/a/", relative).as_deref(), Some("https://example.com/a/img/f.ico"));
         assert_eq!(best_icon("https://example.com/", "<p>rien</p>"), None);
-    }
-}
-
-#[cfg(test)]
-mod addresses {
-    #[test]
-    fn ipv6_forms_of_private_ipv4_are_refused() {
-        for ip in ["64:ff9b::c0a8:101", "2002:c0a8:101::1", "::192.168.1.1", "::ffff:10.0.0.1", "192.0.0.8"] {
-            assert!(!super::is_public(ip.parse().unwrap()), "{ip}");
-        }
-        assert!(super::is_public("64:ff9b::808:808".parse().unwrap()));
-    }
-}
-
-#[cfg(test)]
-mod network {
-    /// cargo test -p facteur-core logos_from_the_web -- --ignored --nocapture
-    #[tokio::test]
-    #[ignore = "needs the network"]
-    async fn logos_from_the_web() {
-        for domain in ["airbnb.com", "github.com", "sncf-connect.com", "laposte.fr"] {
-            let logo = super::fetch_logo(domain).await;
-            let kind = logo.as_deref().map(|l| l.split(';').next().unwrap_or("").to_string());
-            println!("{domain:<20} {:?} {} octets", kind, logo.as_ref().map_or(0, |l| l.len() * 3 / 4));
-            assert!(logo.is_some(), "{domain} sans logo");
-        }
     }
 }

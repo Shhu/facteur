@@ -193,6 +193,11 @@ fn site(host: &str) -> String {
     if bare.parse::<IpAddr>().is_ok() { bare.to_ascii_lowercase() } else { registrable(host) }
 }
 
+/// The objects to read again: listed with an ETag other than the one stored (new ones included).
+pub(crate) fn changed_objects(listed: &[(String, String)], known: &std::collections::HashMap<String, String>) -> Vec<String> {
+    listed.iter().filter(|(href, etag)| known.get(href) != Some(etag)).map(|(href, _)| href.clone()).collect()
+}
+
 pub fn site_of(url: &Url) -> Option<String> {
     url.host_str().map(site)
 }
@@ -855,12 +860,14 @@ mod tests {
         let c = Client::new("me@shop.fr", "secret").unwrap();
         // Refused before anything is sent: another site, plain http, or with the password to
         // a site not trusted.
+        // Refused, not merely unreachable: offline, or the site down, would fail too.
+        let refused = |r: Result<Answer>| matches!(r, Err(Error::Other(m)) if m.contains("adresse refusée"));
         let evil = Url::parse("https://attacker.example/.well-known/caldav").unwrap();
-        assert!(c.send("PROPFIND", &evil, "0", "", Access::Anonymous(&["shop.fr".into()]), 1024).await.is_err());
+        assert!(refused(c.send("PROPFIND", &evil, "0", "", Access::Anonymous(&["shop.fr".into()]), 1024).await));
         let http = Url::parse("http://shop.fr/.well-known/caldav").unwrap();
-        assert!(c.send("PROPFIND", &http, "0", "", Access::Anonymous(&["shop.fr".into()]), 1024).await.is_err());
+        assert!(refused(c.send("PROPFIND", &http, "0", "", Access::Anonymous(&["shop.fr".into()]), 1024).await));
         let own = Url::parse("https://shop.fr/.well-known/caldav").unwrap();
-        assert!(c.send("PROPFIND", &own, "0", "", Access::Password, 1024).await.is_err());
+        assert!(refused(c.send("PROPFIND", &own, "0", "", Access::Password, 1024).await));
     }
 
     #[test]

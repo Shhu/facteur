@@ -113,6 +113,7 @@ watch(session, () => {
   savedAt.value = null
   lastSaved = null
   textSynced = false
+  opened = d.draft_id || unsaved.value ? null : heading(d)
   showCopies.value = d.cc.length > 0 || d.bcc.length > 0
   // The editor normalises the HTML on open: not a keystroke.
   quiet++
@@ -174,12 +175,20 @@ function onText(text: string) {
   })
 }
 
+/** Recipients and subject as the draft opened with (a reply's, a forward's, a link's); null for a
+ *  draft that must be saved whatever it holds (one already saved, one taken back from the outbox). */
+let opened: string | null = null
+const heading = (d: Draft) => JSON.stringify([d.to, d.cc, d.bcc, d.subject.trim()])
+
+/** Nothing of the writer's own: no text typed (the signature and the quoted message aside), no
+ *  file attached, recipients and subject as they came. Such a draft is never saved: opening a
+ *  reply and closing it leaves nothing in Drafts. */
 const isEmpty = computed(() => {
   const d = draft.value
   if (!d) return true
-  if (d.to.length || d.cc.length || d.bcc.length || d.subject.trim() || d.attachments.length || d.forwarded.length) return false
+  if (d.draft_id || opened === null || heading(d) !== opened || d.attachments.length) return false
   if (d.html === null) return !d.body.trim()
-  const rest = withoutSignature(d.html, senderSignature(accountById(d.account_id), d.from))
+  const rest = ownPart(d.html, senderSignature(accountById(d.account_id), d.from))
   return !htmlText(rest).trim() && !/<img\b/i.test(rest)
 })
 

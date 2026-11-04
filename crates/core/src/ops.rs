@@ -858,7 +858,7 @@ mod tests {
         // Out of the trash, refused for good by the server.
         let out = push(&Op::MoveSet { mailbox: "Trash".into(), uids: vec![5, 6], dest: "INBOX".into(), uidvalidity: None });
         for _ in 0..MAX_ATTEMPTS {
-            store.fail_op(out, "NO", MAX_ATTEMPTS).unwrap();
+            store.refuse_op(out, "NO", MAX_ATTEMPTS).unwrap();
         }
         push(&Op::Move { mailbox: "Trash".into(), uid: 8, dest: "Archive".into(), uidvalidity: None });
         push(&Op::MoveSet { mailbox: "INBOX".into(), uids: vec![1], dest: "Trash".into(), uidvalidity: None });

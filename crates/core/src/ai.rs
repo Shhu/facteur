@@ -1517,7 +1517,7 @@ mod worker {
         use super::*;
 
         #[test]
-        fn a_request_waiting_behind_a_stop_starts_no_process() {
+        fn a_request_read_before_a_stop_sees_it() {
             let before = STOPS.load(Ordering::SeqCst);
             assert!(!stopped_since(before));
             stop();
@@ -1666,9 +1666,8 @@ mod tests {
         assert_eq!(context_room(100, 512, 32_768), Some((628, 512)));
         assert_eq!(context_room(4090, 512, 4096), None);
         for prompt in [0, 500, 3000, 4000, 4079] {
-            if let Some((room, max)) = context_room(prompt, 512, 4096) {
-                assert!(prompt + max + 16 <= room, "{prompt}");
-            }
+            let (room, max) = context_room(prompt, 512, 4096).unwrap_or_else(|| panic!("{prompt}: some room left"));
+            assert!(prompt + max + 16 <= room && max > 0, "{prompt}");
         }
     }
 
@@ -1699,16 +1698,23 @@ mod tests {
         let dest = dir.path().join("test.gguf");
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop = cancel.clone();
+        let received = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let seen = received.clone();
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             download(&model, &dest, &cancel, |done| {
+                seen.store(done, std::sync::atomic::Ordering::SeqCst);
                 if done >= 10 {
                     stop.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             }),
         )
         .await;
-        assert!(res.expect("stopped without waiting for the network").is_err());
+        // The body had started (10 bytes in), then the stop ended it while the network was silent.
+        assert_eq!(received.load(std::sync::atomic::Ordering::SeqCst), 10);
+        let res = res.expect("stopped without waiting for the network");
+        assert!(matches!(&res, Err(Error::Other(m)) if m.contains("arrêté")), "{res:?}");
+        assert!(!dest.exists() && !dest.with_extension("part").exists(), "nothing left behind");
     }
 
     #[test]
@@ -1764,7 +1770,8 @@ mod tests {
     #[test]
     #[ignore]
     fn an_injected_mail_does_not_dictate_the_summary() {
-        let Ok(model) = std::env::var("FACTEUR_TEST_MODEL") else { return };
+        // Run by hand (`--ignored`): without its model it fails, rather than passing having checked nothing.
+        let model = std::env::var("FACTEUR_TEST_MODEL").expect("FACTEUR_TEST_MODEL: path of a model file");
         let date = 1_792_497_600;
         let threads = [
             // Forged control tokens: a system turn of its own after the real one.

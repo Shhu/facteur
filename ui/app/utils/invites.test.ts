@@ -10,15 +10,20 @@ describe('inviteFromSubject', () => {
 
   it('stays fast on a crafted subject', () => {
     const started = performance.now()
-    inviteFromSubject('Invitation: x' + ' @ 1('.repeat(4000))
+    // Ending as Google writes them: the right answer is an invitation, found after the crafted part.
+    const found = inviteFromSubject('Invitation: x' + ' @ 1('.repeat(4000) + ' @ Fri Oct 23, 2026 8am - 11am (UTC+2) (me@x.com)')
     expect(performance.now() - started).toBeLessThan(500)
+    // Still read: quick, not given up.
+    expect(found?.kind).toBe('invitation')
+    expect(found?.title.startsWith('x')).toBe(true)
   })
 })
 
 describe('inviteNotes', () => {
   it('stays fast on a crafted description', () => {
     const started = performance.now()
-    expect(inviteNotes('<a'.repeat(50_000))).not.toBeNull()
+    // No tag in it: the text as it is.
+    expect(inviteNotes('<a'.repeat(50_000))).toBe('<a'.repeat(50_000))
     expect(performance.now() - started).toBeLessThan(500)
   })
 })

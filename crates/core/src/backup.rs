@@ -328,8 +328,7 @@ async fn backup_folder(
     // Every exchange is bounded: a connection dead during an automatic backup (sleep) must not
     // leave it "in progress" until a restart.
     let what = crate::tr!("sauvegarde", "backup");
-    // A folder listed but not readable (shared without the read right): counted as failed, the
-    // other folders still saved.
+    // A folder listed but not readable: left out, the other folders still saved.
     let mb = match bounded(120, &what, async { Ok(lease.session().examine(name).await?) }).await {
         // Refused for good (no read right, gone): noted apart, so the backup is not retried every
         // hour for it. For a while (locked, busy, throttled): failed, tried again soon.
@@ -1293,6 +1292,13 @@ mod tests {
         assert!(bases.contains(&"20.U9V2.facteur".to_string()));
     }
 
+    /// A folder's change time a minute on: however coarse the file system's clock, a file
+    /// added shows (no sleep to wait for it).
+    fn later(dir: &Path) {
+        let at = std::fs::metadata(dir).unwrap().modified().unwrap() + std::time::Duration::from_secs(60);
+        std::fs::File::open(dir).unwrap().set_modified(at).unwrap();
+    }
+
     #[test]
     fn catalog_reads_the_disk_again_only_after_a_change() {
         let root = tempfile::tempdir().unwrap();
@@ -1305,8 +1311,8 @@ mod tests {
         assert_eq!(catalog(root.path(), &RestoreFilter::default(), 10, 0).unwrap().matching, 1);
         let sig = signature(root.path()).unwrap();
         assert_eq!(refreshed().lock().unwrap().get(root.path()), Some(&sig));
-        std::thread::sleep(std::time::Duration::from_millis(20));
         write_synced(&dir.join("cur").join("6.U2V1.facteur:2,"), b"Message-ID: <b@x>\r\n\r\ny").unwrap();
+        later(&dir.join("cur"));
         assert_ne!(signature(root.path()).unwrap(), sig, "a new file changes the signature");
         assert_eq!(catalog(root.path(), &RestoreFilter::default(), 10, 0).unwrap().matching, 2);
     }
@@ -1322,8 +1328,8 @@ mod tests {
         write_synced(&dir.join("cur").join("5.U1V1.facteur:2,S"), b"Message-ID: <a@x>\r\n\r\nx").unwrap();
         assert_eq!(catalog(root.path(), &RestoreFilter::default(), 10, 0).unwrap().matching, 1);
         // A run cut after writing a file, before indexing it.
-        std::thread::sleep(std::time::Duration::from_millis(20));
         write_synced(&dir.join("cur").join("6.U2V1.facteur:2,"), b"Message-ID: <b@x>\r\n\r\ny").unwrap();
+        later(&dir.join("cur"));
         // The next run succeeds.
         let before = signature(root.path()).ok();
         mark_current(root.path(), before);

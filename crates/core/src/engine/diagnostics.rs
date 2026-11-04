@@ -518,8 +518,18 @@ mod tests {
     fn the_engine_reports_its_diagnostics() {
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::open(dir.path()).unwrap();
+        assert!(engine.diagnostics().unwrap().accounts.is_empty());
+        let srv = crate::model::ServerConfig { host: "localhost".into(), port: 143, security: crate::model::Security::None };
+        let acc = engine
+            .store()
+            .insert_account(&crate::model::NewAccount {
+                auth: crate::model::NewAuth::default(),
+                name: "Y".into(), email: "y@example.org".into(), username: "y".into(), password: String::new(),
+                imap: srv.clone(), smtp: srv,
+            })
+            .unwrap();
         let d = engine.diagnostics().unwrap();
-        assert!(d.accounts.is_empty());
+        assert_eq!(d.accounts.iter().map(|a| (a.id, a.email.as_str())).collect::<Vec<_>>(), [(acc, "y@example.org")]);
         assert!(d.store.page_count.unwrap_or(0) > 0);
         assert!(d.store.file_bytes > 0);
     }

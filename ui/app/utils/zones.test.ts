@@ -4,8 +4,13 @@ import { instantAt, wallFields, zoneOffsetLabel } from './zones'
 // Run with the computer in Europe/Paris (see the `test` script): the night of 2027-03-28 has no
 // 02:30 there.
 describe('an event set in another zone', () => {
+  it('runs with the computer in Europe/Paris', () => {
+    // Elsewhere (UTC) the tests below could not fail: 02:30 that night only is skipped in Paris.
+    expect(new Date(2027, 2, 28, 2, 30).getHours()).toBe(3)
+  })
+
   it('keeps a time the computer\'s clock skips', () => {
-    // 02:30 in Tokyo that night, 18:30 UTC the day before.
+    // 02:30 in Tokyo that night, 17:30 UTC the day before.
     const at = Date.UTC(2027, 2, 27, 17, 30) / 1000
     const fields = wallFields(at, 'Asia/Tokyo')
     expect(fields).toEqual({ date: '2027-03-28', time: '02:30' })
