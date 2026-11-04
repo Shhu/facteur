@@ -535,7 +535,7 @@ mod tests {
 
     #[test]
     fn reads_the_size_the_server_takes() {
-        let lines = |l: &[&'static str]| l.to_vec().into_iter();
+        let lines = |l: &'static [&'static str]| l.iter().copied();
         assert_eq!(size_limit(lines(&["smtp.example.com", "8BITMIME", "SIZE 35882577", "AUTH PLAIN"])), Some(35_882_577));
         assert_eq!(size_limit(lines(&["mx", "size 1000"])), Some(1000));
         assert_eq!(size_limit(lines(&["mx", "SIZE 0"])), None);

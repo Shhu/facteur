@@ -8187,7 +8187,7 @@ mod tests {
         let listed = s.list_threads(&[inbox], &[], ThreadFilter::All, true, None, 50, 0).unwrap();
         assert_eq!(listed.iter().map(|t| t.subject.as_str()).collect::<Vec<_>>(), ["Épinglé", "Revenu", "Récent"]);
         assert!(listed[1].woken && listed[1].activity == 400 && listed[1].snoozed_until.is_none());
-        assert_eq!(s.summary(old).unwrap().flags.flagged, true);
+        assert!(s.summary(old).unwrap().flags.flagged);
     }
 
     #[test]

@@ -1558,8 +1558,8 @@ mod tests {
         let other = save("Maison", 3, b"Message-ID: <a@x>\r\n\r\nbody two");
         let before = dir_size(root.path());
         assert_eq!(link_copies(root.path()).unwrap(), 1);
-        assert_eq!(same_file::is_same_file(&all, &label).unwrap(), true);
-        assert_eq!(same_file::is_same_file(&all, &other).unwrap(), false);
+        assert!(same_file::is_same_file(&all, &label).unwrap());
+        assert!(!same_file::is_same_file(&all, &other).unwrap());
         assert_eq!(std::fs::read(&label).unwrap(), raw);
         assert_eq!(dir_size(root.path()), before - raw.len() as u64, "the linked file counts once");
         assert_eq!(link_copies(root.path()).unwrap(), 0, "nothing left to link");

@@ -347,6 +347,8 @@ const KEYCHAIN_READ_WAIT: Duration = Duration::from_secs(120);
 const KEYCHAIN_RETRY: Duration = Duration::from_secs(300);
 /// A sign-in refused "for now" for this long is no longer passing: the user is asked to sign in again.
 const REFUSED_FOR_NOW_LIMIT: Duration = Duration::from_secs(30 * 60);
+/// Results a server search lists, newest first.
+const SERVER_SEARCH_LIMIT: usize = 200;
 /// Refusals "for now" further apart are no run: a sleep or an evening between them.
 const REFUSED_FOR_NOW_GAP: Duration = Duration::from_secs(10 * 60);
 /// At least this many refusals in the run before the account waits for the user.
@@ -4564,7 +4566,8 @@ impl Engine {
             let no_body = if q.has_attachment { self.store.without_body(&ids)? } else { HashSet::new() };
             // IMAP has no criterion for it either: told by the folders here.
             let labelled = if q.labelled.is_some() { self.store.labelled(&ids)? } else { HashSet::new() };
-            Ok((self.store.summaries(&ids, ids.len())?, no_body, labelled))
+            let filtered = q.has_attachment || q.unread.is_some() || q.flagged || q.labelled.is_some();
+            Ok((self.store.summaries(&ids, if filtered { ids.len() } else { SERVER_SEARCH_LIMIT })?, no_body, labelled))
         })?;
         found.retain(|m| {
             (!q.has_attachment || m.has_attachments || no_body.contains(&m.id))
@@ -4573,7 +4576,7 @@ impl Engine {
                 && q.labelled.is_none_or(|want| labelled.contains(&m.id) == want)
         });
         found.sort_by_key(|m| std::cmp::Reverse(m.date));
-        found.truncate(200);
+        found.truncate(SERVER_SEARCH_LIMIT);
         Ok(found)
     }
 

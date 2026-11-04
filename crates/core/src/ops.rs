@@ -671,7 +671,7 @@ async fn expunge_uids(session: &mut Session, caps: &Caps, uids: &[u32]) -> Resul
     for chunk in &others {
         crate::imap::run_checked(session, format!("UID STORE {} +FLAGS.SILENT (\\Deleted)", crate::imap::uid_set(chunk))).await?;
     }
-    Ok(res?)
+    res
 }
 
 /// Checks the labels hold before the op removes any: Gmail has been seen accepting the addition

@@ -85,7 +85,7 @@ fn text(op: Op, values: &[&str], wanted: &str) -> bool {
     match op {
         Op::Contains => values.iter().any(|v| v.contains(&wanted)),
         Op::NotContains => values.iter().all(|v| !v.contains(&wanted)),
-        Op::Is => values.iter().any(|v| *v == wanted),
+        Op::Is => values.contains(&wanted),
         Op::EndsWith => values.iter().any(|v| v.ends_with(&wanted)),
     }
 }
@@ -186,7 +186,7 @@ mod tests {
             ..Default::default()
         };
         let folder = rule(vec![cond(Field::From, Op::EndsWith, "finances.gouv.fr")], vec![Action::Move { mailbox_id: 9 }, Action::MarkRead]);
-        let d = decide(&[folder.clone()], &impots).unwrap();
+        let d = decide(std::slice::from_ref(&folder), &impots).unwrap();
         assert_eq!(d, Decision { mark_read: true, pin: false, destination: Some(Action::Move { mailbox_id: 9 }) });
 
         let mut both = rule(vec![cond(Field::Subject, Op::Contains, "facture"), cond(Field::Bulk, Op::Is, "")], vec![Action::Archive]);

@@ -1451,7 +1451,7 @@ async fn sync_mailbox_locked(
     let mut new: Vec<u32> = sorted
         .iter()
         .rev()
-        .filter(|u| (**u >= from || refused.contains(u) || restore.contains(u)) && !local.contains_key(u) && !in_flight.contains(u) && !purging.is_some_and(|b| **u < b))
+        .filter(|u| (**u >= from || refused.contains(u) || restore.contains(u)) && !local.contains_key(u) && !in_flight.contains(u) && purging.is_none_or(|b| **u >= b))
         .copied()
         .collect();
     let label = crate::utf7::decode(&state.name);
@@ -1877,7 +1877,7 @@ pub async fn load_older(store: &Store, session: &mut Session, state: MailboxStat
     let mut older: Vec<u32> = imap::uid_search_checked(session, &format!("UID 1:{}", from - 1), 0)
         .await?
         .into_iter()
-        .filter(|u| *u < from && !local.contains(u) && !in_flight.contains(u) && !purging.is_some_and(|b| *u < b))
+        .filter(|u| *u < from && !local.contains(u) && !in_flight.contains(u) && purging.is_none_or(|b| *u >= b))
         .collect();
     older.sort_unstable_by(|a, b| b.cmp(a));
     older.truncate(count);
