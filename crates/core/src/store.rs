@@ -720,6 +720,35 @@ CREATE TABLE id_floors (
     id   INTEGER NOT NULL
 );
 "#,
+    // Images shown by hand: also by sender and size, so another message reusing that Message-ID
+    // (a public list post's) and that From does not load its own; the copies of one message share
+    // both. One row per such message: a second one shown (another list's copy) is remembered too.
+    r#"
+CREATE TABLE images_shown_by (
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL,
+    sender     TEXT NOT NULL,
+    size       INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (account_id, message_id, sender, size)
+);
+INSERT OR IGNORE INTO images_shown_by (account_id, message_id, sender, size, created_at)
+    SELECT s.account_id, s.message_id, lower(COALESCE(m.from_addr, '')), m.size, s.created_at
+    FROM images_shown s JOIN messages m ON m.account_id = s.account_id AND m.message_id = s.message_id;
+DROP TABLE images_shown;
+ALTER TABLE images_shown_by RENAME TO images_shown;
+"#,
+    // The floors of `next_id` set from what exists: a row deleted before a table's first new id
+    // would otherwise give its id away again.
+    r#"
+INSERT OR IGNORE INTO id_floors (name, id)
+    SELECT 'messages', COALESCE(MAX(id), 0) FROM messages
+    UNION ALL SELECT 'outbox', COALESCE(MAX(id), 0) FROM outbox
+    UNION ALL SELECT 'pending_ops', COALESCE(MAX(id), 0) FROM pending_ops
+    UNION ALL SELECT 'accounts', COALESCE(MAX(id), 0) FROM accounts
+    UNION ALL SELECT 'calendars', COALESCE(MAX(id), 0) FROM calendars
+    UNION ALL SELECT 'mailboxes', COALESCE(MAX(id), 0) FROM mailboxes;
+"#,
 ];
 
 /// A move into folder ?1 still on its way. With Gmail's labels, a move out of the bin or spam
@@ -1472,7 +1501,6 @@ impl Store {
         Ok(Some(freed))
     }
 
-    #[track_caller]
     /// Tests sharing process-wide state by folder id: a folder of their own, out of the others' range.
     #[cfg(test)]
     pub(crate) fn renumber_mailbox(&self, from: i64, to: i64) -> Result<()> {
@@ -1480,6 +1508,7 @@ impl Store {
         Ok(())
     }
 
+    #[track_caller]
     fn db(&self) -> Conn<'_> {
         let (started, at) = (std::time::Instant::now(), std::panic::Location::caller());
         // A panic mid-query leaves the connection consistent (SQLite rolls the transaction back),
@@ -1912,13 +1941,15 @@ impl Store {
             .query_row("SELECT selectable FROM mailboxes WHERE account_id = ?1 AND name = ?2", params![account_id, name], |r| r.get(0))
             .optional()?;
         let db = self.db();
+        // A new folder never takes a deleted one's id: a rule filing into that one would file here.
+        let fresh = if was_selectable.is_none() { Some(next_id(&db, "mailboxes")?) } else { None };
         db.execute(
-            "INSERT INTO mailboxes (account_id, name, delimiter, role, selectable)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO mailboxes (id, account_id, name, delimiter, role, selectable)
+             VALUES (?6, ?1, ?2, ?3, ?4, ?5)
              ON CONFLICT (account_id, name) DO UPDATE
                 SET delimiter = excluded.delimiter, role = excluded.role, selectable = excluded.selectable
                 WHERE (delimiter, role, selectable) IS NOT (excluded.delimiter, excluded.role, excluded.selectable)",
-            params![account_id, name, delimiter, role.map(Role::as_str), selectable],
+            params![account_id, name, delimiter, role.map(Role::as_str), selectable, fresh],
         )?;
         let id = db.query_row("SELECT id FROM mailboxes WHERE account_id = ?1 AND name = ?2", params![account_id, name], |r| r.get(0))?;
         drop(db);
@@ -4148,8 +4179,8 @@ impl Store {
     /// Nothing kept for a message without a Message-ID.
     pub fn remember_images(&self, id: i64) -> Result<()> {
         self.db().execute(
-            "INSERT OR IGNORE INTO images_shown (account_id, message_id, created_at)
-             SELECT account_id, message_id, ?2 FROM messages WHERE id = ?1 AND message_id IS NOT NULL",
+            "INSERT OR IGNORE INTO images_shown (account_id, message_id, created_at, sender, size)
+             SELECT account_id, message_id, ?2, lower(COALESCE(from_addr, '')), size FROM messages WHERE id = ?1 AND message_id IS NOT NULL",
             params![id, now()],
         )?;
         Ok(())
@@ -4157,7 +4188,8 @@ impl Store {
 
     pub fn images_remembered(&self, id: i64) -> Result<bool> {
         Ok(self.read().query_row(
-            "SELECT EXISTS (SELECT 1 FROM messages m JOIN images_shown s ON s.account_id = m.account_id AND s.message_id = m.message_id WHERE m.id = ?1)",
+            "SELECT EXISTS (SELECT 1 FROM messages m JOIN images_shown s ON s.account_id = m.account_id AND s.message_id = m.message_id
+             AND s.sender = lower(COALESCE(m.from_addr, '')) AND s.size = m.size WHERE m.id = ?1)",
             [id],
             |r| r.get(0),
         )?)
@@ -4428,23 +4460,41 @@ impl Store {
             .replacen("m.mailbox_id", &format!("CASE WHEN {labelled} THEN ?3 ELSE m.mailbox_id END"), 1)
             .replacen("m.draft", draft, 1);
         let mut st = db.prepare(&format!(
-            "SELECT {cols}, m.message_id FROM messages m
+            "SELECT {cols}, m.message_id, m.mailbox_id IS NOT ?3 AND NOT {labelled},
+                    CASE b.role WHEN 'all' THEN 2 WHEN 'trash' THEN 3 WHEN 'junk' THEN 3 ELSE 1 END
+             FROM messages m
              LEFT JOIN mailboxes b ON b.id = m.mailbox_id
              WHERE m.account_id = ?1 AND m.thread_id = ?2
-             ORDER BY m.date, m.mailbox_id IS NOT ?3 AND NOT {labelled},
-                      CASE b.role WHEN 'all' THEN 2 WHEN 'trash' THEN 3 ELSE 1 END"
+             ORDER BY m.date"
         ))?;
         let rows = st.query_map(params![account_id, thread_id, prefer], |r| {
-            Ok((summary_from_row(r)?, r.get::<_, Option<String>>(15)?))
+            Ok((summary_from_row(r)?, r.get::<_, Option<String>>(15)?, r.get::<_, bool>(16)?, r.get::<_, i64>(17)?))
         })?;
-        let mut seen_ids = std::collections::HashSet::new();
-        let mut out = Vec::new();
+        // Copies sharing a Message-ID show once: from the folder asked for, else not the bin, else
+        // the newest (a draft saved again after an older copy went to the bin).
+        let mut out: Vec<MessageSummary> = Vec::new();
+        // Message-ID -> where its kept copy sits in `out`, and that copy's rank.
+        type Rank = (bool, i64, std::cmp::Reverse<i64>);
+        let mut best: HashMap<String, (usize, Rank)> = HashMap::new();
         for row in rows {
-            let (m, key) = row?;
-            if key.is_none_or(|k| seen_ids.insert(k)) {
-                out.push(m);
+            let (m, key, elsewhere, place) = row?;
+            let rank = (elsewhere, place, std::cmp::Reverse(m.date));
+            match key {
+                None => out.push(m),
+                Some(k) => match best.get(&k) {
+                    Some(&(_, kept)) if kept <= rank => {}
+                    Some(&(at, _)) => {
+                        out[at] = m;
+                        best.insert(k, (at, rank));
+                    }
+                    None => {
+                        best.insert(k, (out.len(), rank));
+                        out.push(m);
+                    }
+                },
             }
         }
+        out.sort_by_key(|m| m.date);
         Ok(out)
     }
 
@@ -5223,9 +5273,11 @@ impl Store {
             params![domain, exclude],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
+        // Escaped: a '_' of a crafted domain would match any letter of a real one.
+        let escaped = domain.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
         let wrote_to = db.query_row(
-            "SELECT EXISTS (SELECT 1 FROM correspondents WHERE email LIKE ?1 OR email LIKE ?2)",
-            params![format!("%@{domain}"), format!("%.{domain}")],
+            "SELECT EXISTS (SELECT 1 FROM correspondents WHERE email LIKE ?1 ESCAPE '\\' OR email LIKE ?2 ESCAPE '\\')",
+            params![format!("%@{escaped}"), format!("%.{escaped}")],
             |r| r.get(0),
         )?;
         Ok((messages, senders, wrote_to))
@@ -5969,7 +6021,7 @@ impl Store {
         self.db().execute(
             "DELETE FROM pending_ops WHERE account_id = ?1
                AND op LIKE '{\"kind\":\"save_draft\"%'
-               AND instr(op, '\"message_id\":\"' || ?2 || '\"') > 0",
+               AND json_extract(op, '$.message_id') = ?2",
             params![account_id, message_id],
         )?;
         Ok(())
@@ -5979,10 +6031,39 @@ impl Store {
     pub fn drop_pending_draft_deletes(&self, account_id: i64, message_id: &str) -> Result<()> {
         self.db().execute(
             "DELETE FROM pending_ops WHERE account_id = ?1 AND kind = 'delete_draft'
-               AND instr(op, '\"message_id\":\"' || ?2 || '\"') > 0",
+               AND json_extract(op, '$.message_id') = ?2",
             params![account_id, message_id],
         )?;
         Ok(())
+    }
+
+    /// The draft was deleted or sent since: a deletion of it queued, or a message of it in the outbox.
+    pub fn draft_given_up(&self, account_id: i64, message_id: &str) -> Result<bool> {
+        Ok(self.read().query_row(
+            "SELECT EXISTS (SELECT 1 FROM pending_ops WHERE account_id = ?1 AND kind = 'delete_draft' AND json_extract(op, '$.message_id') = ?2)
+                 OR EXISTS (SELECT 1 FROM outbox WHERE account_id = ?1 AND json_extract(draft, '$.draft_id') = ?2)",
+            params![account_id, message_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Message-IDs of the drafts with a save queued (failed ones too), read in one pass.
+    pub fn queued_draft_ids(&self, account_id: i64) -> Result<HashSet<String>> {
+        let db = self.read();
+        let mut st = db.prepare("SELECT json_extract(op, '$.message_id') FROM pending_ops WHERE account_id = ?1 AND kind = 'save_draft'")?;
+        let rows = st.query_map(params![account_id], |r| r.get::<_, Option<String>>(0))?.filter_map(|r| r.transpose()).collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Ids of the queued saves of a draft.
+    pub fn pending_draft_save_ids(&self, account_id: i64, message_id: &str) -> Result<Vec<i64>> {
+        let db = self.read();
+        let mut st = db.prepare(
+            "SELECT id FROM pending_ops WHERE account_id = ?1 AND kind = 'save_draft'
+               AND json_extract(op, '$.message_id') = ?2 ORDER BY id",
+        )?;
+        let rows = st.query_map(params![account_id, message_id], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        Ok(rows)
     }
 
     /// Payloads of the queued saves of a draft (failed ones too), oldest first.
@@ -5990,7 +6071,7 @@ impl Store {
         let db = self.read();
         let mut st = db.prepare(
             "SELECT op, failed FROM pending_ops WHERE account_id = ?1 AND kind = 'save_draft'
-               AND instr(op, '\"message_id\":\"' || ?2 || '\"') > 0 ORDER BY id",
+               AND json_extract(op, '$.message_id') = ?2 ORDER BY id",
         )?;
         let rows = st.query_map(params![account_id, message_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
         Ok(rows)
@@ -6002,7 +6083,7 @@ impl Store {
         Ok(self.read().query_row(
             &format!(
                 "SELECT EXISTS (SELECT 1 FROM pending_ops WHERE account_id = ?1 AND failed = 0 AND kind = 'save_draft'
-                                  AND instr(op, '\"message_id\":\"' || ?2 || '\"') > 0)
+                                  AND json_extract(op, '$.message_id') = ?2)
                      OR EXISTS (SELECT 1 FROM messages m WHERE m.account_id = ?1 AND m.message_id = ?2 AND {})",
                 in_folder_where("m", "rb.account_id = ?1 AND rb.role = 'drafts'")
             ),
@@ -6409,8 +6490,8 @@ fn local_day(ts: i64) -> i64 {
 /// The longest a zone is ahead of or behind UTC (whole-day events read in the local zone).
 const MAX_ZONE_OFFSET: i64 = 14 * 3600;
 
-/// An id for a new row of `table` (`messages`, `outbox`, `pending_ops`, `accounts`, `calendars`)
-/// never given before. SQLite hands the
+/// An id for a new row of `table` (`messages`, `outbox`, `pending_ops`, `accounts`, `calendars`,
+/// `mailboxes`) never given before. SQLite hands the
 /// highest id out again once its row is deleted: a draft replaced, then sent, left its id to the
 /// reply arriving next, and everything kept by id (the interface's messages, a body downloaded)
 /// showed the draft under the reply.
@@ -6491,6 +6572,12 @@ impl Store {
             return Ok(EventSearch { hits: Vec::new(), more: false });
         }
         let events = self.calendar_events(q.from.unwrap_or(i64::MIN / 4), q.to.unwrap_or(i64::MAX / 4))?;
+        // Outlook gives each occurrence a uid of its own: its series is told by the master's id.
+        let masters: HashMap<i64, String> = {
+            let db = self.read();
+            let mut st = db.prepare("SELECT id, series FROM calendar_events WHERE series IS NOT NULL")?;
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
+        };
         let has_all = |hay: &str, words: &[String]| words.iter().all(|w| hay.contains(w.as_str()));
         let mut series: Vec<(CalendarEvent, usize)> = Vec::new();
         let mut index: HashMap<(i64, String), usize> = HashMap::new();
@@ -6510,7 +6597,7 @@ impl Store {
                 continue;
             }
             // By start: the first occurrence not over stands for its series, else the last one.
-            let key = (e.calendar_id, if e.recurring { e.uid.clone() } else { format!("{}\n{}", e.uid, e.instance) });
+            let key = (e.calendar_id, if e.recurring { masters.get(&e.id).cloned().unwrap_or_else(|| e.uid.clone()) } else { format!("{}\n{}", e.uid, e.instance) });
             match index.get(&key) {
                 Some(&i) => {
                     let (kept, n) = &mut series[i];
@@ -6578,7 +6665,8 @@ impl Store {
     /// date of its series.
     pub fn set_event_response(&self, id: i64, answer: &str, series: bool) -> Result<()> {
         let sql = if series {
-            "UPDATE calendar_events SET response = ?2 WHERE response IS NOT NULL AND (calendar_id, uid) = (SELECT calendar_id, uid FROM calendar_events WHERE id = ?1)"
+            "UPDATE calendar_events SET response = ?2 WHERE response IS NOT NULL
+               AND (calendar_id, COALESCE(series, uid)) = (SELECT calendar_id, COALESCE(series, uid) FROM calendar_events WHERE id = ?1)"
         } else {
             "UPDATE calendar_events SET response = ?2 WHERE id = ?1"
         };
@@ -7982,6 +8070,29 @@ mod tests {
         assert!(!s.summary(id).unwrap().flags.seen, "the local change stays");
         s.update_flags(inbox, &[(1, ServerFlags { seen: true, ..FLAGS })], &HashSet::new(), s.flags_tick()).unwrap();
         assert!(s.summary(id).unwrap().flags.seen);
+    }
+
+    #[test]
+    fn a_thread_shows_the_live_copy_of_a_draft_not_the_one_in_the_bin() {
+        let (s, acc, inbox, _) = setup();
+        let drafts = s.upsert_mailbox(acc, "Drafts", Some("/"), Some(Role::Drafts), true).unwrap();
+        let trash = s.upsert_mailbox(acc, "Trash", Some("/"), Some(Role::Trash), true).unwrap();
+        let root = s.insert_header(acc, inbox, 1, &header("a@x", None, "a", 1), FLAGS, 10).unwrap();
+        let binned = s.insert_header(acc, trash, 1, &header("d@x", Some("a@x"), "Re: a", 2), FLAGS, 10).unwrap();
+        let live = s.insert_header(acc, drafts, 1, &header("d@x", Some("a@x"), "Re: a", 5), FLAGS, 12).unwrap();
+        let thread = s.summary(root).unwrap().thread_id;
+        let ids: Vec<i64> = s.thread_messages(acc, thread, None).unwrap().iter().map(|m| m.id).collect();
+        assert_eq!(ids, [root, live], "not {binned}");
+    }
+
+    #[test]
+    fn a_deleted_folders_id_is_never_given_again() {
+        let (s, acc, _, _) = setup();
+        let bills = s.upsert_mailbox(acc, "Factures", Some("/"), None, true).unwrap();
+        assert_eq!(s.upsert_mailbox(acc, "Factures", Some("/"), None, true).unwrap(), bills, "the same folder keeps its id");
+        s.delete_mailbox(bills).unwrap();
+        let next = s.upsert_mailbox(acc, "Perso", Some("/"), None, true).unwrap();
+        assert_ne!(next, bills, "a rule filing into the deleted folder must not file here");
     }
 
     #[test]
@@ -9814,6 +9925,10 @@ mod tests {
         assert_eq!(find(EventQuery { from: Some(400), ..text("hebdo") }), ["weekly 400 2"]);
         assert!(find(EventQuery::default()).is_empty());
         assert!(find(EventQuery { without: "point".into(), ..Default::default() }).is_empty());
+        // Outlook: a uid per occurrence, one series all the same.
+        let outlook = |uid: &str, start: i64| Instance { series: Some("master".into()), ..ev(uid, "x", "Réunion équipe", start) };
+        s.replace_calendar_events(b, acc, "b", &[outlook("o1", 500), outlook("o2", 600)], None).unwrap();
+        assert_eq!(find(text("equipe")), ["o1 500 2"]);
     }
 
     #[test]

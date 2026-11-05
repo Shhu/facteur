@@ -67,6 +67,23 @@ export function withoutSignature(html: string, legacy = ''): string {
 
 /** What the writer typed: the draft without its signature, nor the quoted or forwarded message
  *  below. */
+/** What the quoted or forwarded message holds, from its start to the end: its words and pictures
+ *  as the editor keeps them (no style sheet, no spacing between blocks: it rewrites the HTML on
+ *  open and at a change of sender). A change there is the writer's own too. */
+export function quotedPart(html: string): string {
+  const doc = new DOMParser().parseFromString(html, 'text/html')
+  doc.body.querySelectorAll('style, script, title, noscript, template').forEach(el => el.remove())
+  const start = quotedStart(doc.body)
+  let text = ''
+  let images = 0
+  for (let el: Element | null = start; el; el = el.nextElementSibling) {
+    text += el.textContent ?? ''
+    // Only those the editor keeps: an image without a source (one the mail did not carry) goes.
+    images += el.querySelectorAll('img[src]').length + (el.matches('img[src]') ? 1 : 0)
+  }
+  return `${text.replace(/\s+/g, '')}\n${images}`
+}
+
 export function ownPart(html: string, legacy = ''): string {
   const doc = new DOMParser().parseFromString(withoutSignature(html, legacy), 'text/html')
   const start = quotedStart(doc.body)
@@ -105,6 +122,8 @@ let beforeReplace: (() => Promise<boolean>) | null = null
 let beforeQuit: (() => Promise<boolean>) | null = null
 /** Latest replacement asked for: an older one still waiting for the save is dropped. */
 let replacing = 0
+/** Latest draft asked for: a slower answer for an earlier one is dropped. */
+let opening = 0
 
 /** Resolves to false when the save failed and the user keeps the draft: cancel the close. */
 export function flushDraftBeforeQuit(): Promise<boolean> {
@@ -118,6 +137,8 @@ export function useComposer() {
   const session = useState('composer-session', () => 0)
   /** The draft just shown exists nowhere else (taken back from the outbox): save it at once. */
   const unsaved = useState('composer-unsaved', () => false)
+  /** Bumped at each draft saved: a thread showing it reads it again then, not at every sync tick. */
+  const saved = useState('composer-saved', () => 0)
 
   function onBeforeReplace(fn: () => Promise<boolean>) {
     beforeReplace = fn
@@ -262,10 +283,14 @@ export function useComposer() {
   }
 
   async function resume(messageId: number) {
+    const n = ++opening
+    const seen = replacing
     try {
       const d = await api.openDraft(messageId)
+      // Another draft, a reply or a new message asked for meanwhile: that one stays.
+      if (n !== opening || replacing !== seen) return
       // Already in the window: kept as it is, newer than its last save.
-      if (open.value && d.draft_id && draft.value?.draft_id === d.draft_id) return
+      if (open.value && (d.draft_id ? draft.value?.draft_id === d.draft_id : draft.value?.source === messageId)) return
       await reopen(d)
     } catch (e) {
       showError(e, tr('common.toast.draftUnreadable'))
@@ -274,15 +299,16 @@ export function useComposer() {
 
   /** Deletes a saved draft without opening it; not the one the composer holds, which saves itself
    *  again (it is discarded from there). Resolves to false when nothing was deleted. */
-  async function discardSaved(messageId: number): Promise<boolean> {
+  async function discardSaved(messageId: number, inDrafts = true): Promise<boolean> {
     try {
       const d = await api.openDraft(messageId)
-      if (!d.draft_id) return false
-      if (open.value && draft.value?.draft_id === d.draft_id) {
+      if (open.value && (d.draft_id ? draft.value?.draft_id === d.draft_id : draft.value?.source === messageId)) {
         toast.add({ title: tr('common.toast.draftOpen'), icon: 'i-lucide-file-pen' })
         return false
       }
-      await api.discardDraft(d.account_id, d.draft_id)
+      // A copy without a Message-ID, or outside Drafts (another client's): it goes to the bin itself.
+      if (!d.draft_id || !inDrafts) await api.trash([messageId])
+      else await api.discardDraft(d.account_id, d.draft_id)
       return true
     } catch (e) {
       showError(e, tr('common.toast.draftNotDiscarded'))
@@ -305,7 +331,7 @@ export function useComposer() {
     }
   }
 
-  return { open, draft, session, unsaved, compose, composeMailto, reply, replyAllCount, forward, resume, discardSaved, reopen, editOutgoing, onBeforeReplace, onBeforeQuit }
+  return { open, draft, session, unsaved, saved, compose, composeMailto, reply, replyAllCount, forward, resume, discardSaved, reopen, editOutgoing, onBeforeReplace, onBeforeQuit }
 }
 
 /** Strips every remote resource the editor would load (tracking pixels): non-embedded `img`

@@ -282,6 +282,16 @@ const PALETTES: Record<Paint, { key: string, value: string, swatch: string }[]> 
   ]
 }
 const attribute = (paint: Paint) => paint === 'color' ? 'color' : 'backgroundColor'
+// Read once per editor state, not once per swatch: the toolbar asks each of them at every render.
+const paints = new WeakMap<object, Record<string, unknown>>()
+function paintsOf(editor: Editor) {
+  let found = paints.get(editor.state)
+  if (!found) {
+    found = editor.getAttributes('textStyle')
+    paints.set(editor.state, found)
+  }
+  return found
+}
 function paint(editor: Editor, kind: Paint, value: string | null) {
   const chain = editor.chain().focus()
   if (kind === 'color') return value ? chain.setColor(value) : chain.unsetColor()
@@ -291,8 +301,27 @@ function paint(editor: Editor, kind: Paint, value: string | null) {
 const pickerOpen = ref(false)
 const pickerPaint = ref<Paint>('color')
 const pickerValue = ref('#2563eb')
+/** The code being typed: handed to the picker once whole, which reads a partial one as white. */
+const pickerText = ref(pickerValue.value)
+watch(pickerValue, (v) => {
+  if (v.toLowerCase() !== pickerText.value.toLowerCase()) pickerText.value = v
+})
+/** A typed code as #rrggbb: the # optional, #rgb spelled out; null when it is none. */
+function hexCode(text: string): string | null {
+  const bare = text.trim().replace(/^#/, '')
+  if (/^[0-9a-f]{6}$/i.test(bare)) return `#${bare}`
+  if (/^[0-9a-f]{3}$/i.test(bare)) return `#${[...bare].map(c => c + c).join('')}`
+  return null
+}
+watch(pickerText, (v) => {
+  const code = hexCode(v)
+  if (code && /^#?[0-9a-f]{6}$/i.test(v.trim())) pickerValue.value = code
+})
+const pickerInvalid = computed(() => !hexCode(pickerText.value))
 function applyPicked() {
-  if (target && /^#[0-9a-f]{6}$/i.test(pickerValue.value)) paint(target, pickerPaint.value, pickerValue.value).run()
+  const code = hexCode(pickerText.value)
+  if (!code) return
+  if (target) paint(target, pickerPaint.value, code).run()
   pickerOpen.value = false
 }
 
@@ -341,7 +370,7 @@ const handlers = {
     canExecute: () => true,
     execute: (editor: Editor, cmd: { paint: Paint, value: string | null }) => paint(editor, cmd.paint, cmd.value),
     isActive: (editor: Editor, cmd: { paint: Paint, value: string | null }) =>
-      !!cmd.value && editor.isActive('textStyle', { [attribute(cmd.paint)]: cmd.value })
+      !!cmd.value && paintsOf(editor)[attribute(cmd.paint)] === cmd.value
   },
   pickPaint: {
     canExecute: () => true,
@@ -350,6 +379,7 @@ const handlers = {
       pickerPaint.value = cmd.paint
       const current = editor.getAttributes('textStyle')[attribute(cmd.paint)]
       if (typeof current === 'string' && /^#[0-9a-f]{6}$/i.test(current)) pickerValue.value = current
+      pickerText.value = pickerValue.value
       pickerOpen.value = true
       return editor.chain()
     },
@@ -568,8 +598,8 @@ const toolbar = computed(() => {
         <form class="flex flex-col items-center gap-3" @submit.prevent="applyPicked">
           <UColorPicker v-model="pickerValue" />
           <div class="flex w-full gap-2">
-            <UInput v-model="pickerValue" class="min-w-0 flex-1 font-mono" :aria-label="$t('app.editor.customColor')" />
-            <UButton type="submit" :label="$t('app.editor.apply')" />
+            <UInput v-model="pickerText" class="min-w-0 flex-1 font-mono" :color="pickerInvalid ? 'error' : undefined" :highlight="pickerInvalid" :aria-invalid="pickerInvalid" :aria-label="$t('app.editor.customColor')" />
+            <UButton type="submit" :label="$t('app.editor.apply')" :disabled="pickerInvalid" />
           </div>
         </form>
       </template>

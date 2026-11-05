@@ -59,6 +59,10 @@ const scopeItems = computed(() => [
 /** Chosen once per new event: every attempt to create it sends the same key, so one whose
  *  answer was lost does not create it twice. */
 let createKey = ''
+/** The calendar a create was sent to. An answer lost, the event may be there already: a retry
+ *  into another calendar is another event, with a key of its own (the same key would have the
+ *  first one filed under this calendar). */
+let triedIn: number | null = null
 const newKey = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('')
 /** Outlook gives only a preview of an event's body: it is changed in Outlook. */
 const descriptionLocked = computed(() => !!props.event && calendars.value.find(c => c.id === props.event!.calendar_id)?.source === 'microsoft')
@@ -212,6 +216,7 @@ function fill() {
   repeat.value = blankRepeat()
   guests.value = (props.event?.attendees ?? []).filter(a => !a.organizer).map(a => addressFull({ name: a.name ?? null, email: a.email }))
   createKey = newKey()
+  triedIn = null
   zoneChosen.value = false
   const e = props.event
   if (e) {
@@ -341,6 +346,8 @@ async function save() {
       await api.updateEvent(props.event, d, scope.value === 'series')
       emit('saved', props.event.id)
     } else {
+      if (triedIn !== null && triedIn !== form.calendarId) createKey = newKey()
+      triedIn = form.calendarId!
       const id = await api.createEvent(form.calendarId!, d, createKey)
       try {
         localStorage.setItem(LAST_KEY, String(form.calendarId))

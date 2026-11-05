@@ -275,7 +275,7 @@ pub struct ProcessMemory {
 }
 
 impl Purpose {
-    const ALL: [Purpose; 4] = [Purpose::Sync, Purpose::Interactive, Purpose::Queue, Purpose::Background];
+    const ALL: [Purpose; 5] = [Purpose::Sync, Purpose::Interactive, Purpose::Queue, Purpose::Background, Purpose::Completion];
 
     fn name(self) -> &'static str {
         match self {
@@ -283,6 +283,7 @@ impl Purpose {
             Purpose::Interactive => "interactive",
             Purpose::Queue => "queue",
             Purpose::Background => "background",
+            Purpose::Completion => "completion",
         }
     }
 }

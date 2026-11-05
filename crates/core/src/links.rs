@@ -23,6 +23,22 @@ const CLICK_TRACKERS: &[(&str, &str)] = &[
     ("mlsend.com", "MailerLite"), ("convertkit-mail.com", "Kit"), ("customeriomail.com", "Customer.io"),
 ];
 
+/// Hosts serving every customer of a mailing or storage service: approving one would let anyone
+/// sending through it load images (an open reported).
+const SHARED_HOSTS: &[&str] = &[
+    "mcusercontent.com", "amazonaws.com", "cloudfront.net", "googleusercontent.com", "googleapis.com", "azureedge.net",
+    "windows.net", "akamaihd.net", "imgur.com", "postimg.cc", "imgbb.com",
+    // Image proxies fetching any address for anyone.
+    "wp.com", "cloudinary.com", "githubusercontent.com", "weserv.nl",
+];
+
+/// A registrable domain whose images are no one's in particular: never approved as a host. Below
+/// one too: the public suffix list makes `storage.googleapis.com` a registrable domain of its own.
+pub fn shared_host(domain: &str) -> bool {
+    let under = |s: &str| domain == s || domain.strip_suffix(s).is_some_and(|r| r.ends_with('.'));
+    SHARED_HOSTS.iter().any(|s| under(s)) || CLICK_TRACKERS.iter().any(|(d, _)| *d == domain)
+}
+
 /// Security gateways rewriting every link of the mail they let through (registrable domain, path,
 /// parameter holding the destination, service name): the gateway checks the link at click time.
 const GATEWAYS: &[(&str, &str, &str, &str)] = &[("mailinblack.com", "/securelink", "url", "Mailinblack")];
@@ -44,6 +60,9 @@ pub struct LinkFacts {
     /// As spelled in DNS, for lookups.
     #[serde(skip)]
     pub domain_ascii: String,
+    /// The domain judged (its age, how often it was seen): a gateway's destination, else `domain_ascii`.
+    #[serde(skip)]
+    pub judged_ascii: String,
     pub secure: bool,
     pub ip: bool,
     /// Non-Latin or special characters in the domain (possible homograph).
@@ -146,11 +165,23 @@ pub fn analyze(href: &str, text: &str) -> Option<LinkFacts> {
         .iter()
         .find(|(d, path, ..)| *d == domain_ascii && url.path().trim_end_matches('/') == *path)
         .and_then(|(_, _, param, name)| {
-            let (_, to) = url.query_pairs().find(|(k, _)| k == param)?;
+            // Named twice, which one the gateway follows is unknown: judged as the gateway itself.
+            let mut named = url.query_pairs().filter(|(k, _)| k == param);
+            let (_, to) = named.next()?;
+            if named.next().is_some() {
+                return None;
+            }
             let to = url::Url::parse(&to).ok()?;
             let url::Host::Domain(to_host) = to.host()? else { return None };
             let to_host = bare(to_host);
-            (matches!(to.scheme(), "http" | "https") && !to_host.split('.').any(|l| l.starts_with("xn--"))).then_some((*name, to_host, to.scheme() == "https"))
+            // Not to a shortener, a tracker or a redirector naming its own target: anyone can write
+            // a gateway link, and its destination would hide the real one while escaping the
+            // redirector's note.
+            let to_domain = registrable(&to_host);
+            let hidden = SHORTENERS.iter().any(|d| *d == to_host || *d == to_domain)
+                || CLICK_TRACKERS.iter().any(|(d, _)| *d == to_host || *d == to_domain)
+                || to.query_pairs().any(|(_, v)| v.starts_with("http://") || v.starts_with("https://"));
+            (matches!(to.scheme(), "http" | "https") && !hidden && !to_host.split('.').any(|l| l.starts_with("xn--"))).then_some((*name, to_host, to.scheme() == "https"))
         });
     let compared = gateway.as_ref().map_or(host.as_str(), |(_, to, _)| to.as_str());
     let differs = |s: &String| *s != compared && !compared.ends_with(&format!(".{s}")) && !s.ends_with(&format!(".{compared}"));
@@ -197,6 +228,7 @@ pub fn analyze(href: &str, text: &str) -> Option<LinkFacts> {
         secure: url.scheme() == "https" && gateway.as_ref().is_none_or(|(_, _, secure)| *secure),
         shortener: SHORTENERS.contains(&ascii.as_str()),
         tracker: CLICK_TRACKERS.iter().find(|(d, _)| *d == domain_ascii).map(|(_, name)| *name),
+        judged_ascii: gateway.as_ref().map_or_else(|| domain_ascii.clone(), |(_, to, _)| registrable(to)),
         gateway: gateway.map(|(name, ..)| name),
         host,
         domain,
@@ -560,6 +592,13 @@ mod tests {
         let gateway = "https://mibc-fr-06.mailinblack.com/securelink/?url=https%3A%2F%2Fyoutube.com&key=abc";
         let f = analyze(gateway, "https://youtube.com/watch?v=u3Q29svLrcU").unwrap();
         assert_eq!(f.gateway, Some("Mailinblack"));
+        assert_eq!(f.judged_ascii, "youtube.com", "its reputation is the destination's, not the gateway's");
+        let twice = "https://x.mailinblack.com/securelink/?url=https%3A%2F%2Fyoutube.com&url=https%3A%2F%2Fevil.example&key=k";
+        assert_eq!(analyze(twice, "youtube.com").unwrap().gateway, None, "two destinations: neither is taken at its word");
+        let shortened = "https://x.mailinblack.com/securelink/?url=https%3A%2F%2Fbit.ly%2Fabc&key=k";
+        assert_eq!(analyze(shortened, "bit.ly/abc").unwrap().gateway, None, "a shortener hides the destination: not unwrapped");
+        let redirected = "https://x.mailinblack.com/securelink/?url=https%3A%2F%2Fwww.google.com%2Furl%3Fq%3Dhttps%3A%2F%2Fevil.example&key=k";
+        assert_eq!(analyze(redirected, "google.com").unwrap().gateway, None, "nor a redirector naming its own target");
         assert!(!f.deceptive);
         let trust = evaluate(&f, &LinkContext::default());
         assert_eq!(trust.level, Level::Medium, "{trust:?}");
@@ -586,6 +625,16 @@ mod tests {
         // What is read in the text is not what is seen; an unencrypted destination still tells.
         assert!(analyze(gateway, "\u{202E}moc.ebutuoy").unwrap().deceptive);
         assert!(!analyze("https://mibc-fr-06.mailinblack.com/securelink/?url=http%3A%2F%2Fyoutube.com", "Voir").unwrap().secure);
+    }
+
+    #[test]
+    fn shared_hosts_cover_what_the_public_suffix_list_splits_off() {
+        for shared in ["googleapis.com", "storage.googleapis.com", "camo.githubusercontent.com", "s3.amazonaws.com", "i0.wp.com"] {
+            assert!(shared_host(shared), "{shared}");
+        }
+        for own in ["notgoogleapis.com", "example.com", "banque.fr"] {
+            assert!(!shared_host(own), "{own}");
+        }
     }
 
     #[test]

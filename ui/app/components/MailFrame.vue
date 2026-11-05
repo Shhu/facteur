@@ -403,6 +403,23 @@ function prepare(doc: Document) {
     e.preventDefault()
     openImageMenu(src, e.clientX, e.clientY)
   })
+  // Copied or dragged out while its images are blocked: pasted into a mail, they would load in the
+  // app's own window (a tracking pixel reporting the reading). The selection leaves them out.
+  const selected = (data: DataTransfer | null) => {
+    const selection = doc.getSelection()
+    if (props.allowRemote || !selection || selection.isCollapsed || !data) return false
+    const box = doc.createElement('div')
+    for (let i = 0; i < selection.rangeCount; i++) box.appendChild(selection.getRangeAt(i).cloneContents())
+    data.setData('text/html', withoutRemoteImages(box.innerHTML))
+    data.setData('text/plain', selection.toString())
+    return true
+  }
+  doc.addEventListener('copy', (e) => {
+    if (selected(e.clipboardData)) e.preventDefault()
+  })
+  doc.addEventListener('dragstart', (e) => {
+    selected(e.dataTransfer)
+  })
   observer = new ResizeObserver(() => fitHeight(doc))
   observer.observe(doc.documentElement)
   fitHeight(doc)

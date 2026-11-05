@@ -979,13 +979,17 @@ async fn complete_gmail(store: &Store, session: &mut Session, state: &MailboxSta
     }
     let wanted: Vec<u32> = wanted.into_iter().collect();
     let local = store.mailbox_uids_among(state.id, &wanted)?;
-    let mut missing: Vec<u32> = wanted.into_iter().filter(|u| !local.contains_key(u) && !in_flight.contains(u)).collect();
+    // Arrived since the folder's last sync (after this sync's own search): left to the next sync,
+    // which runs the rules and the screener on them and tells of them.
+    let next = state.uidnext.filter(|_| state.uidvalidity.is_some() && state.role == Some(Role::All));
+    let mut missing: Vec<u32> =
+        wanted.into_iter().filter(|u| !local.contains_key(u) && !in_flight.contains(u) && next.is_none_or(|n| *u < n)).collect();
     if missing.is_empty() {
         return Ok(changed);
     }
     missing.sort_unstable_by(|a, b| b.cmp(a));
-    let fetched = fetch_headers(store, session, state.account_id, state.id, &mut missing, &mut |_| {}, false).await?;
-    Ok(changed || !fetched.ids.is_empty())
+    let fetched_any = !fetch_headers(store, session, state.account_id, state.id, &mut missing, &mut |_| {}, false).await?.ids.is_empty();
+    Ok(changed || fetched_any)
 }
 
 /// `known`: the folder's cached UIDs when already at hand; otherwise read only if needed.
@@ -1614,7 +1618,7 @@ fn asks_status_alone(scope: &Scope, list_status: bool, listed: bool) -> bool {
     matches!(scope, Scope::All | Scope::System) && (!list_status || !listed)
 }
 
-fn message_level(e: &crate::Error) -> bool {
+pub(crate) fn message_level(e: &crate::Error) -> bool {
     use async_imap::error::Error as Imap;
     match e {
         crate::Error::Imap(Imap::Parse(_) | Imap::Bad(_)) => true,
@@ -1904,7 +1908,12 @@ async fn load_older_labelled(store: &Store, session: &mut Session, label: &Mailb
     // Those the server will not give are left out: asked again, they would never be cached and
     // the history fetch would go round for ever.
     let bad: HashSet<u32> = unreadable().get(&all.id).map(|u| u.bad.clone()).unwrap_or_default();
-    let mut missing: Vec<u32> = carrying.into_iter().filter(|u| !local.contains_key(u) && !in_flight.contains(u) && !bad.contains(u)).collect();
+    // Arrived since All Mail's last sync: left to the sync, which screens and notifies them.
+    let next = store.mailbox_state(all.id)?.uidnext;
+    let mut missing: Vec<u32> = carrying
+        .into_iter()
+        .filter(|u| !local.contains_key(u) && !in_flight.contains(u) && !bad.contains(u) && next.is_none_or(|n| *u < n))
+        .collect();
     missing.sort_unstable_by(|a, b| b.cmp(a));
     missing.truncate(count);
     if missing.is_empty() {
@@ -2110,28 +2119,37 @@ pub enum Download {
 
 /// For reading: a message of `size` bytes or more without its large attachments, when its
 /// structure has some; otherwise all of it.
-pub async fn download_for_reading(store: &Store, session: &mut Session, id: i64, mailbox: &str, uid: u32, size: u32) -> Result<(Download, Option<u32>)> {
+/// `None`: a large message to download whole, which the caller does on a connection of its own
+/// (this one may be borrowed from the account's syncs).
+pub async fn download_for_reading(store: &Store, session: &mut Session, id: i64, mailbox: &str, uid: u32, size: u32) -> Result<Option<(Download, Option<u32>)>> {
     let validity = session.examine(mailbox).await?.uid_validity;
     check_still_there(store, id, mailbox, uid, validity)?;
     if size >= crate::partial::PARTIAL_FROM {
-        match shown_parts(session, uid).await {
-            Ok(Some(raw)) => return Ok((Download::Partial(raw), validity)),
-            Ok(None) => {}
-            Err(e) if e.is_connection_drop() => return Err(e),
-            // A structure this parser cannot read: the whole message, as before.
-            Err(e) => tracing::info!("message {id}: structure unreadable ({e}), downloaded whole"),
-        }
+        return match shown_parts(session, uid).await {
+            Ok(Some(raw)) => Ok(Some((Download::Partial(raw), validity))),
+            Ok(None) => Ok(None),
+            // A structure this parser cannot read closes the stream: the caller downloads the whole
+            // message on a new connection.
+            Err(e) if e.is_connection_drop() || message_level(&e) => Err(e),
+            Err(e) => {
+                tracing::info!("message {id}: structure unreadable ({e}), downloaded whole");
+                Ok(None)
+            }
+        };
     }
-    Ok((Download::Whole(whole_body(session, uid).await?), validity))
+    Ok(Some((Download::Whole(whole_body(session, uid).await?), validity)))
 }
 
 async fn shown_parts(session: &mut Session, uid: u32) -> Result<Option<Vec<u8>>> {
     use async_imap::imap_proto::{MessageSection, SectionPath};
     let fetches: Vec<Fetch> = session.uid_fetch(uid.to_string(), "(UID BODYSTRUCTURE)").await?.try_collect().await?;
+    // A FETCH cut short ends quietly: a dropped connection, not a message to read whole.
+    imap::still_open(session).await?;
     let Some(plan) = fetches.iter().find(|f| f.uid == Some(uid)).and_then(|f| f.bodystructure()).and_then(crate::partial::plan) else {
         return Ok(None);
     };
     let fetches: Vec<Fetch> = session.uid_fetch(uid.to_string(), plan.query()).await?.try_collect().await?;
+    imap::still_open(session).await?;
     let Some(fetch) = fetches.iter().find(|f| f.uid == Some(uid)) else { return Ok(None) };
     let path = |section: &str| section.split('.').map(str::parse).collect::<std::result::Result<Vec<u32>, _>>().ok();
     let Some(header) = fetch.section(&SectionPath::Full(MessageSection::Header)) else { return Ok(None) };

@@ -10,7 +10,7 @@ defineEmits<{ toggle: [id: number] }>()
 
 const { reply, replyAllCount: countReplyAll, forward, composeMailto, resume, discardSaved } = useComposer()
 const { quick } = useTemplates()
-const { accountById, accountColor, isMine } = useMail()
+const { accountById, accountColor, isMine, mailboxes } = useMail()
 const showError = useErrorToast()
 const { t } = useI18n()
 const toast = useToast()
@@ -132,7 +132,10 @@ async function discardDraft() {
   if (!await confirm(t('mail.messageCard.discardDraftConfirm'), { title: t('mail.messageCard.discardDraft'), kind: 'warning', okLabel: t('mail.messageCard.discardDraft') })) return
   discarding.value = true
   try {
-    if (await discardSaved(props.message.id)) useListStale().bump()
+    // Flagged a draft in another folder (another client's): that copy goes to the bin, not the
+    // draft of that Message-ID in Drafts. With Gmail's labels a draft lies in All Mail.
+    const role = mailboxes.value.find(b => b.id === props.message.mailbox_id)?.role
+    if (await discardSaved(props.message.id, role === 'drafts' || role === 'all')) useListStale().bump()
   } finally {
     discarding.value = false
   }

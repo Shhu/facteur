@@ -1008,8 +1008,8 @@ async fn save_image(app: AppHandle, engine: Eng<'_>, id: i64, src: String, ask: 
             .map_err(|e| Error::Other(e.to_string()))?
             .map_err(|e| Error::Other(facteur_core::tr!("enregistrement impossible : {e}", "could not save: {e}")))?
     };
-    // Opened from facteur only while it still has the image's own extension.
-    let openable = path.to_ascii_lowercase().ends_with(&format!(".{ext}")) && !ext.is_empty();
+    // Opened from facteur only while it still has the image's own extension, and not a scripted one.
+    let openable = path.to_ascii_lowercase().ends_with(&format!(".{ext}")) && facteur_core::attachments::image_openable(&ext);
     app.state::<SavedFiles>().0.lock().unwrap_or_else(|e| e.into_inner()).insert(path.clone(), openable);
     Ok(Some(Saved { path, openable }))
 }

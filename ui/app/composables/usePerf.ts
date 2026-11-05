@@ -119,7 +119,7 @@ export function usePerf() {
 // Mirrors crates/core/src/engine/diagnostics.rs.
 
 export interface ConnectionDiagnostics {
-  purpose: 'sync' | 'interactive' | 'queue' | 'background'
+  purpose: 'sync' | 'interactive' | 'queue' | 'background' | 'completion'
   open: boolean | null
   busy: boolean
   idle_secs: number | null

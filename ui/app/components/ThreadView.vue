@@ -14,7 +14,7 @@ const props = withDefaults(
 const emit = defineEmits<{ close: [], done: [], pinned: [] }>()
 
 const { tick, mailboxes, isMine, accountById, accountColor } = useMail()
-const { reply, replyAllCount, forward, resume, open: composing } = useComposer()
+const { reply, replyAllCount, forward, resume, saved, open: composing } = useComposer()
 const showError = useErrorToast()
 const listStale = useListStale()
 const { t } = useI18n()
@@ -104,10 +104,14 @@ const drafts = computed(() => draftIds(messages.value, mailboxes.value))
 const replyTarget = computed(() => replyTargetIn(messages.value, drafts.value))
 /** The reply already begun: a draft after the message replies go to. Reply resumes it rather than
  *  starting a second one. */
+/** Drafts thrown away (in the bin, still marked as drafts): plain messages, not a reply begun. */
+const binned = computed(() => new Set(mailboxes.value.filter(b => b.role === 'trash' || b.role === 'junk').map(b => b.id)))
+const liveDraft = (m: MessageSummary) => drafts.value.has(m.id) && !binned.value.has(m.mailbox_id)
 const pendingDraft = computed(() => {
   const target = replyTarget.value
+  if (!target || resetPending.value) return undefined
   const list = messages.value
-  return target ? list.slice(list.indexOf(target) + 1).findLast(m => drafts.value.has(m.id)) : undefined
+  return list.slice(list.indexOf(target) + 1).findLast(liveDraft)
 })
 /** Another thread was asked for and its messages aren't in yet: `messages` still holds the
  *  previous one, which no action (button or shortcut) may target meanwhile. */
@@ -130,8 +134,12 @@ function applyRefinedTrust(detail: MessageDetail) {
   const trust = refinedTrust.value[detail.summary.id]
   if (!trust) return
   detail.trust = trust
-  // Remote images are never loaded for an untrustworthy message.
-  if (trust.level === 'low') detail.images_allowed = false
+  // Remote images are never loaded for an untrustworthy message, not even from an approved host.
+  // Set only when it changes: the frame rebuilds its document at each new value.
+  if (trust.level === 'low') {
+    if (detail.images_allowed) detail.images_allowed = false
+    if (detail.image_hosts.length) detail.image_hosts = []
+  }
 }
 watch(refinedTrust, () => details.forEach(applyRefinedTrust))
 
@@ -139,6 +147,12 @@ watch(refinedTrust, () => details.forEach(applyRefinedTrust))
 const unreadable = new Set<number>()
 
 /** A message read before, read again in place (no spinner meanwhile); dropped if not open. */
+// A draft saved again keeps its summary (the preview is its first lines only): read again when
+// the composer saves it.
+watch(saved, () => {
+  for (const id of drafts.value) refreshDetail(id)
+})
+
 async function refreshDetail(id: number) {
   if (!details.has(id) && !unreadable.has(id)) return
   if (!expanded.has(id)) {
@@ -242,7 +256,7 @@ async function load(reset: boolean) {
     const was = old.get(m.id)
     return was && sign(was) === sign(m) ? was : m
   })
-  const stale = wasReset ? [] : [...new Set([...staleDetails(messages.value, list, draftIds(list, mailboxes.value)), ...list.filter(m => unreadable.has(m.id)).map(m => m.id)])]
+  const stale = wasReset ? [] : [...new Set([...staleDetails(messages.value, list), ...list.filter(m => unreadable.has(m.id)).map(m => m.id)])]
   if (wasReset) unreadable.clear()
   if (wasReset || kept.length !== messages.value.length || kept.some((m, i) => m !== messages.value[i])) messages.value = kept
   for (const id of stale) refreshDetail(id)
@@ -262,7 +276,10 @@ async function load(reset: boolean) {
     // A reply begun: opened on it, where the writing goes on.
     const firstUnread = list.find(m => !m.flags.seen)
     const begun = pendingDraft.value
-    if (begun) expanded.add(begun.id)
+    if (begun && !expanded.has(begun.id)) {
+      expanded.add(begun.id)
+      loadDetail(begun.id)
+    }
     scrollTo(begun?.id ?? (order.value === 'newest' ? (lastUnread ?? list.at(-1))?.id : (firstUnread ?? list.at(-1))?.id))
     const unread = list.filter(m => !m.flags.seen).map(m => m.id)
     if (unread.length) markRead(unread)
@@ -552,7 +569,7 @@ const refuseItems = computed(() => [
 ])
 function screenSender(verdict: keyof typeof SCREEN_DONE) {
   const from = sender.value
-  if (!from) return
+  if (!from || resetPending.value) return
   const name = from.name?.trim() || from.email
   run(
     () => api.screenSender(props.accountId, from.email, verdict, false),
@@ -963,7 +980,7 @@ useEventListener('keydown', (e: KeyboardEvent) => {
               :expanded="expanded.has(row.message.id)"
               :loading="loadingIds.has(row.message.id)"
               :latest="row.message.id === replyTarget?.id"
-              :draft="drafts.has(row.message.id)"
+              :draft="liveDraft(row.message)"
               :pending-draft="row.message.id === replyTarget?.id ? pendingDraft?.id : undefined"
               @toggle="toggle"
             />

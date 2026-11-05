@@ -219,13 +219,38 @@ pub const MAX_MESSAGE_SIZE: usize = 25 * 1024 * 1024;
 /// already hold that line.
 fn with_signature_separator(html: &str) -> std::borrow::Cow<'_, str> {
     const BLOCK: &str = "<div class=\"facteur-signature\">";
-    match html.find(BLOCK) {
-        Some(at) if !html[at + BLOCK.len()..].starts_with("<p>-- </p>") => {
-            let end = at + BLOCK.len();
-            std::borrow::Cow::Owned(format!("{}<p>-- </p>{}", &html[..end], &html[end..]))
+    let Some(at) = html.find(BLOCK) else { return std::borrow::Cow::Borrowed(html) };
+    let end = at + BLOCK.len();
+    let rest = &html[end..];
+    // A signature that opens on its own separator line (typed in, as other mail clients want, or
+    // an older draft's), whatever its styling: that one is kept, made exact.
+    let mut i = 0;
+    loop {
+        let at = &rest[i..];
+        let skipped = at.len() - at.trim_start().len();
+        if skipped > 0 {
+            i += skipped;
+        } else if at.starts_with('<') && !at.starts_with("<br") && let Some(close) = at.find('>') {
+            i += close + 1;
+        } else {
+            break;
         }
-        _ => std::borrow::Cow::Borrowed(html),
     }
+    let text_end = rest[i..].find('<').map_or(rest.len(), |j| i + j);
+    let after = &rest[text_end..];
+    // On a line of its own: inline elements closed, then a line break or the end of the block.
+    let mut line_end = after;
+    while line_end.starts_with("</") && !line_end.starts_with("</p>") && !line_end.starts_with("</div>") && let Some(close) = line_end.find('>') {
+        line_end = line_end[close + 1..].trim_start();
+    }
+    let alone = ["<br", "</p>", "</div>"].iter().any(|t| line_end.starts_with(t));
+    if rest[i..text_end].replace("&nbsp;", " ").replace('\u{a0}', " ").trim_end() == "--" && alone {
+        if &rest[i..text_end] == "-- " {
+            return std::borrow::Cow::Borrowed(html);
+        }
+        return std::borrow::Cow::Owned(format!("{}-- {after}", &html[..end + i]));
+    }
+    std::borrow::Cow::Owned(format!("{}<p>-- </p>{rest}", &html[..end]))
 }
 
 pub fn estimated_size(draft: &Draft) -> usize {
@@ -347,10 +372,14 @@ async fn send_with(account: &Account, credential: &Credential, message: &Message
             Credential::Token(token) => Some((vec![Mechanism::Xoauth2], Credentials::new(account.username.clone(), token.clone()))),
             Credential::Password(_) => None,
         };
+        let token = matches!(credential, Credential::Token(_));
         if let Some((mechanisms, credentials)) = auth {
             // Refused sign-in: told apart, so that a cached OAuth token is replaced and the send tried
-            // again (see `deliver_as`).
-            conn.auth(&mechanisms, &credentials).await.map_err(|e| if e.is_permanent() { Error::Auth(e.to_string()) } else { connection_error(&e) })?;
+            // again (see `deliver_as`). Gmail refuses a token with a challenge, which lettre takes
+            // for a client error.
+            conn.auth(&mechanisms, &credentials)
+                .await
+                .map_err(|e| if e.is_permanent() || (token && e.is_client()) { Error::Auth(e.to_string()) } else { connection_error(&e) })?;
         }
         Ok::<_, Error>((conn, limit))
     };
@@ -643,6 +672,20 @@ mod tests {
         assert!(!parts.html.unwrap().contains("-- "), "not shown in the HTML");
         let old = signed("<p>Bonjour</p><div class=\"facteur-signature\"><p>-- </p><p>Yann</p></div>");
         assert_eq!(old.body.replace("\r\n", "\n").trim(), "Bonjour\n\n-- \nYann", "an older draft's own line is not doubled");
+        let edited = signed("<p>Bonjour</p><div class=\"facteur-signature\"><p>--</p><p>Yann</p></div>");
+        assert_eq!(edited.body.replace("\r\n", "\n").trim(), "Bonjour\n\n-- \nYann", "nor once the editor dropped its space");
+        let typed = signed("<p>Bonjour</p><div class=\"facteur-signature\"><p>-- <br>Yann</p></div>");
+        assert_eq!(typed.body.replace("\r\n", "\n").trim(), "Bonjour\n\n-- \nYann", "nor when the signature opens on its own");
+        for styled in [
+            "<p>Bonjour</p><div class=\"facteur-signature\"><p><span style=\"color: #888\">-- <br>Yann</span></p></div>",
+            "<p>Bonjour</p><div class=\"facteur-signature\"><p style=\"text-align: right\">--&nbsp;</p><p>Yann</p></div>",
+            "<p>Bonjour</p><div class=\"facteur-signature\"><p><b>--</b></p><p>Yann</p></div>",
+        ] {
+            assert_eq!(signed(styled).body.replace("\r\n", "\n").trim(), "Bonjour\n\n-- \nYann", "nor when styled: {styled}");
+        }
+        // "--" followed by the name on the same line is no separator line: one goes before it.
+        let inline = signed("<p>Bonjour</p><div class=\"facteur-signature\"><p><b>--</b> Yann</p></div>");
+        assert!(inline.body.replace("\r\n", "\n").contains("\n-- \n"), "{}", inline.body);
     }
 
     #[test]

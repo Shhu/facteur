@@ -11,7 +11,7 @@ const AUTOSAVE_MS = 3000
 const AUTOSAVE_HEAVY_MS = 15000
 const autosaveDelay = () => (draft.value?.attachments.length || draft.value?.forwarded.length ? AUTOSAVE_HEAVY_MS : AUTOSAVE_MS)
 
-const { open, draft, session, unsaved, editOutgoing, onBeforeReplace, onBeforeQuit } = useComposer()
+const { open, draft, session, unsaved, saved, editOutgoing, onBeforeReplace, onBeforeQuit } = useComposer()
 const { ask } = useWhenPicker()
 const { accounts, accountById, accountColor } = useMail()
 const showError = useErrorToast()
@@ -114,6 +114,7 @@ watch(session, () => {
   lastSaved = null
   textSynced = false
   opened = d.draft_id || unsaved.value ? null : heading(d)
+  openedQuote = d.html === null ? '' : quotedPart(d.html)
   showCopies.value = d.cc.length > 0 || d.bcc.length > 0
   // The editor normalises the HTML on open: not a keystroke.
   quiet++
@@ -178,6 +179,8 @@ function onText(text: string) {
 /** Recipients and subject as the draft opened with (a reply's, a forward's, a link's); null for a
  *  draft that must be saved whatever it holds (one already saved, one taken back from the outbox). */
 let opened: string | null = null
+/** The quoted message as it opened: words typed inside or below it count as written. */
+let openedQuote = ''
 const heading = (d: Draft) => JSON.stringify([d.to, d.cc, d.bcc, d.subject.trim()])
 
 /** Nothing of the writer's own: no text typed (the signature and the quoted message aside), no
@@ -188,6 +191,7 @@ const isEmpty = computed(() => {
   if (!d) return true
   if (d.draft_id || opened === null || heading(d) !== opened || d.attachments.length) return false
   if (d.html === null) return !d.body.trim()
+  if (quotedPart(d.html) !== openedQuote) return false
   const rest = ownPart(d.html, senderSignature(accountById(d.account_id), d.from))
   return !htmlText(rest).trim() && !/<img\b/i.test(rest)
 })
@@ -229,6 +233,7 @@ async function save(): Promise<boolean> {
         lastSaved = print
         saveFailed.value = false
         savedAt.value = Date.now() / 1000
+        saved.value++
         if (d.draft_id !== id) {
           await silently(() => {
             d.draft_id = id
@@ -355,6 +360,8 @@ async function discard() {
   open.value = false
   draft.value = null
   if (d?.draft_id) await api.discardDraft(d.account_id, d.draft_id).catch(showError)
+  // Reopened from a copy without a Message-ID (another client's): that copy goes, to the bin.
+  else if (d?.source) await api.trash([d.source]).catch(showError)
 }
 
 // Closing the window first saves the open draft: the default layout's close guard calls
@@ -428,13 +435,17 @@ function retire(d: Draft) {
   accountGen++
   const oldAccount = d.account_id
   const oldId = d.draft_id
+  // Reopened from another client's copy without a Message-ID: that copy goes to the bin itself.
+  const oldSource = oldId ? null : d.source
   const pending = inFlight
   d.draft_id = null
+  d.source = null
   lastSaved = null
-  if (!oldId) return
+  if (!oldId && !oldSource) return
   ;(async () => {
     if (pending) await pending
-    await api.discardDraft(oldAccount, oldId).catch(showError)
+    if (oldId) await api.discardDraft(oldAccount, oldId).catch(showError)
+    else if (oldSource) await api.trash([oldSource]).catch(showError)
   })()
 }
 

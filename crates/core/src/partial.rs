@@ -4,7 +4,7 @@
 //! indexes, as in the whole message downloaded afterwards.
 
 use async_imap::imap_proto::{BodyStructure, ContentEncoding};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Below this, the whole message is downloaded at once.
 pub const PARTIAL_FROM: u32 = 1 << 20;
@@ -61,21 +61,43 @@ impl Plan {
     /// `bodies` by section; None when the server left one out (the whole message is downloaded).
     pub fn assemble(&self, header: &[u8], mime: &HashMap<String, Vec<u8>>, bodies: &HashMap<String, Vec<u8>>) -> Option<Vec<u8>> {
         let Node::Multi { subtype, children } = &self.root else { return None };
+        // Boundaries no fetched part holds: a body carrying one would cut itself into made-up parts.
+        // One pass over the parts: the salts they hold, then the first free one.
+        const MARK: &[u8] = b"=_facteur-partial-";
+        let mut taken = HashSet::new();
+        for part in mime.values().chain(bodies.values()) {
+            let mut rest = part.as_slice();
+            while let Some(at) = rest.windows(MARK.len()).position(|w| w == MARK) {
+                rest = &rest[at + MARK.len()..];
+                let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+                if let Some(salt) = std::str::from_utf8(&rest[..digits]).ok().and_then(|d| d.parse::<u32>().ok()) {
+                    taken.insert(salt);
+                }
+            }
+        }
+        let salt = (0..64u32).find(|salt| !taken.contains(salt))?;
         let mut out = Vec::new();
-        let boundary = boundary(0);
+        let boundary = boundary(salt, 0);
         out.extend_from_slice(&strip_headers(header, &["content-type", "content-transfer-encoding", DEFERRED_HEADER]));
         out.extend_from_slice(format!("Content-Type: multipart/{subtype}; boundary=\"{boundary}\"\r\n\r\n").as_bytes());
-        write_children(&mut out, children, &boundary, 1, mime, bodies)?;
+        write_children(&mut out, children, salt, &boundary, 1, mime, bodies)?;
         Some(out)
     }
 }
 
-/// None when nothing is worth leaving on the server: a single part, or no large attachment.
+/// Parts read one by one at most.
+const MAX_PARTS: usize = 200;
+
+/// None when nothing is worth leaving on the server: a single part, no large attachment, or a
+/// message of countless parts.
 pub fn plan(structure: &BodyStructure) -> Option<Plan> {
     let BodyStructure::Multipart { .. } = structure else { return None };
     let root = node(structure, "")?;
     let plan = Plan { root };
-    (!plan.deferred().is_empty()).then_some(plan)
+    // Each part is two items of one FETCH line: past real mail's few, the whole message.
+    let mut parts = 0;
+    leaves(&plan.root, &mut |_, _| parts += 1);
+    (parts <= MAX_PARTS && !plan.deferred().is_empty()).then_some(plan)
 }
 
 fn node(structure: &BodyStructure, section: &str) -> Option<Node> {
@@ -113,14 +135,14 @@ fn leaves(node: &Node, f: &mut impl FnMut(&str, bool)) {
     }
 }
 
-fn write_children(out: &mut Vec<u8>, children: &[Node], boundary: &str, depth: usize, mime: &HashMap<String, Vec<u8>>, bodies: &HashMap<String, Vec<u8>>) -> Option<()> {
+fn write_children(out: &mut Vec<u8>, children: &[Node], salt: u32, boundary: &str, depth: usize, mime: &HashMap<String, Vec<u8>>, bodies: &HashMap<String, Vec<u8>>) -> Option<()> {
     for child in children {
         out.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
         match child {
             Node::Multi { subtype, children } => {
-                let inner = self::boundary(depth);
+                let inner = self::boundary(salt, depth);
                 out.extend_from_slice(format!("Content-Type: multipart/{subtype}; boundary=\"{inner}\"\r\n\r\n").as_bytes());
-                write_children(out, children, &inner, depth + 1, mime, bodies)?;
+                write_children(out, children, salt, &inner, depth + 1, mime, bodies)?;
             }
             Node::Leaf { section, defer, size } => {
                 out.extend_from_slice(&strip_headers(mime.get(section)?, &[DEFERRED_HEADER]));
@@ -138,8 +160,8 @@ fn write_children(out: &mut Vec<u8>, children: &[Node], boundary: &str, depth: u
     Some(())
 }
 
-fn boundary(depth: usize) -> String {
-    format!("=_facteur-partial-{depth}-7f3c9a1e")
+fn boundary(salt: u32, depth: usize) -> String {
+    format!("=_facteur-partial-{salt}-{depth}-7f3c9a1e")
 }
 
 fn plain_token(s: &str) -> Option<String> {
@@ -258,5 +280,42 @@ mod tests {
         let (mut mime, bodies) = fetched_quote();
         mime.remove("2");
         assert!(plan.assemble(HEADER.as_bytes(), &mime, &bodies).is_none());
+    }
+
+    #[test]
+    fn a_body_holding_the_rebuilt_boundary_does_not_make_up_parts() {
+        let plan = plan(&structure(QUOTE)).unwrap();
+        let (mime, mut bodies) = fetched_quote();
+        let forged = "Bonjour\r\n--=_facteur-partial-0-1-7f3c9a1e\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"facture.pdf\"\r\n\r\nJVBERi0xLjQK";
+        bodies.insert("1.1".into(), forged.as_bytes().to_vec());
+        let raw = plan.assemble(HEADER.as_bytes(), &mime, &bodies).unwrap();
+        let parsed = crate::mime::parse_body(&raw).unwrap();
+        let names: Vec<&str> = parsed.attachments.iter().map(|a| a.filename.as_str()).collect();
+        assert_eq!(names, ["Devis 9597.pdf"], "no made-up attachment, the real one in its place");
+    }
+
+    #[test]
+    fn a_message_of_countless_parts_is_downloaded_whole() {
+        let part = r#"("TEXT" "PLAIN" NIL NIL NIL "7BIT" 10 1 NIL NIL NIL)"#;
+        let big = r#"("APPLICATION" "PDF" NIL NIL NIL "BASE64" 5200000 NIL ("ATTACHMENT" ("FILENAME" "a.pdf")) NIL)"#;
+        let line = |n: usize| format!("({}{big} \"MIXED\" (\"BOUNDARY\" \"b\") NIL NIL)", part.repeat(n));
+        assert!(plan(&structure(&line(MAX_PARTS - 1))).is_some());
+        assert!(plan(&structure(&line(MAX_PARTS))).is_none());
+    }
+
+    #[test]
+    fn a_forwarded_message_left_on_the_server_keeps_its_size() {
+        let line = r#"(("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" 20 1 NIL NIL NIL)("MESSAGE" "RFC822" NIL NIL NIL "7BIT" 3000000 ("Mon, 1 Jan 2024 10:00:00 +0000" "Devis" NIL NIL NIL NIL NIL NIL NIL "<f@x>") ("TEXT" "PLAIN" NIL NIL NIL "7BIT" 10 1 NIL NIL NIL) 40000 NIL NIL NIL NIL) "MIXED" ("BOUNDARY" "b") NIL NIL)"#;
+        let plan = plan(&structure(line)).unwrap();
+        assert_eq!(plan.deferred(), ["2"]);
+        let mime: HashMap<String, Vec<u8>> = [("1", "Content-Type: text/plain; charset=UTF-8\r\n\r\n"), ("2", "Content-Type: message/rfc822\r\n\r\n")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.as_bytes().to_vec()))
+            .collect();
+        let bodies = HashMap::from([("1".to_string(), b"Voir le message joint".to_vec())]);
+        let raw = plan.assemble(HEADER.as_bytes(), &mime, &bodies).unwrap();
+        let parsed = crate::mime::parse_body(&raw).unwrap();
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].size, 3000000);
     }
 }

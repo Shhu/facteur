@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { openUrl } from '@tauri-apps/plugin-opener'
 import type { Invite } from '~/utils/types'
+import { seriesUid } from '~/utils/invites'
 import type { InvitePerson } from '~/components/InviteAttendees.vue'
 import type { Partstat } from '~/components/InviteAnswers.vue'
 
@@ -171,7 +172,7 @@ const { events: dayEvents } = useCalendarEvents(() => {
 }, 5000)
 /** Other timed events of that day (long ones too); the invitation itself is often already in
  *  the calendar. */
-const others = computed(() => (dayEvents.value ?? []).filter(e => e.uid !== props.invite.uid && e.status !== 'cancelled' && !e.all_day))
+const others = computed(() => (dayEvents.value ?? []).filter(e => seriesUid(e.uid) !== seriesUid(props.invite.uid) && e.status !== 'cancelled' && !e.all_day))
 /** Those overlapping the invitation that take the time (not shown as free, not declined). */
 const conflicts = computed(() => {
   const s = slot.value

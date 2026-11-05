@@ -299,6 +299,14 @@ fn signals(msg: &mail_parser::Message) -> crate::trust::Signals {
             .any(|w| w.contains('@') && w.contains('.') && !w.eq_ignore_ascii_case(&address))
     });
     let lookalike_domain = lookalike(&domain);
+    // A pass reached for another domain than the one shown, or with several senders (which one
+    // the provider judged is unknown): proves nothing about the From shown.
+    let senders = msg.headers().iter().filter(|h| h.name.as_str().eq_ignore_ascii_case("From")).count();
+    let other = results.and_then(crate::trust::dmarc_domain).is_some_and(|d| crate::autoconfig::registrable(&d) != crate::autoconfig::registrable(&domain));
+    let dmarc = match dmarc {
+        Some(true) if senders != 1 || addresses(msg.from()).len() != 1 || other => None,
+        verdict => verdict,
+    };
     let reply_to_elsewhere = addresses(msg.reply_to()).iter().any(|r| {
         let other = r.email.rsplit_once('@').map(|(_, d)| d.to_ascii_lowercase()).unwrap_or_default();
         !domain.is_empty() && crate::autoconfig::registrable(&other) != crate::autoconfig::registrable(&domain)
@@ -514,7 +522,8 @@ fn real_attachments<'a>(msg: &'a mail_parser::Message<'a>, shown: &'a HashSet<St
 /// An attachment left on the server by a partial opening (see [`crate::partial`]): its size as
 /// the structure gave it. Only on an empty part: a sender's own header changes nothing.
 fn deferred_size(part: &mail_parser::MessagePart) -> Option<usize> {
-    if !part.contents().is_empty() {
+    // A forwarded message left out reads as its blank line.
+    if !part.contents().iter().all(u8::is_ascii_whitespace) {
         return None;
     }
     part.headers.iter().rev().find_map(|h| match (&h.name, &h.value) {
@@ -1091,8 +1100,9 @@ struct Tag<'a> {
 }
 
 /// The tags of `html`, in one pass, read as the parser does: a `<` inside a quoted attribute
-/// value, a comment, or the text of a script, style or title starts no tag.
-fn html_tags(html: &str) -> Vec<Tag<'_>> {
+/// value, a comment, or (`raw`) the text of a script, style or title starts no tag. Not `raw`:
+/// as inside SVG or MathML, where those hold tags.
+fn html_tags(html: &str, raw: bool) -> Vec<Tag<'_>> {
     const RAW_TEXT: [&str; 9] = ["script", "style", "xmp", "iframe", "noembed", "noframes", "noscript", "title", "textarea"];
     let b = html.as_bytes();
     let find = |from: usize, needle: &[u8]| b.get(from..).and_then(|rest| rest.windows(needle.len()).position(|w| w == needle)).map(|p| from + p);
@@ -1105,8 +1115,24 @@ fn html_tags(html: &str) -> Vec<Tag<'_>> {
             i = match b.get(at + 4..) {
                 Some([b'>', ..]) => at + 5,
                 Some([b'-', b'>', ..]) => at + 6,
-                _ => find(at + 4, b"-->").map_or(b.len(), |e| e + 3),
+                // Ended by "--!>" too, as the parser does: one scan for whichever comes first.
+                _ => {
+                    let mut k = at + 4;
+                    loop {
+                        let Some(d) = find(k, b"--") else { break b.len() };
+                        match (b.get(d + 2), b.get(d + 3)) {
+                            (Some(b'>'), _) => break d + 3,
+                            (Some(b'!'), Some(b'>')) => break d + 4,
+                            _ => k = d + 1,
+                        }
+                    }
+                }
             };
+            continue;
+        }
+        // In SVG or MathML, CDATA runs to "]]>", `>` and all (in HTML, a bogus comment ending at `>`).
+        if !raw && b[at..].starts_with(b"<![CDATA[") {
+            i = find(at + 9, b"]]>").map_or(b.len(), |e| e + 3);
             continue;
         }
         let closing = next == Some(b'/');
@@ -1160,7 +1186,7 @@ fn html_tags(html: &str) -> Vec<Tag<'_>> {
         tags.push(Tag { start: at, end, closing, name });
         i = end;
         // Their text runs to their own end tag.
-        if !closing && let Some(raw) = RAW_TEXT.iter().find(|r| r.eq_ignore_ascii_case(name)) {
+        if !closing && raw && let Some(raw) = RAW_TEXT.iter().find(|r| r.eq_ignore_ascii_case(name)) {
             let mut k = end;
             i = loop {
                 let Some(e) = find(k, b"</") else { break b.len() };
@@ -1170,7 +1196,7 @@ fn html_tags(html: &str) -> Vec<Tag<'_>> {
                 }
                 k = e + 2;
             };
-        } else if !closing && name.eq_ignore_ascii_case("plaintext") {
+        } else if !closing && raw && name.eq_ignore_ascii_case("plaintext") {
             break;
         }
     }
@@ -1186,6 +1212,32 @@ fn html_tags(html: &str) -> Vec<Tag<'_>> {
 /// - elements nested past [`MAX_NESTING`], and end tags matching nothing open past
 ///   [`MAX_STRAY_ENDS`].
 fn defused(html: &str) -> std::borrow::Cow<'_, str> {
+    let tags = html_tags(html, true);
+    let mut cut = crafted_tags(html, &tags);
+    // SVG or MathML: whether a style or a title there holds text or tags depends on rules this
+    // scan does not follow. Read both ways, whatever either finds crafted goes.
+    let lower = html.to_ascii_lowercase();
+    if lower.contains("<svg") || lower.contains("<math") {
+        cut.extend(crafted_tags(html, &html_tags(html, false)));
+    }
+    if cut.is_empty() {
+        return std::borrow::Cow::Borrowed(html);
+    }
+    cut.sort_unstable();
+    let mut out = String::with_capacity(html.len());
+    let mut at = 0;
+    for (start, end) in cut {
+        if start >= at {
+            out.push_str(&html[at..start]);
+        }
+        at = at.max(end);
+    }
+    out.push_str(&html[at..]);
+    std::borrow::Cow::Owned(out)
+}
+
+/// Where the tags crafted to blow up the parser are (see [`defused`]); none for ordinary mail.
+fn crafted_tags(html: &str, tags: &[Tag<'_>]) -> Vec<(usize, usize)> {
     const FORMATTING: [&str; 14] = ["a", "b", "big", "code", "em", "font", "i", "nobr", "s", "small", "strike", "strong", "tt", "u"];
     const VOID: [&str; 15] = ["area", "base", "br", "col", "embed", "hr", "img", "input", "keygen", "link", "meta", "param", "source", "track", "wbr"];
     // Closed by the next of their kind or by their parent's end: never nested deep.
@@ -1194,7 +1246,6 @@ fn defused(html: &str) -> std::borrow::Cow<'_, str> {
     // An end tag that does something even with nothing open.
     const ALWAYS: [&str; 4] = ["p", "br", "body", "html"];
     let is = |list: &[&str], name: &str| list.iter().any(|l| l.eq_ignore_ascii_case(name));
-    let tags = html_tags(html);
     let mut dropped = vec![false; tags.len()];
     // Formatting elements open at once at most, as the parser keeps them: three of a kind (same
     // name and attributes) at most, the others forgotten (its "Noah's Ark" rule). Told by the tag
@@ -1275,16 +1326,9 @@ fn defused(html: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     if !crafted && !deep && !strays {
-        return std::borrow::Cow::Borrowed(html);
+        return Vec::new();
     }
-    let mut out = String::with_capacity(html.len());
-    let mut at = 0;
-    for (tag, _) in tags.iter().zip(&dropped).filter(|(_, d)| **d) {
-        out.push_str(&html[at..tag.start]);
-        at = tag.end;
-    }
-    out.push_str(&html[at..]);
-    std::borrow::Cow::Owned(out)
+    tags.iter().zip(&dropped).filter(|(_, d)| **d).map(|(t, _)| (t.start, t.end)).collect()
 }
 
 /// Plain-text version of HTML: the text/plain part of outgoing mail, the search index and the
@@ -1604,6 +1648,12 @@ Subject: virement\r\n\r\ncorps";
         let s = parse_headers(raw, 0).signals;
         assert_eq!((s.dkim, s.spf, s.dmarc), (Some(false), Some(false), Some(false)));
         assert!(s.spam_flag);
+        // A pass reached for another domain than the one shown, or with two senders: not the shown one's.
+        let dmarc = |headers: &str| parse_headers(format!("Authentication-Results: mx.fournisseur.fr; dmarc=pass header.from=pirate.example\r\n{headers}Subject: x\r\n\r\ncorps").as_bytes(), 0).signals.dmarc;
+        assert_eq!(dmarc("From: a@pirate.example\r\n"), Some(true));
+        assert_eq!(dmarc("From: Banque <alerte@banque.fr>\r\n"), None);
+        assert_eq!(dmarc("From: a@pirate.example\r\nFrom: Banque <alerte@banque.fr>\r\n"), None);
+        assert_eq!(dmarc("From: alerte@banque.fr, a@pirate.example\r\n"), None);
     }
 
     #[test]
@@ -1920,6 +1970,25 @@ Subject: Votre compte\r\n\r\n.\r\n";
         // A closing tag inside a style or a title is text too.
         let styled = format!("{}{}", (0..5000).map(|i| format!("<b id={i}><style></b></style>")).collect::<String>(), "<p>x".repeat(20_000));
         assert!(!defused(&styled).contains("<b "));
+        // A comment the parser ends at "--!>" hides nothing after it.
+        let banged = format!("<!----!>{}{}", (0..5000).map(|i| format!("<b id={i}>")).collect::<String>(), "<p>x".repeat(20_000));
+        assert!(!defused(&banged).contains("<b "));
+        // In SVG a style holds tags, which the parser reads.
+        let drawn = format!("<svg><style>{}{}", (0..5000).map(|i| format!("<b id={i}>")).collect::<String>(), "<p>x".repeat(20_000));
+        assert!(!defused(&drawn).contains("<b "));
+        // In SVG, CDATA ends at "]]>" only: a `>` or `<!--` inside it hides nothing.
+        let cdata = format!("<svg><![CDATA[><!--]]>{}{}", (0..5000).map(|i| format!("<b id={i}>")).collect::<String>(), "<p>x".repeat(20_000));
+        assert!(!defused(&cdata).contains("<b "));
+        // SVG ended at once, or a way out of it: the HTML reading still finds the bomb.
+        let closed = format!("<svg/><textarea><plaintext></textarea><p>{}{}", (0..1000).map(|i| format!("<b id={i}>")).collect::<String>(), "<p>x".repeat(20_000));
+        assert!(!defused(&closed).contains("<b "));
+        let fonts = format!("<p><svg/>{}{}", (0..5000).map(|i| format!("<font id={i}><style></font></style>")).collect::<String>(), "<p>x".repeat(22_000));
+        assert!(!defused(&fonts).contains("<font "));
+        // Countless comments: read once each.
+        let comments = "<!--[if !supportLists]-->x".repeat(100_000);
+        let started = std::time::Instant::now();
+        assert!(matches!(defused(&comments), std::borrow::Cow::Borrowed(_)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
     }
 
     #[test]

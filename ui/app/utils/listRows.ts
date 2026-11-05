@@ -75,14 +75,14 @@ export function replyTargetIn(messages: MessageSummary[], drafts: Set<number>): 
 }
 
 /** Messages already read whose content may have changed since: moved (a draft sent is filed in
- *  Sent under the same id), a draft sent (Gmail: the same row, relabelled), a new preview, or a
- *  draft (saved again at each pause, its preview the same once past its first lines). */
-export function staleDetails(before: MessageSummary[], after: MessageSummary[], drafts: Set<number>): number[] {
+ *  Sent under the same id), a draft sent (Gmail: the same row, relabelled), or a new preview. A
+ *  draft saved again is read again when the composer saves it. */
+export function staleDetails(before: MessageSummary[], after: MessageSummary[]): number[] {
   const old = new Map(before.map(m => [m.id, m]))
   return after
     .filter((m) => {
       const was = old.get(m.id)
-      return !!was && (drafts.has(m.id) || was.flags.draft !== m.flags.draft || was.mailbox_id !== m.mailbox_id || was.preview !== m.preview)
+      return !!was && (was.flags.draft !== m.flags.draft || was.mailbox_id !== m.mailbox_id || was.preview !== m.preview)
     })
     .map(m => m.id)
 }

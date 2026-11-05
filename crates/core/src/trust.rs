@@ -280,6 +280,16 @@ pub fn parse_authentication_results(value: &str) -> (Option<bool>, Option<bool>,
     (dkim, spf, dmarc)
 }
 
+/// `header.from` of the DMARC verdict: the domain it was reached for, in lowercase.
+pub fn dmarc_domain(value: &str) -> Option<String> {
+    let resinfos = resinfos(value)?;
+    let tokens = resinfos.iter().find(|tokens| method_result(tokens).is_some_and(|(m, _)| m == "dmarc"))?;
+    tokens[1..].iter().find_map(|t| {
+        let (name, value) = t.split_once('=')?;
+        name.eq_ignore_ascii_case("header.from").then(|| value.trim_matches('"').to_ascii_lowercase())
+    })
+}
+
 /// A DKIM signature the receiving server verified, as its `Authentication-Results` names it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DkimPass {
@@ -344,6 +354,7 @@ mod tests {
                      spf=pass (google.com: domain of x@airbnb.com) smtp.mailfrom=x@airbnb.com;\r\n \
                      dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=airbnb.com";
         assert_eq!(parse_authentication_results(gmail), (Some(true), Some(true), Some(true)));
+        assert_eq!(dmarc_domain(gmail).as_deref(), Some("airbnb.com"));
         let forged = "mx.example.net; dkim=fail; dkim=pass; spf=softfail; dmarc=fail";
         assert_eq!(parse_authentication_results(forged), (Some(true), Some(false), Some(false)));
         assert_eq!(parse_authentication_results("mx.example.net; none"), (None, None, None));

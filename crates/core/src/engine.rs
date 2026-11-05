@@ -198,6 +198,9 @@ enum Purpose {
     /// Longer work started from the interface (history, server search, folder refresh): kept off
     /// the interactive connection so it never delays opening a message.
     Background,
+    /// The rest of a large message opened on its text, fetched behind it: minutes on a slow line,
+    /// which neither a search nor older mail waits for. Closed soon after, like the others.
+    Completion,
 }
 
 fn pool_close_after(purpose: Purpose, host: &str) -> Duration {
@@ -289,7 +292,7 @@ impl backup::Lease for Dedicated<'_> {
             drop(conn);
         }
         tokio::task::yield_now().await;
-        self.held = Some(Held::Shared(self.engine.session_after(self.account_id, Purpose::Background, false).await?));
+        self.held = Some(Held::Shared(self.engine.session_after(self.account_id, Purpose::Background, false, false).await?));
         Ok(true)
     }
 }
@@ -349,6 +352,9 @@ const KEYCHAIN_RETRY: Duration = Duration::from_secs(300);
 const REFUSED_FOR_NOW_LIMIT: Duration = Duration::from_secs(30 * 60);
 /// Results a server search lists, newest first.
 const SERVER_SEARCH_LIMIT: usize = 200;
+/// A large message whose reading finds nothing to leave on the server: downloaded whole on the
+/// same connection, borrowed or not, below this size.
+const SAME_TURN_MAX: u64 = 8 * 1024 * 1024;
 /// Refusals "for now" further apart are no run: a sleep or an evening between them.
 const REFUSED_FOR_NOW_GAP: Duration = Duration::from_secs(10 * 60);
 /// At least this many refusals in the run before the account waits for the user.
@@ -681,8 +687,8 @@ fn rebuilt_first(first: chrono::NaiveDate, e: &CalendarEvent, draft: &EventDraft
     // Weekly on days that leave the first one out: it starts on the first of them.
     let shift = crate::calendar::days_to_chosen(day, draft.repeat.as_ref());
     let zone = draft.zone.as_deref();
-    let moved = |t| crate::calendar::moved_days(t, shift, zone, draft.all_day).ok_or_else(out_of_range);
-    Ok((moved(start)?, moved(end)?, draft.all_day, day + chrono::Duration::days(shift)))
+    let (start, end) = crate::calendar::moved_span(start, end, shift, zone, draft.all_day).ok_or_else(out_of_range)?;
+    Ok((start, end, draft.all_day, day + chrono::Duration::days(shift)))
 }
 
 /// A new series weekly on days that leave its first day out starts on the first of them, as
@@ -690,9 +696,7 @@ fn rebuilt_first(first: chrono::NaiveDate, e: &CalendarEvent, draft: &EventDraft
 fn on_a_chosen_day(mut d: EventDraft) -> EventDraft {
     let Some(day) = crate::calendar::first_day(d.start, d.end, d.all_day, d.zone.as_deref()) else { return d };
     let shift = crate::calendar::days_to_chosen(day, d.repeat.as_ref());
-    if let (Some(start), Some(end)) =
-        (crate::calendar::moved_days(d.start, shift, d.zone.as_deref(), d.all_day), crate::calendar::moved_days(d.end, shift, d.zone.as_deref(), d.all_day))
-    {
+    if let Some((start, end)) = crate::calendar::moved_span(d.start, d.end, shift, d.zone.as_deref(), d.all_day) {
         (d.start, d.end) = (start, end);
     }
     d
@@ -901,6 +905,8 @@ struct Undo {
     /// (account, pattern, decision before).
     screening: Vec<(i64, String, Option<String>)>,
     categories: Vec<crate::store::SenderCategorySnapshot>,
+    /// (account, queued draft save) dropped by a draft's move: queued again when it is undone.
+    draft_saves: Vec<(i64, String)>,
 }
 
 fn group_by_home(rehome: &[(i64, i64)]) -> Vec<(i64, Vec<i64>)> {
@@ -1428,13 +1434,20 @@ impl Engine {
     }
 
     async fn session(&self, account_id: i64, purpose: Purpose) -> Result<Conn> {
-        self.session_after(account_id, purpose, true).await
+        self.session_after(account_id, purpose, true, true).await
+    }
+
+    /// As `session`, never on another purpose's idle connection: a whole download would hold the
+    /// account's syncs back for its whole length.
+    async fn own_session(&self, account_id: i64, purpose: Purpose) -> Result<Conn> {
+        self.session_after(account_id, purpose, true, false).await
     }
 
     /// `counted`: among those a sync gives way to. A long job taking the one connection back after
     /// giving it over is not: the sync would hand it back after each folder, and the two take
     /// turns folder by folder.
-    async fn session_after(&self, account_id: i64, purpose: Purpose, counted: bool) -> Result<Conn> {
+    /// `borrow`: an opening may take another purpose's idle connection rather than sign in.
+    async fn session_after(&self, account_id: i64, purpose: Purpose, counted: bool, borrow: bool) -> Result<Conn> {
         let single = self.single_connection(account_id);
         // Waiting behind a sync on the one connection: it gives way between two folders.
         let _waiting = (single && counted && purpose != Purpose::Sync).then(|| Waiting::new(self.waiting_on(account_id)));
@@ -1445,6 +1458,12 @@ impl Engine {
         let slot = self.slots.lock().unwrap().entry((account_id, purpose)).or_default().clone();
         // A long job taking the connection back after giving it over waits as long as the sync it
         // gave way to runs (that one has its own watchdog): it is queued, not stuck.
+        // Opening a message does not queue behind a download holding its connection while another
+        // one of the account sits idle.
+        let busy = borrow && purpose == Purpose::Interactive && slot.try_lock().is_err();
+        if busy && let Some(idle) = self.idle_connection(account_id).await {
+            return Ok(idle);
+        }
         let mut guard = if counted {
             tokio::time::timeout(SLOT_WAIT, slot.lock_owned()).await.map_err(|_| {
                 Error::Other(crate::tr!("connexion au serveur occupée depuis trop longtemps", "server connection busy for too long"))
@@ -1469,7 +1488,7 @@ impl Engine {
             Some(conn) => conn.used = Instant::now(),
             // Opening a message does not wait for a sign-in (seconds at Gmail) while another
             // connection of the account sits idle.
-            None if purpose == Purpose::Interactive && let Some(idle) = self.idle_connection(account_id).await => {
+            None if borrow && purpose == Purpose::Interactive && let Some(idle) = self.idle_connection(account_id).await => {
                 steps.mark("borrowed");
                 return Ok(idle);
             }
@@ -1485,7 +1504,7 @@ impl Engine {
 
     /// Another open connection of the account, free and alive.
     async fn idle_connection(&self, account_id: i64) -> Option<Conn> {
-        for purpose in [Purpose::Background, Purpose::Queue, Purpose::Sync] {
+        for purpose in [Purpose::Background, Purpose::Completion, Purpose::Queue, Purpose::Sync] {
             let Some(slot) = self.slots.lock().unwrap().get(&(account_id, purpose)).cloned() else { continue };
             let Ok(mut guard) = slot.try_lock_owned() else { continue };
             let Some(conn) = guard.as_mut() else { continue };
@@ -2333,17 +2352,13 @@ impl Engine {
             downloads.retain(|_, l| Arc::strong_count(l) > 1);
             downloads.entry(id).or_default().clone()
         };
-        let _one = lock.lock().await;
-        if let Some(raw) = crate::rt::offload(|| self.store.body(id))? {
-            return Ok((sync::Download::Whole(raw), None));
-        }
+        // Reading does not wait for a whole download running (the rest of this message, fetched
+        // in the background): its shown parts come on their own. A whole download waits for the
+        // one running rather than starting another.
+        let mut _one = if reading { lock.try_lock().ok() } else { Some(lock.lock().await) };
         let loc = self.store.location(id)?;
-        // By UID too: a row deleted last leaves its id to the next one (a draft, then what was sent).
-        if let Some((kept, kept_uid, raw)) = self.last_body.lock().unwrap().as_ref()
-            && *kept == id
-            && *kept_uid == loc.uid
-        {
-            return Ok((sync::Download::Whole(raw.to_vec()), None));
+        if let Some(raw) = self.kept_body(id, loc.uid)? {
+            return Ok((sync::Download::Whole(raw), None));
         }
         let uid = loc.uid.ok_or_else(in_flight)?;
         // Two minutes plus a second per 50 KB: a 40 MB message on a slow line must not be cut off
@@ -2353,16 +2368,22 @@ impl Engine {
         let mut steps = crate::perf::Steps::new(|| format!("account {} message {id} ({size} bytes)", loc.account_id));
         // A kept connection the server dropped meanwhile: once more on a new one.
         let mut attempt = 0;
+        let mut reading = reading;
         let res = loop {
             attempt += 1;
-            let mut guard = self.session(loc.account_id, purpose).await?;
+            // A large one is not done on a connection borrowed from the account's syncs.
+            let mut guard = if reading || size < u64::from(crate::partial::PARTIAL_FROM) {
+                self.session(loc.account_id, purpose).await?
+            } else {
+                self.own_session(loc.account_id, purpose).await?
+            };
             steps.mark("connection");
             let session = &mut guard.as_mut().expect("session open").session;
             let what = crate::tr!("téléchargement du message", "downloading the message");
             let res = if reading {
                 bounded(secs, &what, sync::download_for_reading(&self.store, session, id, &loc.mailbox, uid, u32::try_from(size).unwrap_or(u32::MAX))).await
             } else {
-                bounded(secs, &what, sync::download_body(&self.store, session, id, &loc.mailbox, uid)).await.map(|(raw, v)| (sync::Download::Whole(raw), v))
+                bounded(secs, &what, sync::download_body(&self.store, session, id, &loc.mailbox, uid)).await.map(|(raw, v)| Some((sync::Download::Whole(raw), v)))
             };
             // A cut EXAMINE or FETCH must not leave the dead connection in the slot for the next message.
             if matches!(res, Err(Error::Io(_) | Error::Imap(_) | Error::Other(_) | Error::Dropped(_) | Error::Refused(_))) {
@@ -2373,10 +2394,45 @@ impl Engine {
                     tracing::info!("message {id}: {e}; trying again on a new connection");
                     self.note_cut(loc.account_id, false);
                 }
+                Err(e) if attempt == 1 && reading && sync::message_level(&e) => {
+                    tracing::info!("message {id}: structure unreadable ({e}), downloaded whole on a new connection");
+                    reading = false;
+                }
+                // Nothing to leave on the server: the whole of it, not on a borrowed connection.
+                Ok(None) if reading => {
+                    reading = false;
+                    // The whole download keeps its own retry.
+                    attempt = 0;
+                    // One already running: its result, once in, rather than a second download.
+                    if _one.is_none() {
+                        drop(guard);
+                        _one = Some(lock.lock().await);
+                        if let Some(raw) = self.kept_body(id, loc.uid)? {
+                            return Ok((sync::Download::Whole(raw), None));
+                        }
+                    } else if (self.single_connection(loc.account_id) || size < SAME_TURN_MAX)
+                        && let Some(open) = guard.as_mut()
+                    {
+                        // The account's only connection is no borrowed one: the whole of it on this
+                        // turn, rather than after a waiting sync's. Not too large either: held a
+                        // little longer, the connection spares a wait behind another download.
+                        let res = bounded(secs, &what, sync::download_body(&self.store, &mut open.session, id, &loc.mailbox, uid)).await;
+                        if matches!(res, Err(Error::Io(_) | Error::Imap(_) | Error::Other(_) | Error::Dropped(_) | Error::Refused(_))) {
+                            *guard = None;
+                        }
+                        match res {
+                            Err(e) if e.is_connection_drop() => {
+                                self.note_cut(loc.account_id, false);
+                                attempt = 1;
+                            }
+                            res => break res.map(|(raw, v)| Some((sync::Download::Whole(raw), v))),
+                        }
+                    }
+                }
                 res => break res,
             }
         };
-        let (download, validity) = res?;
+        let (download, validity) = res?.ok_or_else(|| Error::Other("download".into()))?;
         steps.mark(match download {
             sync::Download::Whole(_) => "whole",
             sync::Download::Partial(_) => "shown parts",
@@ -2385,6 +2441,15 @@ impl Engine {
             *self.last_body.lock().unwrap() = Some((id, Some(uid), Arc::new(raw.clone())));
         }
         Ok((download, Some((loc.mailbox, uid, validity))))
+    }
+
+    /// The message's whole body when at hand: cached, or the last one downloaded (by UID too: a
+    /// row deleted last leaves its id to the next one, a draft then what was sent).
+    fn kept_body(&self, id: i64, uid: Option<u32>) -> Result<Option<Vec<u8>>> {
+        if let Some(raw) = crate::rt::offload(|| self.store.body(id))? {
+            return Ok(Some(raw));
+        }
+        Ok(self.last_body.lock().unwrap().as_ref().filter(|(kept, kept_uid, _)| *kept == id && *kept_uid == uid).map(|(_, _, raw)| raw.to_vec()))
     }
 
     /// Moved, and its new folder has not confirmed it yet (no UID).
@@ -2475,9 +2540,13 @@ impl Engine {
     pub async fn message(self: &Arc<Self>, id: i64) -> Result<MessageDetail> {
         let (raw, downloaded, whole) = match self.body_download(id, Purpose::Interactive, true).await? {
             (sync::Download::Whole(raw), downloaded) => (raw, downloaded, true),
-            // The rest follows in the background: the attachments, then the signature check.
+            // The rest follows in the background: the attachments, then the signature check. Not
+            // on the one shared connection, which it would hold for minutes: there the rest comes
+            // when an attachment is asked for.
             (sync::Download::Partial(raw), _) => {
-                self.complete_body(id);
+                if !self.store.location(id).is_ok_and(|l| self.single_connection(l.account_id)) {
+                    self.complete_body(id);
+                }
                 (raw, None, false)
             }
         };
@@ -2564,7 +2633,8 @@ impl Engine {
             own_copy: mine,
             images_covered: parsed.remote.any && !parsed.remote.unlisted && blocked_hosts.is_empty(),
             image_hosts,
-            blocked_hosts,
+            // A shared host is not offered: approving it would let any of its customers in.
+            blocked_hosts: blocked_hosts.into_iter().filter(|h| !crate::links::shared_host(h)).collect(),
             sender_key,
             trust,
             invite,
@@ -2575,9 +2645,13 @@ impl Engine {
     /// The whole of a message opened without its attachments, downloaded and cached in the
     /// background; its DKIM signature, which covers the attachments, checked then.
     fn complete_body(self: &Arc<Self>, id: i64) {
+        // One already running or waiting for its turn: not a second one.
+        if self.body_downloads.lock().unwrap().get(&id).is_some_and(|l| Arc::strong_count(l) > 1) {
+            return;
+        }
         let this = self.clone();
         self.spawn(async move {
-            let raw = match this.body_download(id, Purpose::Background, false).await {
+            let raw = match this.body_download(id, Purpose::Completion, false).await {
                 Ok((sync::Download::Whole(raw), Some((mailbox, uid, validity)))) => {
                     match crate::rt::offload(|| sync::keep_body(&this.store, id, &mailbox, uid, validity, &raw)) {
                         Ok(()) => this.body_cached(id),
@@ -2817,6 +2891,23 @@ impl Engine {
         for snapshot in &undo.categories {
             self.store.restore_sender_category(snapshot)?;
         }
+        // Unless a newer save of the draft was queued meanwhile (it replaces every copy, and the
+        // old one after it would put the older text back), or the draft was deleted or sent since.
+        let mid = |payload: &str| serde_json::from_str::<serde_json::Value>(payload).ok().and_then(|v| v["message_id"].as_str().map(str::to_string));
+        let mut newer = HashSet::new();
+        for (account_id, payload) in &undo.draft_saves {
+            if let Some(mid) = mid(payload)
+                && (!self.store.pending_draft_saves(*account_id, &mid)?.is_empty() || self.store.draft_given_up(*account_id, &mid)?)
+            {
+                newer.insert((*account_id, mid));
+            }
+        }
+        for (account_id, payload) in &undo.draft_saves {
+            if mid(payload).is_some_and(|m| newer.contains(&(*account_id, m))) {
+                continue;
+            }
+            self.store.push_op(*account_id, payload, &crate::i18n::both(|| crate::tr!("Enregistrer le brouillon", "Save draft")), None)?;
+        }
         drop(held);
         for account_id in accounts {
             self.emit(Event::Changed { account_id });
@@ -3000,30 +3091,82 @@ impl Engine {
             };
             plan.push((id, loc, uid));
         }
-        // A draft moved away (deleted from the list) while a save of it waits: that save would
-        // expunge the copy the move names and put the draft back. It goes; the copy it was to
-        // replace, if any, with it.
-        for (id, loc, _) in &plan {
-            if self.store.mailbox_state(loc.mailbox_id)?.role == Some(Role::Drafts)
-                && let Some(mid) = self.store.message_ids(*id)?.0
-                && !self.store.pending_draft_saves(loc.account_id, &mid)?.is_empty()
-                && let Some((uid, uidvalidity)) = self.take_pending_draft(loc.account_id, &mid)?
-            {
-                self.delete_old_draft(loc.account_id, &loc.mailbox, uid, uidvalidity)?;
-            }
-        }
-        if labels_model {
-            return self.file_labelled(plan, &dest, from, undo);
-        }
         // Gmail before its first sync turned folders into labels: its folders are not folders.
         // Without All Mail shown in IMAP it never will be: its folders are moved as folders,
-        // which Gmail turns into label changes itself.
-        if self.store.provider(dest.account_id)? == crate::provider::Provider::Gmail && self.store.mailbox_by_role(dest.account_id, Role::All)?.is_some() {
+        // which Gmail turns into label changes itself. Refused before anything is changed.
+        if !labels_model
+            && self.store.provider(dest.account_id)? == crate::provider::Provider::Gmail
+            && self.store.mailbox_by_role(dest.account_id, Role::All)?.is_some()
+        {
             return Err(Error::Other(crate::tr!(
                 "compte en cours de préparation, réessayez après la synchronisation",
                 "account still being set up, try again after the sync"
             )));
         }
+        // A draft moved away (deleted from the list) while a save of it waits: that save would
+        // expunge the copy the move names and put the draft back. It goes; the copy it was to
+        // replace, if any, with it. Told by the save itself: with Gmail's labels a draft's row is
+        // in All Mail, and leaves Drafts only for the bin, junk, or when moved from Drafts (archived
+        // or labelled, it keeps its Drafts label and its save). Undone, the move puts the saves
+        // back, so the latest text still reaches the server. One being uploaded right now: the
+        // move waits for it.
+        let role_of = |mailbox_id: i64| self.store.mailbox_state(mailbox_id).ok().and_then(|m| m.role);
+        let labels_leave = matches!(dest.role, Some(Role::Trash | Role::Junk)) || from.and_then(role_of) == Some(Role::Drafts);
+        let mut dropped = Vec::new();
+        let mut queued: HashMap<i64, HashSet<String>> = HashMap::new();
+        for (id, loc, _) in &plan {
+            if !(if labels_model { labels_leave } else { role_of(loc.mailbox_id) == Some(Role::Drafts) }) {
+                continue;
+            }
+            let queued = match queued.entry(loc.account_id) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => e.insert(self.store.queued_draft_ids(loc.account_id)?),
+            };
+            if queued.is_empty() {
+                continue;
+            }
+            let Some(mid) = self.store.message_ids(*id)?.0.filter(|m| queued.contains(m)) else { continue };
+            if self.store.pending_draft_save_ids(loc.account_id, &mid)?.into_iter().any(crate::ops::being_sent) {
+                return Err(in_flight());
+            }
+            let saves = self.store.pending_draft_saves(loc.account_id, &mid)?;
+            if !saves.is_empty() {
+                dropped.push((loc.account_id, mid, saves));
+            }
+        }
+        for (account_id, mid, saves) in dropped {
+            if let Some(undo) = undo.as_deref_mut() {
+                undo.draft_saves.extend(saves.into_iter().map(|(payload, _)| (account_id, payload)));
+            }
+            if let Some((uid, uidvalidity)) = self.take_pending_draft(account_id, &mid)?
+                && let Some(drafts) = self.store.mailbox_by_role(account_id, Role::Drafts)?
+            {
+                self.delete_old_draft(account_id, &drafts.name, uid, uidvalidity)?;
+            }
+        }
+        if labels_model {
+            return self.file_labelled(plan, &dest, from, undo);
+        }
+        // A draft thrown away from Drafts: its cached UID may be that of a copy a save just replaced
+        // (the newer one is known only at the next read of Drafts). Its Message-ID goes too, after
+        // the move, or the newer copy would come back.
+        let binned_drafts: Vec<(i64, String)> = if matches!(dest.role, Some(Role::Trash | Role::Junk)) {
+            let mut found = Vec::new();
+            for (id, loc, _) in &plan {
+                if role_of(loc.mailbox_id) == Some(Role::Drafts)
+                    && let Some(mid) = self.store.message_ids(*id)?.0
+                {
+                    found.push((*id, mid));
+                }
+            }
+            found
+        } else {
+            Vec::new()
+        };
+        let drafts_name = match binned_drafts.is_empty() {
+            true => None,
+            false => self.store.mailbox_by_role(dest.account_id, Role::Drafts)?.map(|m| m.name),
+        };
         let items: Vec<crate::provider::Moving> = plan
             .into_iter()
             .map(|(id, loc, uid)| crate::provider::Moving { id, mailbox_id: loc.mailbox_id, mailbox: loc.mailbox, uid })
@@ -3044,6 +3187,19 @@ impl Engine {
                 Some(undo) => self.enqueue_undoable(dest.account_id, &command.op, &label, undo)?,
                 None => {
                     self.enqueue(dest.account_id, &command.op, &label)?;
+                }
+            }
+        }
+        if let Some(drafts) = drafts_name {
+            let moved: HashSet<i64> = plan.moved.iter().copied().collect();
+            for (_, mid) in binned_drafts.into_iter().filter(|(id, _)| moved.contains(id)) {
+                let op = Op::DeleteDraft { mailbox: drafts.clone(), message_id: mid };
+                let label = crate::i18n::both(|| crate::tr!("Supprimer le brouillon", "Delete draft"));
+                match undo.as_deref_mut() {
+                    Some(undo) => self.enqueue_undoable(dest.account_id, &op, &label, undo)?,
+                    None => {
+                        self.enqueue(dest.account_id, &op, &label)?;
+                    }
                 }
             }
         }
@@ -3352,8 +3508,8 @@ impl Engine {
         let facts = analyze(href, text).ok_or_else(|| Error::Other(crate::tr!("lien illisible", "unreadable link")))?;
         let summary = self.store.summary(message_id)?;
         let sender_host = summary.from.as_ref().and_then(|a| a.email.rsplit_once('@')).map(|(_, host)| host.to_ascii_lowercase());
-        let sender_domain = sender_host.as_deref().is_some_and(|host| crate::autoconfig::registrable(host) == facts.domain_ascii);
-        let (seen_messages, seen_senders, wrote_to) = self.store.link_domain_context(&facts.domain_ascii, message_id)?;
+        let sender_domain = sender_host.as_deref().is_some_and(|host| crate::autoconfig::registrable(host) == facts.judged_ascii);
+        let (seen_messages, seen_senders, wrote_to) = self.store.link_domain_context(&facts.judged_ascii, message_id)?;
         // The text announces another domain (a click tracker's included): where the user expects to
         // land is looked at too.
         let announced = facts
@@ -3362,8 +3518,8 @@ impl Engine {
             .filter(|_| facts.deceptive)
             .and_then(|shown| idna::domain_to_ascii(shown).ok())
             .map(|ascii| crate::autoconfig::registrable(&ascii))
-            .filter(|ascii| ascii.contains('.') && *ascii != facts.domain_ascii);
-        let link_age = async { if facts.ip { None } else { self.domain_registered(&facts.domain_ascii).await } };
+            .filter(|ascii| ascii.contains('.') && *ascii != facts.judged_ascii);
+        let link_age = async { if facts.ip { None } else { self.domain_registered(&facts.judged_ascii).await } };
         let announced_age = async {
             match &announced {
                 Some(ascii) => self.domain_registered(ascii).await,
@@ -3560,7 +3716,7 @@ impl Engine {
         let domains: std::collections::BTreeSet<String> = remote.hosts.iter().map(|h| crate::autoconfig::registrable(h)).filter(|d| !d.is_empty()).collect();
         let (mut approved, mut blocked) = (Vec::new(), Vec::new());
         for domain in domains {
-            if !low && self.store.images_trusted(&domain)? {
+            if !low && !crate::links::shared_host(&domain) && self.store.images_trusted(&domain)? {
                 approved.push(domain);
             } else {
                 blocked.push(domain);
@@ -3851,6 +4007,12 @@ impl Engine {
             domain.contains('.').then_some(domain)
         }
         .ok_or_else(|| Error::Other(crate::tr!("« {entry} » n'est ni un domaine ni une adresse", "“{entry}” is neither a domain nor an address")))?;
+        if crate::links::shared_host(&key) {
+            return Err(Error::Other(crate::tr!(
+                "{key} sert les images de quiconque passe par ce service : approuvez plutôt l'expéditeur",
+                "{key} serves the images of anyone using that service: approve the sender instead"
+            )));
+        }
         self.store.add_trusted_images(&key)?;
         Ok(key)
     }
@@ -4545,7 +4707,19 @@ impl Engine {
         // screener), then join the results.
         if !late.is_empty() {
             let folders: Vec<String> = late.iter().map(|(_, name, _)| name.clone()).collect::<HashSet<_>>().into_iter().collect();
-            match self.sync_scoped(account_id, sync::Scope::Folders(folders)).await {
+            // Behind a long sync, the results do not wait for it: that sync reads these folders
+            // itself, and this one carries on in the background. With a sync running, none starts.
+            let synced = if sync::folders_idle(account_id) {
+                let this = self.clone();
+                let work = self.spawn(async move { this.sync_scoped(account_id, sync::Scope::Folders(folders)).await });
+                match tokio::time::timeout(REFRESH_TURN_WAIT, work).await {
+                    Ok(joined) => joined.unwrap_or_else(|e| Err(Error::Other(e.to_string()))),
+                    Err(_) => Err(Error::Other(format!("still waiting after {}s", REFRESH_TURN_WAIT.as_secs()))),
+                }
+            } else {
+                Err(Error::Other("a sync of the account is running".into()))
+            };
+            match synced {
                 Ok(_) => {
                     for (mailbox_id, _, uids) in &late {
                         ids.extend(self.store.mailbox_uids_among(*mailbox_id, uids)?.into_values());
@@ -8202,6 +8376,15 @@ mod tests {
         assert!(engine.images_remembered(draft).unwrap());
         assert!(engine.images_remembered(copy).unwrap(), "the same message in another folder");
         assert!(!engine.images_remembered(other).unwrap());
+        // Another sender reusing that Message-ID (a list post's is public): its images stay blocked.
+        let from = |email: &str| Some(crate::model::Address { name: None, email: email.into() });
+        let forged = store.insert_header(acc, inbox, 4, &crate::mime::HeaderInfo { from: from("pixel@tracker.example"), ..header(Some("a@mli.immo")) }, flags, 10).unwrap();
+        assert!(!engine.images_remembered(forged).unwrap(), "another sender");
+        let posed = store.insert_header(acc, inbox, 5, &header(Some("a@mli.immo")), flags, 4000).unwrap();
+        assert!(!engine.images_remembered(posed).unwrap(), "that sender and Message-ID, another message");
+        // Shown on it too (another list's copy): both remembered.
+        engine.remember_images(posed).unwrap();
+        assert!(engine.images_remembered(posed).unwrap() && engine.images_remembered(draft).unwrap());
         engine.remember_images(bare).unwrap();
         assert!(!engine.images_remembered(bare).unwrap(), "no Message-ID: nothing to remember it by");
     }
@@ -8220,6 +8403,9 @@ mod tests {
         assert_eq!(blocked, ["tracker.example"]);
         let (approved, _) = engine.image_hosts(&remote, true).unwrap();
         assert!(approved.is_empty(), "never for an untrustworthy message");
+        // A mailing service's host is every customer's: never approved.
+        assert!(engine.add_trusted_images("https://xyz.list-manage.com/track/open.php").is_err());
+        assert!(engine.add_trusted_images("mcusercontent.com").is_err());
     }
 
     #[test]
@@ -8915,6 +9101,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_large_message_whose_structure_cannot_be_read_opens_whole_on_a_new_connection() {
+        let (port, log) = scripted_imap(QUOTE_WHOLE, r#"("TEXT" "PLAIN" ("CHARSET") NIL NIL "7BIT" 1 1)"#, quote_sections()).await;
+        let (_dir, engine, acc) = engine_on(port);
+        let id = quote_in_inbox(&engine, acc, 5_300_000);
+        let detail = engine.message(id).await.unwrap();
+        assert!(detail.html.contains("Voici le devis"), "{}", detail.html);
+        let log = log.lock().unwrap();
+        assert_eq!(log.iter().filter(|c| c.to_ascii_uppercase().starts_with("LOGIN")).count(), 2, "the broken connection is not reused: {log:?}");
+        assert!(log.iter().any(|c| c.contains("BODY.PEEK[]")), "{log:?}");
+    }
+
+    #[tokio::test]
     async fn opening_a_message_borrows_an_idle_connection_instead_of_signing_in() {
         let (port, log) = scripted_imap(QUOTE_WHOLE, QUOTE_STRUCTURE, quote_sections()).await;
         let (_dir, engine, acc) = engine_on(port);
@@ -8926,12 +9124,23 @@ mod tests {
         assert!(log.iter().any(|c| c.contains("BODY.PEEK[]")), "a small message is downloaded whole: {log:?}");
     }
 
+    #[tokio::test]
+    async fn a_large_whole_download_does_not_take_the_idle_sync_connection() {
+        let (port, log) = scripted_imap(QUOTE_WHOLE, QUOTE_STRUCTURE, quote_sections()).await;
+        let (_dir, engine, acc) = engine_on(port);
+        let id = quote_in_inbox(&engine, acc, 5_300_000);
+        drop(engine.session(acc, Purpose::Sync).await.unwrap());
+        engine.attachment(id, 0).await.unwrap();
+        let log = log.lock().unwrap();
+        assert_eq!(log.iter().filter(|c| c.to_ascii_uppercase().starts_with("LOGIN")).count(), 2, "its own connection: {log:?}");
+    }
+
     #[test]
     fn only_the_sync_connection_at_microsoft_waits_for_the_next_sync() {
         let microsoft = "outlook.office365.com";
         assert_eq!(pool_close_after(Purpose::Sync, microsoft), MICROSOFT_SYNC_CLOSE_AFTER);
         assert!(MICROSOFT_SYNC_CLOSE_AFTER > Duration::from_secs(5 * 60), "outlives the time between two syncs");
-        for purpose in [Purpose::Interactive, Purpose::Queue, Purpose::Background] {
+        for purpose in [Purpose::Interactive, Purpose::Queue, Purpose::Background, Purpose::Completion] {
             assert_eq!(pool_close_after(purpose, microsoft), POOL_CLOSE_AFTER);
         }
         for host in ["imap.gmail.com", "ssl0.ovh.net", "outlook.office365.com.evil.example"] {
@@ -9417,8 +9626,29 @@ In-Reply-To: <parent@x>\r\nReferences: <root@x> <parent@x>\r\n\r\nBrouillon\r\n"
         let draft = engine.open_draft(id).await.unwrap();
         engine.save_draft(Draft { body: "Premier jet, et un paragraphe".into(), ..draft }).await.unwrap();
         assert_eq!(op_kinds(store, acc), vec!["save_draft"]);
-        engine.trash(&[id], false).unwrap();
+        let token = engine.trash(&[id], false).unwrap().unwrap();
         assert!(!op_kinds(store, acc).contains(&"save_draft".to_string()), "{:?}", op_kinds(store, acc));
+        // Undone: back in Drafts, and its latest text still on its way to the server.
+        engine.undo(token).await.unwrap();
+        assert_eq!(store.location(id).unwrap().mailbox_id, drafts);
+        assert!(op_kinds(store, acc).contains(&"save_draft".to_string()), "{:?}", op_kinds(store, acc));
+    }
+
+    #[tokio::test]
+    async fn a_draft_thrown_away_takes_its_newer_copies_with_it() {
+        let (_dir, engine, acc) = test_engine();
+        let store = engine.store();
+        let drafts = store.upsert_mailbox(acc, "Drafts", Some("/"), Some(Role::Drafts), true).unwrap();
+        store.upsert_mailbox(acc, "Trash", Some("/"), Some(Role::Trash), true).unwrap();
+        let flags = ServerFlags { seen: true, flagged: false, answered: false, draft: true };
+        let h = HeaderInfo { message_id: Some("w@example.org".into()), subject: "Devis".into(), date: 1, ..Default::default() };
+        // Its save already uploaded: the cached UID may be the replaced copy's.
+        let id = store.insert_header(acc, drafts, 3, &h, flags, 10).unwrap();
+        let token = engine.trash(&[id], false).unwrap().unwrap();
+        let kinds = op_kinds(store, acc);
+        assert_eq!(kinds.last().map(String::as_str), Some("delete_draft"), "{kinds:?}");
+        engine.undo(token).await.unwrap();
+        assert!(!op_kinds(store, acc).contains(&"delete_draft".to_string()), "undone with the move");
     }
 
     #[tokio::test]

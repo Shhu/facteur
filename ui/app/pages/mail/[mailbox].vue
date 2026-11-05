@@ -166,7 +166,11 @@ async function read(full: boolean) {
 async function readAll(request: number, key: string) {
   const list = await fetchThreads(limit.value)
   if (request !== loadRequest) return
-  threads.value = list
+  // The same view read again (a page added, a full refresh; its length aside): its unchanged rows
+  // kept, so they are not all rebuilt and rendered again.
+  const shown = (k: string) => k.slice(0, k.lastIndexOf('|'))
+  if (shown(loadedFor) === shown(key)) assignKept(list, threads.value, t => `${t.account_id}-${t.thread_id}`)
+  else threads.value = list
   complete.value = list.length < limit.value
   loadedFor = key
 }

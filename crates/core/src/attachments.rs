@@ -171,6 +171,12 @@ const ARCHIVES: &[&str] = &["zip", "rar", "7z", "gz", "tgz", "tar", "bz2", "xz",
 /// facteur may open this saved attachment with the system's program for it: not a program, a
 /// disk image or a macro document, by what it is and by the name it was saved under, and not
 /// judged suspicious (saving one anyway, once warned, is no consent to running it).
+/// An image saved from a message may be opened from facteur: not one that runs script (an SVG
+/// opens in a browser).
+pub fn image_openable(ext: &str) -> bool {
+    !ext.is_empty() && !ACTIVE_IMAGES.contains(&ext.to_ascii_lowercase().as_str())
+}
+
 pub fn openable(report: &AttachmentReport, saved_as: &str) -> bool {
     let risky = |name: &str| {
         ext(name).is_some_and(|e| [PROGRAMS, DISK_IMAGES, MACRO_OFFICE, ACTIVE_IMAGES, WEB_DOCUMENTS].iter().any(|list| list.contains(&e.as_str())))
@@ -561,6 +567,8 @@ mod tests {
         assert_eq!(super::image_filename("https://x.example/..%2F..%2Fevil.exe", png).as_deref(), Some("evil.png"), "no folder, no program");
         assert_eq!(super::image_filename("https://x.example/logo", b"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\"/>").as_deref(), Some("logo.svg"));
         assert_eq!(super::image_filename("https://x.example/a.png", b"<html>not an image</html>"), None);
+        assert!(super::image_openable("png") && super::image_openable("JPG"));
+        assert!(!super::image_openable("svg") && !super::image_openable("SVGZ") && !super::image_openable(""), "an SVG runs script where it opens");
         assert_eq!(super::data_url_image("data:image/png;base64,iVBO\nRw=="), Some(vec![0x89, 0x50, 0x4e, 0x47]));
         assert_eq!(super::data_url_image("data:text/html;base64,PGI+"), None);
         assert_eq!(super::data_url_image("https://x.example/a.png"), None);

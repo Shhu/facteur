@@ -738,23 +738,35 @@ pub async fn restore(
     }
     // Back where they were: a message moved since the backup is on the server in another folder,
     // and must not come back twice. Read once from the other folders (not the bin or junk, whose
-    // messages are on their way out).
+    // messages are on their way out, nor Sent or Drafts: the copy kept there of a message sent to
+    // oneself or Bcc'd is not the one received).
     let (mut elsewhere, mut elsewhere_anon) = (HashSet::new(), HashSet::new());
+    // Gmail, back into the original folders: All Mail's name, and the labels to give back to
+    // messages it still holds (label folder and role, Message-IDs), given once every APPEND is done.
+    let mut gmail_all: Option<String> = None;
+    let mut gmail_held: HashMap<String, Vec<(u32, i64)>> = HashMap::new();
+    let existed: HashSet<String> = listed.iter().map(|l| l.name.clone()).collect();
     if matches!(target, RestoreTarget::Original) {
         let restored: HashSet<&str> = groups.keys().filter_map(|f| selection.folders.get(f)).map(|i| i.name.as_str()).collect();
-        // Gmail: All Mail holds every other folder's messages already.
+        // Gmail: All Mail holds every other folder's messages already. A message still there
+        // gets its label back rather than being sent again.
         let all = listed.iter().find(|l| l.selectable && l.role == Some(crate::model::Role::All));
+        // X-GM-LABELS is Gmail's own: another server's \All folder is a folder like the others.
+        gmail_all = all.filter(|a| a.name.starts_with("[Gmail]/") || a.name.starts_with("[Google Mail]/")).map(|a| a.name.clone());
         let others: Vec<&imap::ListedMailbox> = match all {
             Some(all) => vec![all],
             None => listed
                 .iter()
-                .filter(|l| l.selectable && !matches!(l.role, Some(crate::model::Role::Trash | crate::model::Role::Junk)) && !restored.contains(l.name.as_str()))
+                .filter(|l| l.selectable && !matches!(l.role, Some(crate::model::Role::Trash | crate::model::Role::Junk | crate::model::Role::Sent | crate::model::Role::Drafts)) && !restored.contains(l.name.as_str()))
                 .collect(),
         };
         for other in &others {
             match message_ids(lease.session(), &other.name).await {
                 Ok((ids, anon)) => {
-                    elsewhere.extend(ids);
+                    if gmail_all.is_some() {
+                        gmail_held.extend(ids.iter().map(|(m, u)| (m.clone(), u.clone())));
+                    }
+                    elsewhere.extend(ids.into_keys());
                     elsewhere_anon.extend(anon);
                 }
                 Err(e) => return Err(interrupted(e, &stats)),
@@ -821,6 +833,14 @@ pub async fn restore(
 
         let label = utf7::decode(&info.name);
         let total = items.len();
+        // (Message-ID, size) of the messages to give this label back, once the folder is done:
+        // a restore cut short has labelled every folder it finished.
+        let mut relabel: Vec<(String, i64)> = Vec::new();
+        let role = listed.iter().find(|l| l.name == *mailbox).and_then(|l| l.role);
+        // A label of the user's holding nothing the backup does not have for it: deleted since,
+        // or made again by a restore cut short.
+        let backed: HashSet<&str> = items.iter().filter_map(|i| i.message_id.as_deref()).collect();
+        let refilled = role.is_none() && present.keys().all(|m| backed.contains(m.as_str()));
         let dir = root.join(&folder);
         for (i, item) in items.iter().enumerate() {
             // The connection may go to another between two: back, it may have a folder selected
@@ -839,7 +859,29 @@ pub async fn restore(
             let again = item.message_id.as_ref().is_some_and(|m| appended.contains(&(m.clone(), item.size)));
             let anon = anon_key(item);
             let anon_there = anon.is_some_and(|k| present_anon.contains(&k) || elsewhere_anon.contains(&k) || appended_anon.contains(&k));
-            if again || anon_there || item.message_id.as_ref().is_some_and(|m| present.contains(m) || elsewhere.contains(m)) {
+            let in_target = item.message_id.as_ref().is_some_and(|m| present.contains_key(m));
+            // A label deleted since (not listed when the restore began, or refilled): its messages,
+            // still in All Mail, get it back. One still there keeps what the user did since: a
+            // message archived or moved meanwhile is not put back. Sent again in this run (gone
+            // from Gmail): every label it had comes back. Told by size too: a draft and the
+            // message sent from it share a Message-ID. Never into the bin, junk or All Mail.
+            if gmail_all.is_some()
+                && !in_target
+                && !matches!(role, Some(crate::model::Role::Trash | crate::model::Role::Junk | crate::model::Role::All))
+                && let Some(m) = &item.message_id
+                && (again
+                    || ((!existed.contains(mailbox.as_str()) || refilled)
+                        && gmail_held.get(m).is_some_and(|held| held.iter().any(|(_, size)| *size == item.size))))
+            {
+                relabel.push((m.clone(), item.size));
+            } else if again
+                || anon_there
+                || in_target
+                || item.message_id.as_ref().is_some_and(|m| match gmail_all {
+                    Some(_) => gmail_held.get(m).is_some_and(|held| held.iter().any(|(_, size)| *size == item.size)),
+                    None => elsewhere.contains(m),
+                })
+            {
                 stats.skipped += 1;
             } else if let Some(path) = index::find_file(&dir, &item.file) {
                 let raw = match std::fs::read(path) {
@@ -893,9 +935,53 @@ pub async fn restore(
                 progress(Progress { mailbox: label.clone(), done: i + 1, total });
             }
         }
+        if let Some(all) = gmail_all.as_deref().filter(|_| !relabel.is_empty()) {
+            lease.give_way().await?;
+            let session = lease.session();
+            // Sent again in this run: All Mail read again for their new UIDs.
+            let fresh = if relabel.iter().any(|k| appended.contains(k)) {
+                Some(message_ids(session, all).await.map_err(|e| interrupted(e, &stats))?.0)
+            } else {
+                None
+            };
+            let held = fresh.as_ref().unwrap_or(&gmail_held);
+            relabelled(session, all, mailbox, role, &relabel, held, &mut stats).await.map_err(|e| interrupted(e, &stats))?;
+        }
         stats.folders += 1;
     }
     Ok(stats)
+}
+
+/// Gmail: a label given back to messages All Mail holds. STORE +X-GM-LABELS adds a label without
+/// touching the others.
+async fn relabelled(
+    session: &mut Session,
+    all: &str,
+    mailbox: &str,
+    role: Option<crate::model::Role>,
+    ids: &[(String, i64)],
+    held: &HashMap<String, Vec<(u32, i64)>>,
+    stats: &mut RestoreStats,
+) -> Result<()> {
+    let what = crate::tr!("restauration", "restore");
+    bounded(60, &what, async { Ok(session.select(all).await.map(|_| ())?) }).await?;
+    {
+        let mut uids: Vec<u32> = ids
+            .iter()
+            .filter_map(|(m, size)| held.get(m)?.iter().find(|(_, s)| s == size).map(|(uid, _)| *uid))
+            .collect();
+        uids.sort_unstable();
+        uids.dedup();
+        stats.skipped += ids.len().saturating_sub(uids.len());
+        let label = crate::provider::gmail_label(mailbox, role);
+        for chunk in uids.chunks(500) {
+            bounded(120, &what, imap::run_checked(session, format!("UID STORE {} +X-GM-LABELS ({label})", uid_set(chunk)))).await?;
+        }
+        stats.messages += uids.len();
+    }
+    // Left read-only before CLOSE: CLOSE on a folder selected read-write would expunge what other
+    // clients only marked deleted.
+    deselect(session, all).await
 }
 
 const REFUSALS_IN_ROW: usize = 10;
@@ -933,17 +1019,17 @@ async fn deselect(session: &mut Session, mailbox: &str) -> Result<()> {
 /// Message-IDs (without brackets) already in `mailbox`, and (arrival date, size) of those without
 /// one. All of them or an error: a set cut short (a FETCH refused with a tagged NO, which
 /// async-imap ends quietly) would have the restore upload again the messages it missed.
-async fn message_ids(session: &mut Session, mailbox: &str) -> Result<(HashSet<String>, HashSet<(i64, i64)>)> {
+async fn message_ids(session: &mut Session, mailbox: &str) -> Result<(HashMap<String, Vec<(u32, i64)>>, HashSet<(i64, i64)>)> {
     let what = crate::tr!("restauration", "restore");
     let exists = bounded(120, &what, async { Ok(session.examine(mailbox).await?.exists) }).await?;
     let mut anon = HashSet::new();
     if exists == 0 {
-        return Ok((HashSet::new(), anon));
+        return Ok((HashMap::new(), anon));
     }
     let mut uids: Vec<u32> = bounded(300, &what, imap::uid_search_checked(session, "ALL", exists)).await?.into_iter().collect();
     uids.sort_unstable();
     // By chunks, each with its own bound: a large folder on a slow server takes the time it needs.
-    let mut ids = HashSet::new();
+    let mut ids = HashMap::new();
     for chunk in uids.chunks(2000) {
         let mut answered: HashSet<u32> = HashSet::new();
         {
@@ -952,11 +1038,13 @@ async fn message_ids(session: &mut Session, mailbox: &str) -> Result<(HashSet<St
                 if let Some(uid) = f.uid {
                     answered.insert(uid);
                 }
-                match f.envelope().and_then(|e| e.message_id.as_ref()) {
-                    Some(id) => {
-                        ids.insert(String::from_utf8_lossy(id).trim_matches(['<', '>', ' ']).to_string());
+                match (f.envelope().and_then(|e| e.message_id.as_ref()), f.uid) {
+                    (Some(id), Some(uid)) => {
+                        let id = String::from_utf8_lossy(id).trim_matches(['<', '>', ' ']).to_string();
+                        ids.entry(id).or_insert_with(Vec::new).push((uid, f.size.map_or(0, i64::from)));
                     }
-                    None => {
+                    (Some(_), None) => {}
+                    (None, _) => {
                         if let (Some(date), Some(size)) = (f.internal_date(), f.size) {
                             anon.insert((date.timestamp(), size as i64));
                         }
@@ -1466,14 +1554,14 @@ mod tests {
         let envelope = |uid: u32, id: &str| format!("* {uid} FETCH (UID {uid} ENVELOPE (NIL NIL NIL NIL NIL NIL NIL NIL NIL \"<{id}>\"))");
         let whole: &'static str = format!("{}\r\n{}\r\n{{tag}} OK done", envelope(3, "a@x"), envelope(4, "b@x")).leak();
         let mut ok = scripted(vec![examine, search, "{tag} OK", whole]).await;
-        assert_eq!(message_ids(&mut ok, "INBOX").await.unwrap().0, HashSet::from(["a@x".to_string(), "b@x".to_string()]));
+        assert_eq!(message_ids(&mut ok, "INBOX").await.unwrap().0, HashMap::from([("a@x".to_string(), vec![(3, 0)]), ("b@x".to_string(), vec![(4, 0)])]));
         // Refused after the first message, the second one still there: no partial set.
         let cut: &'static str = format!("{}\r\n{{tag}} NO [LIMIT] throttled", envelope(3, "a@x")).leak();
         let mut refused = scripted(vec![examine, search, "{tag} OK", cut, "* SEARCH 4\r\n{tag} OK done", "{tag} OK"]).await;
         assert!(message_ids(&mut refused, "INBOX").await.is_err());
         // The second one deleted meanwhile: what came back is the whole set.
         let mut deleted = scripted(vec![examine, search, "{tag} OK", cut, "* SEARCH\r\n{tag} OK done", "{tag} OK"]).await;
-        assert_eq!(message_ids(&mut deleted, "INBOX").await.unwrap().0, HashSet::from(["a@x".to_string()]));
+        assert_eq!(message_ids(&mut deleted, "INBOX").await.unwrap().0, HashMap::from([("a@x".to_string(), vec![(3, 0)])]));
     }
 
     #[tokio::test]
@@ -1607,6 +1695,44 @@ mod tests {
         .await;
         let stats = restore(&mut session, root.path(), Selection { items: vec![item], folders }, RestoreTarget::Original, "", |_| {}).await.unwrap();
         assert_eq!((stats.messages, stats.skipped), (0, 1), "on the server already, in Archive");
+    }
+
+    #[tokio::test]
+    async fn gmail_gets_back_a_deleted_label_by_labelling_what_all_mail_still_holds() {
+        let root = tempfile::tempdir().unwrap();
+        let cur = root.path().join("Factures").join("cur");
+        std::fs::create_dir_all(&cur).unwrap();
+        std::fs::write(cur.join("100.U1V1.facteur:2,"), b"Message-ID: <m@x>\r\n\r\nx").unwrap();
+        let item = Item { folder: "Factures".into(), file: "100.U1V1.facteur:2,".into(), received: 100, flags: String::new(), message_id: Some("m@x".into()), size: 22, subject: String::new() };
+        let folders = HashMap::from([("Factures".to_string(), FolderInfo { name: "Factures".into(), delimiter: Some("/".into()) })]);
+        let all_mail = [
+            "* 1 EXISTS\r\n* OK [UIDVALIDITY 1] ok\r\n{tag} OK [READ-ONLY] done",
+            "* SEARCH 9\r\n{tag} OK done",
+            "{tag} OK",
+            "* 1 FETCH (UID 9 RFC822.SIZE 22 INTERNALDATE \"01-Jan-1970 00:01:40 +0000\" ENVELOPE (NIL NIL NIL NIL NIL NIL NIL NIL NIL \"<m@x>\"))\r\n{tag} OK done",
+        ];
+        let mut script = vec!["* LIST () \"/\" INBOX\r\n* LIST (\\All) \"/\" \"[Gmail]/All Mail\"\r\n{tag} OK done", "{tag} OK"];
+        script.extend(all_mail);
+        script.extend([
+            "{tag} OK closed",
+            // The label, deleted: made again, empty.
+            "{tag} OK created",
+            "* 0 EXISTS\r\n* OK [UIDVALIDITY 2] ok\r\n{tag} OK [READ-ONLY] done",
+            "{tag} OK closed",
+        ]);
+        script.extend(all_mail);
+        script.extend([
+            "* 1 EXISTS\r\n{tag} OK [READ-WRITE] done",
+            "* 1 FETCH (UID 9 X-GM-LABELS (\"Factures\"))\r\n{tag} OK stored",
+            "* 1 EXISTS\r\n* OK [UIDVALIDITY 1] ok\r\n{tag} OK [READ-ONLY] done",
+            "{tag} OK closed",
+        ]);
+        let (mut session, heard) = recorded(script).await;
+        let stats = restore(&mut session, root.path(), Selection { items: vec![item], folders }, RestoreTarget::Original, "", |_| {}).await.unwrap();
+        assert_eq!((stats.messages, stats.skipped), (1, 0), "labelled again, not counted as already there");
+        let heard = heard.lock().unwrap();
+        assert!(heard.iter().any(|c| c == "UID STORE 9 +X-GM-LABELS (\"Factures\")"), "{heard:?}");
+        assert!(!heard.iter().any(|c| c.starts_with("APPEND")), "no second copy: {heard:?}");
     }
 
     #[tokio::test]

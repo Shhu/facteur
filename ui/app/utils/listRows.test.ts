@@ -123,21 +123,21 @@ describe('drafts in a thread', () => {
 describe('staleDetails', () => {
   const msg = (id: number, mailbox_id: number, preview = 'Bonjour', draft = false) => ({ id, mailbox_id, preview, flags: { draft } }) as unknown as MessageSummary
 
-  it('reads again a draft saved since, or sent, whose text the cache no longer matches', () => {
-    const before = [msg(1, 1), msg(2, 2, 'J\'ai rajouté … si il')]
-    expect(staleDetails(before, [msg(1, 1), msg(2, 2, 'J\'ai rajouté … si il')], new Set([2]))).toEqual([2])
-    expect(staleDetails(before, [msg(1, 1), msg(2, 3, 'J\'ai rajouté … si il')], new Set())).toEqual([2])
-    expect(staleDetails(before, [msg(1, 1, 'Autre'), msg(2, 2)], new Set())).toEqual([1, 2])
+  it('reads again a draft sent, or a message whose text the cache no longer matches', () => {
+    const before = [msg(1, 1), msg(2, 2, 'J\'ai rajouté … si il', true)]
+    expect(staleDetails(before, [msg(1, 1), msg(2, 2, 'J\'ai rajouté … si il', true)]), 'an unchanged draft: not at every tick').toEqual([])
+    expect(staleDetails(before, [msg(1, 1), msg(2, 3, 'J\'ai rajouté … si il', true)])).toEqual([2])
+    expect(staleDetails(before, [msg(1, 1, 'Autre'), msg(2, 2, 'J\'ai rajouté … si il', true)])).toEqual([1])
   })
 
   it('reads again a Gmail draft sent: the same row in All Mail, its preview full long before', () => {
     const typing = 'Donc c\'est t\'es en semi vacances ? :D Pour les devis'
     const before = [msg(1, 21), msg(2, 21, typing, true)]
-    expect(staleDetails(before, [msg(1, 21), msg(2, 21, typing, false)], new Set())).toEqual([2])
+    expect(staleDetails(before, [msg(1, 21), msg(2, 21, typing, false)])).toEqual([2])
     expect(draftIds(before, [])).toEqual(new Set([2]))
   })
 
   it('keeps what nothing changed, and leaves new messages to their first read', () => {
-    expect(staleDetails([msg(1, 1)], [msg(1, 1), msg(9, 1)], new Set())).toEqual([])
+    expect(staleDetails([msg(1, 1)], [msg(1, 1), msg(9, 1)])).toEqual([])
   })
 })

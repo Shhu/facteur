@@ -409,7 +409,8 @@
         "sync": "synchro",
         "interactive": "lecture",
         "queue": "file",
-        "background": "travaux"
+        "background": "travaux",
+        "completion": "suite des messages"
       },
       "connection": {
         "busy": "en cours d'utilisation",

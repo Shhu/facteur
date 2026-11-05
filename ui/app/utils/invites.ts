@@ -149,3 +149,14 @@ export function validZone(tz: string | null | undefined): string | null {
 export function zoneCity(tz: string): string {
   return (tz.split('/').at(-1) ?? tz).replace(/_/g, ' ')
 }
+
+/** Outlook's global object id (MS-OXOCAL PidLidGlobalObjectId, in hex): bytes 16 to 19 hold an
+ *  occurrence's date, zero for the series. */
+const OUTLOOK_ID = /^040000008200E00074C5B7101A82E008/i
+
+/** The uid of an event's series: Outlook gives each occurrence a uid of its own, the series'
+ *  with the occurrence's date in it. */
+export function seriesUid(uid: string): string {
+  if (!OUTLOOK_ID.test(uid) || uid.length < 40) return uid
+  return `${uid.slice(0, 32)}00000000${uid.slice(40)}`.toUpperCase()
+}

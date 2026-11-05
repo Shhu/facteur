@@ -2013,14 +2013,29 @@ pub fn days_to_chosen(day: NaiveDate, repeat: Option<&crate::repeat::Repeat>) ->
 /// `t` moved by `days` days of wall time (the same time of day across a change of hour), in
 /// `zone` (`None`, or a whole-day event: the computer's).
 pub fn moved_days(t: i64, days: i64, zone: Option<&str>, all_day: bool) -> Option<i64> {
-    use chrono::TimeZone;
     if days == 0 {
         return Some(t);
     }
     let tz = if all_day { crate::repeat::local_zone() } else { series_zone(zone) };
     let Some((_, tz)) = tz else { return Some(t + days * 86400) };
     let wall = Zone::Named(tz).wall(t)? + chrono::Duration::days(days);
-    tz.from_local_datetime(&wall).earliest().map(|d| d.timestamp())
+    // A time the change of hour skips: an hour later, as everywhere else.
+    resolve(&tz, wall)
+}
+
+/// An event moved by `days` days of wall time, its end too. A start that lands in an hour the
+/// change of hour skips (pushed an hour later) keeps the event's length instead.
+pub fn moved_span(start: i64, end: i64, days: i64, zone: Option<&str>, all_day: bool) -> Option<(i64, i64)> {
+    let moved = moved_days(start, days, zone, all_day)?;
+    let moved_end = moved_days(end, days, zone, all_day)?;
+    if all_day {
+        return Some((moved, moved_end));
+    }
+    let pushed = series_zone(zone).is_some_and(|(_, tz)| {
+        let wall = |t| Zone::Named(tz).wall(t);
+        wall(moved) != wall(start).map(|w| w + chrono::Duration::days(days))
+    });
+    Some((moved, if pushed || moved_end <= moved { moved + (end - start) } else { moved_end }))
 }
 
 /// The zone a timed series is written in: the one asked for, else the computer's.
@@ -2581,6 +2596,21 @@ BEGIN:VEVENT\r\nUID:d\r\nRECURRENCE-ID:20261003T100000Z\r\nDTSTART:20261003T1500
         assert!(unfolded.contains("DTSTART:20261003T160000Z"), "{unfolded}");
         assert!(!unfolded.contains("T210000Z"), "not moved by as much again from 15:00: {unfolded}");
         assert!(unfolded.contains("DTSTART:20261001T160000Z"));
+    }
+
+    #[test]
+    fn a_day_moved_to_starts_an_hour_later_when_its_midnight_is_skipped() {
+        // Santiago, 8 September 2024: midnight becomes 01:00. Thursday 5, 00:00 (UTC-4) moved to
+        // Sunday 8 lands at 01:00 (UTC-3), still that Sunday.
+        assert_eq!(super::moved_days(1_725_508_800, 3, Some("America/Santiago"), false), Some(1_725_768_000));
+        assert_eq!(super::moved_days(1_725_508_800, 1, Some("America/Santiago"), false), Some(1_725_508_800 + 86_400));
+        // Paris, 30 March 2025: 02:30-03:30 on the Friday before, moved to that Sunday, keeps its hour
+        // even though 02:30 does not exist then (03:30-04:30).
+        let (start, end) = super::moved_span(1_743_125_400, 1_743_129_000, 2, Some("Europe/Paris"), false).unwrap();
+        assert_eq!((start, end - start), (1_743_298_200, 3600), "Sunday 03:30 (UTC+2), an hour long");
+        // Saturday 29 March 23:00 to Sunday 07:00 (seven hours across the change) moved to Monday:
+        // 23:00 to Tuesday 07:00 on the wall, eight hours.
+        assert_eq!(super::moved_span(1_743_285_600, 1_743_310_800, 2, Some("Europe/Paris"), false), Some((1_743_454_800, 1_743_483_600)));
     }
 
     #[test]

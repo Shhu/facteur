@@ -409,7 +409,8 @@
         "sync": "sync",
         "interactive": "reading",
         "queue": "queue",
-        "background": "background"
+        "background": "background",
+        "completion": "rest of messages"
       },
       "connection": {
         "busy": "in use",
