@@ -255,6 +255,47 @@ function onDrop(e: DragEvent) {
   if (others.length) emit('files', others)
 }
 
+type Paint = 'color' | 'background'
+/** Text: mid tones, readable on a light or a dark page. Background: marker tints. */
+const PALETTES: Record<Paint, { key: string, value: string, swatch: string }[]> = {
+  color: [
+    { key: 'gray', value: '#6b7280', swatch: 'bg-[#6b7280]' },
+    { key: 'red', value: '#dc2626', swatch: 'bg-[#dc2626]' },
+    { key: 'orange', value: '#ea580c', swatch: 'bg-[#ea580c]' },
+    { key: 'yellow', value: '#ca8a04', swatch: 'bg-[#ca8a04]' },
+    { key: 'green', value: '#16a34a', swatch: 'bg-[#16a34a]' },
+    { key: 'teal', value: '#0d9488', swatch: 'bg-[#0d9488]' },
+    { key: 'blue', value: '#2563eb', swatch: 'bg-[#2563eb]' },
+    { key: 'purple', value: '#7c3aed', swatch: 'bg-[#7c3aed]' },
+    { key: 'pink', value: '#db2777', swatch: 'bg-[#db2777]' }
+  ],
+  background: [
+    { key: 'gray', value: '#e5e7eb', swatch: 'bg-[#e5e7eb]' },
+    { key: 'red', value: '#fecaca', swatch: 'bg-[#fecaca]' },
+    { key: 'orange', value: '#fed7aa', swatch: 'bg-[#fed7aa]' },
+    { key: 'yellow', value: '#fef08a', swatch: 'bg-[#fef08a]' },
+    { key: 'green', value: '#bbf7d0', swatch: 'bg-[#bbf7d0]' },
+    { key: 'teal', value: '#99f6e4', swatch: 'bg-[#99f6e4]' },
+    { key: 'blue', value: '#bfdbfe', swatch: 'bg-[#bfdbfe]' },
+    { key: 'purple', value: '#ddd6fe', swatch: 'bg-[#ddd6fe]' },
+    { key: 'pink', value: '#fbcfe8', swatch: 'bg-[#fbcfe8]' }
+  ]
+}
+const attribute = (paint: Paint) => paint === 'color' ? 'color' : 'backgroundColor'
+function paint(editor: Editor, kind: Paint, value: string | null) {
+  const chain = editor.chain().focus()
+  if (kind === 'color') return value ? chain.setColor(value) : chain.unsetColor()
+  return value ? chain.setBackgroundColor(value) : chain.unsetBackgroundColor()
+}
+
+const pickerOpen = ref(false)
+const pickerPaint = ref<Paint>('color')
+const pickerValue = ref('#2563eb')
+function applyPicked() {
+  if (target && /^#[0-9a-f]{6}$/i.test(pickerValue.value)) paint(target, pickerPaint.value, pickerValue.value).run()
+  pickerOpen.value = false
+}
+
 const handlers = {
   editLink: {
     canExecute: () => true,
@@ -296,6 +337,24 @@ const handlers = {
     execute: (editor: Editor) => stepFontSize(editor, -1),
     isActive: () => false
   },
+  paint: {
+    canExecute: () => true,
+    execute: (editor: Editor, cmd: { paint: Paint, value: string | null }) => paint(editor, cmd.paint, cmd.value),
+    isActive: (editor: Editor, cmd: { paint: Paint, value: string | null }) =>
+      !!cmd.value && editor.isActive('textStyle', { [attribute(cmd.paint)]: cmd.value })
+  },
+  pickPaint: {
+    canExecute: () => true,
+    execute: (editor: Editor, cmd: { paint: Paint }) => {
+      target = editor
+      pickerPaint.value = cmd.paint
+      const current = editor.getAttributes('textStyle')[attribute(cmd.paint)]
+      if (typeof current === 'string' && /^#[0-9a-f]{6}$/i.test(current)) pickerValue.value = current
+      pickerOpen.value = true
+      return editor.chain()
+    },
+    isActive: () => false
+  },
   columns2: {
     canExecute: () => true,
     execute: (editor: Editor) => makeColumns(editor, 2),
@@ -334,6 +393,19 @@ const handlers = {
   }
 } satisfies EditorCustomHandlers
 
+function paintMenu(kind: Paint): EditorToolbarItem<typeof handlers> {
+  return {
+    icon: kind === 'color' ? 'i-lucide-baseline' : 'i-lucide-highlighter',
+    tooltip: { text: t(kind === 'color' ? 'app.editor.textColor' : 'app.editor.backgroundColor') },
+    content: { align: 'start' },
+    items: [
+      [{ kind: 'paint', paint: kind, value: null, icon: 'i-lucide-circle-off', label: t(kind === 'color' ? 'app.editor.textColorAuto' : 'app.editor.backgroundNone') }],
+      PALETTES[kind].map(c => ({ kind: 'paint', paint: kind, value: c.value, label: t(`app.editor.colors.${c.key}`), avatar: { alt: '', size: '3xs', class: `${c.swatch} ring-1 ring-default` } })),
+      [{ kind: 'pickPaint', paint: kind, icon: 'i-lucide-pipette', label: t('app.editor.customColor') }]
+    ]
+  } as EditorToolbarItem<typeof handlers>
+}
+
 const fullToolbar = computed<EditorToolbarItem<typeof handlers>[][]>(() => [
   [
     { kind: 'mark', mark: 'bold', icon: 'i-lucide-bold', tooltip: { text: t('app.editor.bold'), kbds: ['meta', 'b'] } },
@@ -341,7 +413,9 @@ const fullToolbar = computed<EditorToolbarItem<typeof handlers>[][]>(() => [
     { kind: 'mark', mark: 'underline', icon: 'i-lucide-underline', tooltip: { text: t('app.editor.underline'), kbds: ['meta', 'u'] } },
     { kind: 'mark', mark: 'strike', icon: 'i-lucide-strikethrough', tooltip: { text: t('app.editor.strike') } },
     { kind: 'textBigger', icon: 'i-lucide-a-arrow-up', tooltip: { text: t('app.editor.textBigger') } },
-    { kind: 'textSmaller', icon: 'i-lucide-a-arrow-down', tooltip: { text: t('app.editor.textSmaller') } }
+    { kind: 'textSmaller', icon: 'i-lucide-a-arrow-down', tooltip: { text: t('app.editor.textSmaller') } },
+    paintMenu('color'),
+    paintMenu('background')
   ],
   [
     { kind: 'bulletList', icon: 'i-lucide-list', tooltip: { text: t('app.editor.bulletList') } },
@@ -391,6 +465,8 @@ const touchToolbar = computed<EditorToolbarItem<typeof handlers>[][]>(() => {
       items: [
         labelled([text[3]!, blocks[1]!, blocks[2]!]),
         labelled([text[4]!, text[5]!]),
+        labelled([...((text[6] as { items: EditorToolbarItem<typeof handlers>[][] }).items.flat())]),
+        labelled([...((text[7] as { items: EditorToolbarItem<typeof handlers>[][] }).items.flat())]),
         labelled([media[2]!, history[0]!, history[2]!]),
         ...(props.moreItems as EditorToolbarItem<typeof handlers>[][])
       ]
@@ -487,6 +563,17 @@ const toolbar = computed(() => {
     <ImageCropper v-model:open="cropOpen" :src="cropSrc" @done="cropDone" />
     <input ref="fileInput" type="file" accept="image/*" multiple class="hidden" @change="insertImages">
 
+    <UModal v-model:open="pickerOpen" :title="$t(pickerPaint === 'color' ? 'app.editor.textColor' : 'app.editor.backgroundColor')" :ui="{ content: 'max-w-xs' }">
+      <template #body>
+        <form class="flex flex-col items-center gap-3" @submit.prevent="applyPicked">
+          <UColorPicker v-model="pickerValue" />
+          <div class="flex w-full gap-2">
+            <UInput v-model="pickerValue" class="min-w-0 flex-1 font-mono" :aria-label="$t('app.editor.customColor')" />
+            <UButton type="submit" :label="$t('app.editor.apply')" />
+          </div>
+        </form>
+      </template>
+    </UModal>
     <UModal v-model:open="linkOpen" :title="$t('app.editor.insertLink')" :ui="{ content: 'max-w-md' }">
       <template #body>
         <form class="flex gap-2" @submit.prevent="applyLink">

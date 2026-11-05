@@ -1,6 +1,6 @@
 import Image from '@tiptap/extension-image'
 import { Table, TableCell, TableHeader, TableRow } from '@tiptap/extension-table'
-import { FontSize, TextStyle } from '@tiptap/extension-text-style'
+import { BackgroundColor, Color, FontSize, TextStyle } from '@tiptap/extension-text-style'
 import { Node } from '@tiptap/vue-3'
 import type { Editor } from '@tiptap/vue-3'
 
@@ -192,7 +192,7 @@ const cellAttributes = {
 const MailTableCell = TableCell.extend({ addAttributes() { return { ...this.parent?.(), ...cellAttributes } } })
 const MailTableHeader = TableHeader.extend({ addAttributes() { return { ...this.parent?.(), ...cellAttributes } } })
 
-export const editorExtensions = [ResizableImage, Columns, Column, Signature, TextStyle, FontSize, MailTable, TableRow, MailTableHeader, MailTableCell]
+export const editorExtensions = [ResizableImage, Columns, Column, Signature, TextStyle, FontSize, Color, BackgroundColor, MailTable, TableRow, MailTableHeader, MailTableCell]
 
 const FONT_SIZES = [11, 12, 14, 16, 18, 22, 28, 36]
 const NORMAL_SIZE = 14

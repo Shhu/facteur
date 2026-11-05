@@ -1,11 +1,11 @@
 import type { Account, Address, Draft, MessageDetail } from '~/utils/types'
 import { SIGNATURE_CLASS } from '~/utils/editorExtensions'
 
-/** Separated by "-- ", the convention mail clients know to fold. It sits in a marked block so that
- *  a change of sender replaces it as a whole. */
+/** In a marked block, so that a change of sender replaces it as a whole. The "-- " separator is
+ *  added to the text version only, when sending. */
 export function signatureHtml(signature: string | undefined): string {
   const content = signatureContent(signature)
-  return content ? `<div class="${SIGNATURE_CLASS}"><p>-- </p>${content}</div>` : ''
+  return content ? `<div class="${SIGNATURE_CLASS}">${content}</div>` : ''
 }
 
 /** The alias's own signature if it has one, else the account's. */

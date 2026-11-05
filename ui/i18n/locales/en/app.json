@@ -118,7 +118,7 @@
       "close": "Close",
       "maximize": "Maximize",
       "restore": "Restore size",
-      "signatureIn": "{name}'s signature is under “-- ” and follows the sending address.",
+      "signatureIn": "{name}'s signature follows the sending address.",
       "signatureRemoved": "{name}'s signature was removed from this message.",
       "signatureNone": "No signature for {name}.",
       "signatureEdit": "Edit",
@@ -164,6 +164,23 @@
       "columnHint": "Drag the edge of a column to set its width; double-click to reset it.",
       "textBigger": "Bigger text",
       "textSmaller": "Smaller text",
+      "textColor": "Text color",
+      "textColorAuto": "Automatic",
+      "backgroundColor": "Background color",
+      "backgroundNone": "None",
+      "customColor": "Custom…",
+      "apply": "Apply",
+      "colors": {
+        "gray": "Gray",
+        "red": "Red",
+        "orange": "Orange",
+        "yellow": "Yellow",
+        "green": "Green",
+        "teal": "Teal",
+        "blue": "Blue",
+        "purple": "Purple",
+        "pink": "Pink"
+      },
       "more": "More options"
     },
     "when": {

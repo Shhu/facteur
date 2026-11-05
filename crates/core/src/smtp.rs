@@ -117,7 +117,7 @@ fn build_inner(
         Some(html) => {
             // Always derived from the HTML: the plain `body` sent along by the editor can lag
             // behind it (text deleted or changed since).
-            let text = crate::mime::html_to_text(html);
+            let text = crate::mime::html_to_text(&with_signature_separator(html));
             let (html, images) = inline_images(html)?;
             let document = format!(
                 "<!doctype html><html><head><meta charset=\"utf-8\"><style>td > p, th > p {{ margin: 0 }}</style></head>\
@@ -214,6 +214,20 @@ fn thread_references(parent_refs: &[String], parent: &str) -> Vec<String> {
 pub const MAX_MESSAGE_SIZE: usize = 25 * 1024 * 1024;
 
 /// Rough: base64 attachments and images get their line breaks, text parts count as written.
+/// The editor's signature block, preceded by the "-- " line in the text version only: the
+/// convention plain-text readers fold on, which the HTML no longer shows. Drafts written before
+/// already hold that line.
+fn with_signature_separator(html: &str) -> std::borrow::Cow<'_, str> {
+    const BLOCK: &str = "<div class=\"facteur-signature\">";
+    match html.find(BLOCK) {
+        Some(at) if !html[at + BLOCK.len()..].starts_with("<p>-- </p>") => {
+            let end = at + BLOCK.len();
+            std::borrow::Cow::Owned(format!("{}<p>-- </p>{}", &html[..end], &html[end..]))
+        }
+        _ => std::borrow::Cow::Borrowed(html),
+    }
+}
+
 pub fn estimated_size(draft: &Draft) -> usize {
     let attachments: usize = draft.attachments.iter().map(|a| a.data.len()).sum();
     let html = draft.html.as_deref().map_or(0, str::len);
@@ -616,6 +630,19 @@ mod tests {
         assert!(html.contains("<strong>Bob</strong>"));
         assert!(html.contains("data:image/png;base64,"), "image turned back into a data URL for the editor");
         assert!(parts.attachments.is_empty(), "the image is not an attachment");
+    }
+
+    #[test]
+    fn the_signature_separator_is_in_the_text_version_only() {
+        let signed = |html: &str| {
+            let draft = Draft { account_id: 1, to: vec!["bob@example.org".into()], subject: "Sig".into(), html: Some(html.into()), ..Default::default() };
+            crate::mime::parse_draft(&build(&account(), &draft, None, &[], true).unwrap().formatted()).unwrap()
+        };
+        let parts = signed("<p>Bonjour</p><div class=\"facteur-signature\"><p>Yann</p></div>");
+        assert_eq!(parts.body.replace("\r\n", "\n").trim(), "Bonjour\n\n-- \nYann");
+        assert!(!parts.html.unwrap().contains("-- "), "not shown in the HTML");
+        let old = signed("<p>Bonjour</p><div class=\"facteur-signature\"><p>-- </p><p>Yann</p></div>");
+        assert_eq!(old.body.replace("\r\n", "\n").trim(), "Bonjour\n\n-- \nYann", "an older draft's own line is not doubled");
     }
 
     #[test]

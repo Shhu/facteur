@@ -118,7 +118,7 @@
       "close": "Fermer",
       "maximize": "Agrandir",
       "restore": "Réduire",
-      "signatureIn": "La signature de {name} figure sous « -- » et suit l'adresse d'envoi.",
+      "signatureIn": "La signature de {name} suit l'adresse d'envoi.",
       "signatureRemoved": "La signature de {name} a été retirée de ce message.",
       "signatureNone": "Aucune signature pour {name}.",
       "signatureEdit": "Modifier",
@@ -164,6 +164,23 @@
       "columnHint": "Glissez le bord d'une colonne pour régler sa largeur ; double-clic pour revenir à l'automatique.",
       "textBigger": "Texte plus gros",
       "textSmaller": "Texte plus petit",
+      "textColor": "Couleur du texte",
+      "textColorAuto": "Automatique",
+      "backgroundColor": "Couleur de fond",
+      "backgroundNone": "Aucune",
+      "customColor": "Personnalisée…",
+      "apply": "Appliquer",
+      "colors": {
+        "gray": "Gris",
+        "red": "Rouge",
+        "orange": "Orange",
+        "yellow": "Jaune",
+        "green": "Vert",
+        "teal": "Turquoise",
+        "blue": "Bleu",
+        "purple": "Violet",
+        "pink": "Rose"
+      },
       "more": "Plus d'options"
     },
     "when": {

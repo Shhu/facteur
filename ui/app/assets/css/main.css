@@ -151,3 +151,8 @@ html, body {
 body:has([data-dragging="true"]) iframe {
   pointer-events: none;
 }
+
+/* A marker tint under the dark theme's light text would be unreadable: dark text, unless one is chosen. */
+.dark .tiptap span[style*="background-color"]:not([style^="color"]):not([style*=" color"]):not([style*=";color"]) {
+  color: #1f2937;
+}

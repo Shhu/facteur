@@ -1497,7 +1497,14 @@ impl TextWriter {
             return;
         }
         let trimmed = self.out.trim_end_matches(' ').len();
-        self.out.truncate(trimmed);
+        // The signature separator keeps its space, and the signature follows on the next line.
+        let line = &self.out[self.out[..trimmed].rfind('\n').map_or(0, |i| i + 1)..trimmed];
+        if trimmed < self.out.len() && line.trim_start_matches(['>', ' ']) == "--" {
+            self.out.truncate(trimmed + 1);
+            self.pending = 1;
+        } else {
+            self.out.truncate(trimmed);
+        }
         // A blank line inside a quote is still part of it (not the one leaving or entering it).
         let blank_quote = self.blank_quote.min(self.quote).min(MAX_DEPTH);
         for i in 0..self.pending {
