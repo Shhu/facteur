@@ -73,7 +73,8 @@ const srcdoc = computed(() => {
      clients mark in HTML. Opacity rather than a colour: an HTML mail keeps its own. */
   .facteur-signature, .gmail_signature, .moz-signature, div[data-smartmail="gmail_signature"] {
          margin-top: 12px; padding-top: 12px; border-top: 1px dashed ${dark ? '#3f3f46' : '#d4d4d8'}; font-size: 13.5px; opacity: .8; }
-  mark.facteur-date { background: ${dark ? 'rgba(14, 165, 233, .16)' : '#e0f2fe'}; color: inherit; font-weight: 600; border-radius: 4px; padding: 0 3px; }
+  /* Its own ink in an HTML mail: inherited, white text of a dark mail sat on the light blue. */
+  mark.facteur-date { background: ${dark ? 'rgba(14, 165, 233, .16)' : '#e0f2fe'}; color: ${props.plain ? 'inherit' : '#0c4a6e'}; font-weight: 600; border-radius: 4px; padding: 0 3px; }
   /* Height set inline by the message (Outlook does) outweighs auto: shrunk to the width, the
      picture keeps its proportions inside the box rather than being squashed. */
   img { max-width: 100%; height: auto; object-fit: contain; }

@@ -917,6 +917,10 @@ fn sanitize_html_budgeted(html: &str, cids: HashMap<String, (usize, String)>) ->
         })
         .clean(&defused(html))
         .to_string();
+    let clean = match body_colors(html) {
+        Some(sheet) => format!("{sheet}{clean}"),
+        None => clean,
+    };
     // <style> sheets can load resources too.
     let mut remote = std::mem::take(&mut *remote.lock().unwrap_or_else(|e| e.into_inner()));
     for block in style_blocks(&clean) {
@@ -924,6 +928,76 @@ fn sanitize_html_budgeted(html: &str, cids: HashMap<String, (usize, String)>) ->
     }
     let shown = std::mem::take(&mut *shown.lock().unwrap_or_else(|e| e.into_inner()));
     (clean, remote, shown)
+}
+
+/// The colours a mail sets on its `<body>`, which goes with the element: written back as a sheet,
+/// or the reader would take a black newsletter for a white one and invert it.
+fn body_colors(html: &str) -> Option<String> {
+    let lower = html.get(..html.len().min(200_000))?.to_ascii_lowercase();
+    let start = lower.match_indices("<body").map(|(i, _)| i + 5).find(|&i| lower[i..].starts_with(|c: char| c.is_ascii_whitespace()))?;
+    let tag = &lower[start..start + lower[start..].find('>')?];
+    let attribute = |name: &str| {
+        let mut from = 0;
+        while let Some(at) = tag[from..].find(name) {
+            let at = from + at;
+            from = at + name.len();
+            if !tag[..at].ends_with(|c: char| c.is_ascii_whitespace() || c == '"' || c == '\'') {
+                continue;
+            }
+            // "text-align" in a style is no `text` attribute.
+            let Some(rest) = tag[from..].trim_start().strip_prefix('=') else { continue };
+            let rest = rest.trim_start();
+            return Some(match rest.chars().next()? {
+                q @ ('"' | '\'') => &rest[1..rest[1..].find(q)? + 1],
+                _ => rest.split(|c: char| c.is_ascii_whitespace()).next()?,
+            });
+        }
+        None
+    };
+    let declared = |property: &str| {
+        attribute("style")?.split(';').find_map(|d| {
+            let (key, value) = d.split_once(':')?;
+            let value = value.trim();
+            if key.trim() != property {
+                return None;
+            }
+            // In the shorthand, among an image and positions: "url(a.png) center rgb(0, 0, 0)".
+            let function = || ["rgb", "hsl"].iter().find_map(|f| {
+                let at = value.find(f)?;
+                css_color(&value[at..at + value[at..].find(')')? + 1])
+            });
+            css_color(value).or_else(function).or_else(|| value.split_whitespace().find_map(css_color))
+        })
+    };
+    let background = declared("background-color").or_else(|| declared("background")).or_else(|| attribute("bgcolor").and_then(css_color));
+    let text = declared("color").or_else(|| attribute("text").and_then(css_color));
+    if background.is_none() && text.is_none() {
+        return None;
+    }
+    let mut sheet = String::from("<style>body {");
+    if let Some(background) = background {
+        sheet.push_str(&format!(" background-color: {background};"));
+    }
+    if let Some(text) = text {
+        sheet.push_str(&format!(" color: {text};"));
+    }
+    sheet.push_str(" }</style>");
+    Some(sheet)
+}
+
+/// A colour as CSS writes it alone ("#000", "black", "rgb(0, 0, 0)"); nothing else gets through.
+fn css_color(value: &str) -> Option<&str> {
+    let value = value.trim().trim_end_matches("!important").trim();
+    let hex = value.strip_prefix('#').is_some_and(|h| matches!(h.len(), 3 | 4 | 6 | 8) && h.chars().all(|c| c.is_ascii_hexdigit()));
+    let named = (3..=20).contains(&value.len()) && value.chars().all(|c| c.is_ascii_alphabetic()) && !matches!(
+        value,
+        "inherit" | "initial" | "unset" | "revert" | "none" | "center" | "top" | "bottom" | "left" | "right" | "repeat" | "fixed" | "scroll" | "local" | "cover" | "contain" | "auto"
+    );
+    let function = ["rgb(", "rgba(", "hsl(", "hsla("].iter().any(|f| value.starts_with(f))
+        && value.ends_with(')')
+        && value.len() <= 40
+        && value[value.find('(')? + 1..value.len() - 1].chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | ',' | '%' | ' ' | '/'));
+    (hex || named || function).then_some(value)
 }
 
 /// `%XX` sequences decoded (RFC 2392 `cid:` URLs are URL-encoded Content-IDs).
@@ -1625,6 +1699,19 @@ impl TextWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keeps_the_colours_of_the_body() {
+        let (html, _) = sanitize_html(r##"<html><body style="text-align: center; background-color: #000000; padding: 0" bgcolor="#000000" text="#3b3f44"><p>x</p></body></html>"##, HashMap::new());
+        assert!(html.starts_with("<style>body { background-color: #000000; color: #3b3f44; }</style>"));
+        let (html, _) = sanitize_html("<body style='background: url(x.png) RGB(10, 20, 30)'>x</body>", HashMap::new());
+        assert!(html.starts_with("<style>body { background-color: rgb(10, 20, 30); }</style>"));
+        // Only a colour gets through: nothing that would close the sheet.
+        let (html, _) = sanitize_html(r#"<body bgcolor="red}</style><img src=x>">x</body>"#, HashMap::new());
+        assert!(!html.contains("<style>"));
+        let (html, _) = sanitize_html("<body><p>x</p></body>", HashMap::new());
+        assert!(!html.contains("<style>"));
+    }
 
     #[test]
     fn unfilled_template_tokens_stay_out_of_the_preview() {

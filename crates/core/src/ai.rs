@@ -461,7 +461,7 @@ pub fn found_event(answer: &str, received: chrono::NaiveDate) -> Option<FoundEve
     let text = |k: &str| json[k].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     let when = text("when");
     let (start, end, all_day) = match when.as_deref().and_then(|w| parse_when(w, received)) {
-        Some((day, from, to)) => span(day, from, to)?,
+        Some((day, from, to)) => span(day, from, to, None)?,
         None => (None, None, false),
     };
     Some(FoundEvent { title: text("title").unwrap_or_default(), when, place: text("place"), start, end, all_day })
@@ -469,9 +469,14 @@ pub fn found_event(answer: &str, received: chrono::NaiveDate) -> Option<FoundEve
 
 /// Start and end in Unix seconds: an hour when only the start time is known, the whole day
 /// (local midnights) without a time.
-fn span(day: chrono::NaiveDate, from: Option<chrono::NaiveTime>, to: Option<chrono::NaiveTime>) -> Option<(Option<i64>, Option<i64>, bool)> {
+/// The times are those of `zone` when the text names one, the computer's otherwise.
+fn span(day: chrono::NaiveDate, from: Option<chrono::NaiveTime>, to: Option<chrono::NaiveTime>, zone: Option<Zone>) -> Option<(Option<i64>, Option<i64>, bool)> {
     use chrono::TimeZone;
-    let local = |d: chrono::NaiveDateTime| chrono::Local.from_local_datetime(&d).earliest().map(|t| t.timestamp());
+    let local = |d: chrono::NaiveDateTime| match zone {
+        None => chrono::Local.from_local_datetime(&d).earliest().map(|t| t.timestamp()),
+        Some(Zone::Fixed(offset)) => chrono::FixedOffset::east_opt(offset)?.from_local_datetime(&d).single().map(|t| t.timestamp()),
+        Some(Zone::Named(tz)) => tz.from_local_datetime(&d).earliest().map(|t| t.timestamp()),
+    };
     Some(match from {
         Some(from) => {
             let start = local(day.and_time(from));
@@ -480,6 +485,72 @@ fn span(day: chrono::NaiveDate, from: Option<chrono::NaiveTime>, to: Option<chro
         }
         None => (local(day.and_hms_opt(0, 0, 0)?), day.succ_opt().and_then(|n| local(n.and_hms_opt(0, 0, 0)?)), true),
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Zone {
+    /// Seconds east of UTC.
+    Fixed(i32),
+    Named(chrono_tz::Tz),
+}
+
+/// A time zone written right after a time ("9 AM NZT", "14h CET", "10:00 UTC+2"), in capitals as
+/// they are written: "et" is a word too. A zone that changes for the summer ("NZT", "PT") follows
+/// it; "PST", "CEST" are the offsets they say.
+fn zone(word: &str) -> Option<Zone> {
+    use chrono_tz::{America, Australia, Pacific};
+    let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+    if word.is_empty() || word.chars().any(char::is_lowercase) {
+        return None;
+    }
+    let word = word.to_ascii_lowercase();
+    let hours = |h: i32| Some(Zone::Fixed(h * 3600));
+    match word.as_str() {
+        "utc" | "gmt" | "wet" => hours(0),
+        "west" | "bst" | "cet" => hours(1),
+        "cest" | "eet" => hours(2),
+        "eest" | "msk" => hours(3),
+        "sgt" | "hkt" | "awst" => hours(8),
+        "jst" | "kst" => hours(9),
+        "aest" => hours(10),
+        "aedt" => hours(11),
+        "nzst" => hours(12),
+        "nzdt" => hours(13),
+        "est" => hours(-5),
+        "edt" => hours(-4),
+        "cst" => hours(-6),
+        "cdt" => hours(-5),
+        "mst" => hours(-7),
+        "mdt" => hours(-6),
+        "pst" => hours(-8),
+        "pdt" => hours(-7),
+        "et" => Some(Zone::Named(America::New_York)),
+        "ct" => Some(Zone::Named(America::Chicago)),
+        "mt" => Some(Zone::Named(America::Denver)),
+        "pt" => Some(Zone::Named(America::Los_Angeles)),
+        "aet" => Some(Zone::Named(Australia::Sydney)),
+        "nzt" => Some(Zone::Named(Pacific::Auckland)),
+        // "UTC+2", "GMT-05:00", "UTC+5:30", "UTC+0530".
+        _ => {
+            let rest = word.strip_prefix("utc").or_else(|| word.strip_prefix("gmt"))?;
+            let sign = match rest.chars().next()? {
+                '+' => 1,
+                '-' | '−' => -1,
+                _ => return None,
+            };
+            let digits = &rest[rest.chars().next()?.len_utf8()..];
+            let (h, m) = match digits.split_once(':') {
+                Some((h, m)) => (h, m),
+                None if digits.len() == 4 => digits.split_at(2),
+                None => (digits, "0"),
+            };
+            let (h, m): (i32, i32) = (h.parse().ok()?, m.parse().ok()?);
+            if h.to_string().len() > 2 || h > 14 || !(0..60).contains(&m) {
+                return None;
+            }
+            Some(Zone::Fixed(sign * (h * 3600 + m * 60)))
+        }
+    }
 }
 
 /// An appointment an email gives in its own words, found without the AI: a day written out
@@ -563,9 +634,24 @@ pub fn appointment(text: &str, title: &str, received: chrono::NaiveDate, now: i6
                 break;
             }
         }
-        let phrase = text[words[first].0..words[end].1].trim_end_matches([',', '.', ';', ':', '!', '?']).to_string();
-        let Some((day, from @ Some(_), to)) = parse_when(&phrase, received) else { continue };
-        let Some((start @ Some(at), end_at, all_day)) = span(day, from, to) else { continue };
+        let when = text[words[first].0..words[end].1].trim_end_matches([',', '.', ';', ':', '!', '?']);
+        // "9 AM NZT", "9h (UTC+2)": the zone joins the marked words.
+        let mut phrase = when.to_string();
+        let mut named = None;
+        if end + 1 < words.len() && !ends(end) {
+            let next = &text[words[end + 1].0..words[end + 1].1];
+            named = zone(next);
+            if named.is_some() {
+                let name = next.trim_matches(|c: char| !c.is_alphanumeric());
+                let at = next.find(name).unwrap_or(0) + name.len();
+                let closed = next.starts_with('(') && next[at..].starts_with(')');
+                let to = words[end + 1].0 + at + usize::from(closed);
+                phrase = text[words[first].0..to].to_string();
+                end += 1;
+            }
+        }
+        let Some((day, from @ Some(_), to)) = parse_when(when, received) else { continue };
+        let Some((start @ Some(at), end_at, all_day)) = span(day, from, to, named) else { continue };
         if at <= now {
             continue;
         }
@@ -1833,6 +1919,17 @@ mod tests {
         assert_eq!(a.phrase, "20/10/2026 de 9h30 à 10h15");
         assert_eq!((a.event.start, a.event.end), (Some(at(20, 9, 30)), Some(at(20, 10, 15))));
         assert_eq!(a.event.place.as_deref(), Some("Au 12 rue des Lilas"));
+
+        // The zone the sender wrote: 9 AM in Auckland (summer time there) is 20:00 UTC the day before.
+        let utc = |d: u32, h: u32| chrono::Utc.with_ymd_and_hms(2026, 11, d, h, 0, 0).unwrap().timestamp();
+        let a = appointment("Watch it live on November 7 at 9 AM NZT to see the reveal.", "", received, now).unwrap();
+        assert_eq!(a.phrase, "November 7 at 9 AM NZT");
+        assert_eq!(a.event.start, Some(utc(6, 20)));
+        let a = appointment("Le live du 7 novembre à 14h (UTC+2), en direct.", "", received, now).unwrap();
+        assert_eq!(a.phrase, "7 novembre à 14h (UTC+2)");
+        assert_eq!(a.event.start, Some(utc(7, 12)));
+        let a = appointment("Rendez-vous le 7 novembre à 14h et on déjeune après.", "", received, now).unwrap();
+        assert_eq!(a.phrase, "7 novembre à 14h");
 
         let a = appointment("The call is on Thursday, October 15 at 2:30 pm. Thanks!", "", received, now).unwrap();
         assert_eq!(a.phrase, "Thursday, October 15 at 2:30 pm");
