@@ -338,6 +338,7 @@
       "yourDay": "Votre agenda ce jour-là"
     },
     "source": {
+      "cut": "Le début seulement est affiché : copiez la source ou enregistrez le .eml pour l'avoir en entier.",
       "unavailable": "Source indisponible",
       "copied": "Copié",
       "copyFailed": "Copie impossible",

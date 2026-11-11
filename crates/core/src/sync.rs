@@ -334,7 +334,8 @@ pub async fn sync_account_into(
         }
         let state_id = state.id;
         // First pass on this folder: nothing is "new" to the user.
-        let first_pass = state.uidvalidity.is_none();
+        // A folder recreated keeps its new UIDVALIDITY without a UIDNEXT until it is read through.
+        let first_pass = state.uidvalidity.is_none() || state.uidnext.is_none();
         // With labels, All Mail receives: arrivals are told apart by their labels.
         let labelled = labels_model && state.role == Some(Role::All);
         let notify = state.role == Some(Role::Inbox) && !first_pass;
@@ -1355,12 +1356,14 @@ async fn sync_mailbox_locked(
             ))));
         }
         tracing::info!("{}: UIDVALIDITY changed, folder cache reset", state.name);
-        crate::rt::offload(|| store.clear_mailbox(state.id))?;
+        let validity = mb.uid_validity.filter(|v| *v != 0);
+        crate::rt::offload(|| store.reset_mailbox(state.id, validity))?;
         unreadable().remove(&state.id);
         restoring().remove(&state.id);
         changed = true;
         state.highestmodseq = None;
         state.sync_from_uid = None;
+        state.uidnext = None;
         // Read again like a first pass: what comes back is the folder's old mail, not arrivals
         // (no notification, no rule, nothing held for the screener).
         state.uidvalidity = None;
@@ -1465,6 +1468,7 @@ async fn sync_mailbox_locked(
     // Arrivals into the inbox (All Mail with Gmail labels) wait for the screener, out of the lists,
     // when it is on; never on a first pass, which nobody screens.
     let hold = state.uidvalidity.is_some()
+        && state.uidnext.is_some()
         && (state.role == Some(Role::Inbox) || state.role == Some(Role::All) && store.labels_model(account_id)?)
         && store.account(account_id)?.screener_since.is_some();
     let mut fetched = fetch_headers(store, session, account_id, state.id, &mut new, &mut on_chunk, hold).await?;

@@ -923,4 +923,6 @@ export interface FoundEvent {
   start: number | null
   end: number | null
   all_day: boolean
+  /** Written into the event's notes: an invitation's description. */
+  notes?: string | null
 }

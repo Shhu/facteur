@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { openUrl } from '@tauri-apps/plugin-opener'
-import type { Invite } from '~/utils/types'
+import type { FoundEvent, Invite } from '~/utils/types'
 import { seriesUid } from '~/utils/invites'
 import type { InvitePerson } from '~/components/InviteAttendees.vue'
 import type { Partstat } from '~/components/InviteAnswers.vue'
@@ -36,6 +36,20 @@ async function respond(partstat: Partstat) {
   } finally {
     sending.value = null
   }
+}
+
+const eventOpen = ref(false)
+/** A one-off timed or whole-day invitation goes into a calendar through the event form; a series,
+ *  or no calendar to write to, is saved as a file. */
+const suggestion = computed<FoundEvent | null>(() => {
+  const i = props.invite
+  if (i.cancelled || i.recurring || i.start == null || !calendars.value.some(c => c.enabled && !c.read_only)) return null
+  return { title: i.summary, when: null, place: i.location, start: i.start, end: i.end, all_day: i.all_day, notes: i.description }
+})
+
+function add() {
+  if (suggestion.value) eventOpen.value = true
+  else download()
 }
 
 async function download() {
@@ -148,7 +162,7 @@ const people = computed<InvitePerson[]>(() => {
 })
 const title = computed(() => props.invite.summary || t('mail.invite.untitled'))
 
-const { hasCalendars, syncedSpan } = useCalendar()
+const { calendars, hasCalendars, syncedSpan } = useCalendar()
 /** The invitation's time, when it has one (all-day invitations are left out). A recurring one:
  *  its next occurrence not over yet (none known: nothing is said). */
 const slot = computed(() => {
@@ -331,8 +345,9 @@ const nextLabel = computed(() => {
         color="neutral"
         variant="ghost"
         class="h-11 justify-center rounded-xl border border-default bg-(--surface-card) text-sm font-medium lg:h-9.5 lg:rounded-[10px] lg:border-0 lg:bg-transparent lg:text-[13px]"
-        @click="download"
+        @click="add"
       />
     </div>
+    <CalendarEventForm v-if="suggestion" v-model:open="eventOpen" :suggestion="suggestion" />
   </section>
 </template>

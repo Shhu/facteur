@@ -197,10 +197,17 @@ pub async fn backup_account(
     // What was saved is kept (manifest, index), but the backup is not reported complete.
     if stats.failed > 0 {
         let n = stats.failed;
-        return Err(Error::Other(crate::tr!(
-            "{n} message(s) n'ont pas pu être sauvegardés (refusés par le serveur) : la prochaine sauvegarde les redemandera",
-            "{n} message(s) could not be saved (refused by the server): the next backup will ask for them again"
-        )));
+        return Err(Error::Other(if n == 1 {
+            crate::tr!(
+                "1 message n'a pas pu être sauvegardé (refusé par le serveur) : la prochaine sauvegarde le redemandera",
+                "1 message could not be saved (refused by the server): the next backup will ask for it again"
+            )
+        } else {
+            crate::tr!(
+                "{n} messages n'ont pas pu être sauvegardés (refusés par le serveur) : la prochaine sauvegarde les redemandera",
+                "{n} messages could not be saved (refused by the server): the next backup will ask for them again"
+            )
+        }));
     }
     mark_current(root, before);
     Ok(stats)
@@ -1005,7 +1012,11 @@ fn interrupted(e: Error, stats: &RestoreStats) -> Error {
         return e;
     }
     let n = stats.messages;
-    Error::Other(crate::tr!("restauration interrompue après {n} message(s) renvoyé(s) : {e}", "restore interrupted after {n} message(s) uploaded: {e}"))
+    Error::Other(if n == 1 {
+        crate::tr!("restauration interrompue après 1 message renvoyé : {e}", "restore interrupted after 1 message uploaded: {e}")
+    } else {
+        crate::tr!("restauration interrompue après {n} messages renvoyés : {e}", "restore interrupted after {n} messages uploaded: {e}")
+    })
 }
 
 /// Leaves the folder selected without expunging anything: EXAMINE (read-only) first, so CLOSE

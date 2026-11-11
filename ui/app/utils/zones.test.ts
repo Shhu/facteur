@@ -20,6 +20,10 @@ describe('an event set in another zone', () => {
 
   it('reads a time its own zone skips as after it', () => {
     expect(instantAt('2027-03-28', '02:30', 'Europe/Paris')).toBe(Date.UTC(2027, 2, 28, 1, 30) / 1000)
+    // Twice that night in October: the first one, 02:30 summer time.
+    expect(instantAt('2026-10-25', '02:30', 'Europe/Paris')).toBe(Date.UTC(2026, 9, 25, 0, 30) / 1000)
+    // West of UTC too: 03:30 EDT, not 01:30 EST.
+    expect(instantAt('2026-03-08', '02:30', 'America/New_York')).toBe(Date.UTC(2026, 2, 8, 7, 30) / 1000)
   })
 
   it('goes both ways in any zone', () => {

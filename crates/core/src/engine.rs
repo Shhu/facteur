@@ -67,11 +67,31 @@ fn oauth_host(provider: OAuthProvider, host: &str) -> bool {
     domains.iter().any(|d| host == *d || host.strip_suffix(d).is_some_and(|rest| rest.ends_with('.')))
 }
 
+/// Two syncs asked for as one: the folders of both.
+fn merged_scope(a: sync::Scope, b: sync::Scope) -> sync::Scope {
+    use sync::Scope;
+    match (a, b) {
+        (Scope::All, _) | (_, Scope::All) => Scope::All,
+        (Scope::Inbox, Scope::Inbox) => Scope::Inbox,
+        (Scope::System, Scope::System | Scope::Inbox) | (Scope::Inbox, Scope::System) => Scope::System,
+        (Scope::Folders(mut a), Scope::Folders(b)) => {
+            for f in b {
+                if !a.contains(&f) {
+                    a.push(f);
+                }
+            }
+            Scope::Folders(a)
+        }
+        _ => Scope::All,
+    }
+}
+
 fn new_message_id(email: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let domain = email.rsplit_once('@').map_or("facteur.local", |(_, d)| d);
+    let domain = idna::domain_to_ascii(domain).ok().filter(|d| !d.is_empty()).unwrap_or_else(|| "facteur.local".to_string());
     format!("{nanos:x}.{}.{}@{domain}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
@@ -209,6 +229,7 @@ fn pool_close_after(purpose: Purpose, host: &str) -> Duration {
 
 struct Pooled {
     session: Session,
+    opened: Instant,
     caps: Option<sync::Caps>,
     /// A connection idle for long is checked before use.
     used: Instant,
@@ -281,6 +302,14 @@ impl backup::Lease for Dedicated<'_> {
                 drop(conn);
             }
             self.held = Some(Held::Own(own));
+            return Ok(true);
+        }
+        // One connection asked for since: its own is closed, the job goes on with the shared one.
+        if !shared && self.engine.single_connection(self.account_id) {
+            if let Some(Held::Own(mut session)) = self.held.take() {
+                logout(&mut session).await;
+            }
+            self.held = Some(Held::Shared(self.engine.session_after(self.account_id, Purpose::Background, false, false).await?));
             return Ok(true);
         }
         let waiting = |count: Arc<std::sync::atomic::AtomicUsize>| count.load(std::sync::atomic::Ordering::Relaxed);
@@ -398,6 +427,12 @@ pub struct Engine {
     secrets: Secrets,
     events: broadcast::Sender<Event>,
     slots: Mutex<HashMap<(i64, Purpose), Slot>>,
+    /// Per account, what the listening connection reported during a running sync (see
+    /// [`Engine::defer_sync`]).
+    deferred_syncs: Mutex<HashMap<i64, Option<sync::Scope>>>,
+    /// When an account's credentials last changed: a connection opened before is not used again.
+    /// The slots themselves stay, so that each (account, purpose) keeps its one lock.
+    renewed: Mutex<HashMap<i64, Instant>>,
     /// One connection for everything: requests other than the sync waiting for it, per account.
     waiting: Mutex<HashMap<i64, Arc<std::sync::atomic::AtomicUsize>>>,
     /// Accounts signed in to since launch (see `idle_session`).
@@ -737,7 +772,7 @@ enum AiKind {
 /// Written from the account: in its Sent or Drafts folder, from one of its own addresses. No
 /// signature needed: the server holds what the account sent.
 fn written_by_me(role: Option<Role>, from: Option<&str>, own: &[String]) -> bool {
-    matches!(role, Some(Role::Sent | Role::Drafts)) && from.is_some_and(|f| own.iter().any(|o| o.eq_ignore_ascii_case(f.trim())))
+    matches!(role, Some(Role::Sent | Role::Drafts)) && from.is_some_and(|f| own.iter().any(|o| crate::smtp::same_address(o, f)))
 }
 
 /// The From is the sender's own: a DMARC pass (no other server's verdict mixed in), or the
@@ -940,6 +975,8 @@ impl Engine {
             secrets: Secrets::new(),
             events: broadcast::channel(256).0,
             slots: Mutex::default(),
+            deferred_syncs: Mutex::default(),
+            renewed: Mutex::default(),
             waiting: Mutex::default(),
             syncs_waiting: Mutex::default(),
             signed_in: Mutex::default(),
@@ -1054,12 +1091,19 @@ impl Engine {
                     }
                     Err(e) => return Err(e),
                 };
+                // Removed while the refresh ran: nothing of it is kept, or the keychain would hold
+                // it again (and a new account given the same id would take it).
+                if !self.still_there(account) {
+                    return Err(Error::NotFound(crate::tr!("compte {}", "account {}", account.id)));
+                }
                 if let Some(new_refresh) = fresh.refresh_token.as_deref().filter(|t| *t != refresh_token) {
                     // The old one may already be void: the new one is kept in memory whatever happens, and
                     // written again later if the keychain refuses it now.
                     // Bounded: this lock holds every connection of the account, and a keychain can
                     // block for long. Too slow, it is written later like a refused write.
-                    if let Err(e) = self.store_secret(account.id, new_refresh, KEYCHAIN_WAIT).await {
+                    if let Err(e) = self.store_secret(account.id, new_refresh, KEYCHAIN_WAIT).await
+                        && self.still_there(account)
+                    {
                         tracing::error!("account {}: new refresh token not saved to the keychain (retried later): {e}", account.id);
                         self.secret_cache.lock().unwrap().insert(account.id, new_refresh.to_string());
                         self.unsaved_secrets.lock().unwrap().insert(account.id);
@@ -1233,7 +1277,7 @@ impl Engine {
         logout(&mut session).await;
         self.store_secret(account_id, password, KEYCHAIN_READ_WAIT).await?;
         self.clear_refusal(account_id);
-        self.slots.lock().unwrap().retain(|(a, _), _| *a != account_id);
+        self.renew_connections(account_id);
         // The listening connection, paused after the refusal, starts again now.
         self.resume.notify_waiters();
         let this = self.clone();
@@ -1257,6 +1301,12 @@ impl Engine {
     async fn persist_unsaved_secrets(&self) {
         let pending: Vec<i64> = self.unsaved_secrets.lock().unwrap().iter().copied().collect();
         for account_id in pending {
+            // Removed since: its token forgotten, never written back.
+            if self.store.account(account_id).is_err() {
+                self.unsaved_secrets.lock().unwrap().remove(&account_id);
+                self.secret_cache.lock().unwrap().remove(&account_id);
+                continue;
+            }
             let Some(secret) = self.secret_cache.lock().unwrap().get(&account_id).cloned() else { continue };
             // One still waiting for the keychain: not asked again behind it.
             if self.secret_writes.lock().unwrap().contains_key(&account_id) {
@@ -1370,6 +1420,11 @@ impl Engine {
     /// Bounded: a keychain waiting for an unlock prompt must not hold the caller (the account's
     /// OAuth lock, the periodic loop). Too slow, the secret is written again later.
     /// `wait`: longer when the user waits for it (an unlock prompt to answer).
+    /// Not removed since `account` was read (an id is given again to a later account).
+    fn still_there(&self, account: &Account) -> bool {
+        self.store.account(account.id).is_ok_and(|a| a.email.eq_ignore_ascii_case(&account.email))
+    }
+
     async fn store_secret(&self, account_id: i64, secret: &str, wait: Duration) -> Result<()> {
         if self.secret_writes.lock().unwrap().contains_key(&account_id) {
             return Err(Error::Secret(crate::tr!("trousseau verrouillé : en attente du déverrouillage", "keychain locked: waiting for it to be unlocked")));
@@ -1379,9 +1434,13 @@ impl Engine {
         let writes = self.secret_writes.clone();
         let write = tokio::task::spawn_blocking(move || {
             let res = Secrets::new().set(account_id, &owned);
-            if writes.lock().unwrap().remove(&account_id) == Some(true) {
+            // Forgotten meanwhile: deleted before the id is free again, so that a new account
+            // given it cannot have its own secret deleted by this one.
+            let mut writes = writes.lock().unwrap();
+            if writes.get(&account_id) == Some(&true) {
                 let _ = Secrets::new().delete(account_id);
             }
+            writes.remove(&account_id);
             res
         });
         tokio::time::timeout(wait, write)
@@ -1475,6 +1534,11 @@ impl Engine {
         drop(_sync_waiting);
         let mut steps = crate::perf::Steps::new(|| format!("account {account_id} {purpose:?} connection"));
         steps.mark("busy");
+        if let Some(conn) = guard.as_ref()
+            && self.renewed.lock().unwrap().get(&account_id).is_some_and(|at| conn.opened < *at)
+        {
+            *guard = None;
+        }
         // Used a moment ago: still alive (TCP keepalive notices a dead one). After a while, a quick
         // NOOP; a server that takes more than 3 s to answer it is not worth waiting for.
         if let Some(conn) = guard.as_mut()
@@ -1496,10 +1560,80 @@ impl Engine {
                 let account = self.store.account(account_id)?;
                 let session = self.login(&account).await?;
                 steps.mark("login");
-                *guard = Some(Pooled { session, caps: None, used: Instant::now() });
+                *guard = Some(Pooled { session, opened: Instant::now(), caps: None, used: Instant::now() });
             }
         }
         Ok(guard)
+    }
+
+    /// The account's connections, opened with the old credentials, are not used again: closed now
+    /// when free, when next taken otherwise.
+    fn renew_connections(&self, account_id: i64) {
+        self.renewed.lock().unwrap().insert(account_id, Instant::now());
+        let slots: Vec<Slot> = self.slots.lock().unwrap().iter().filter(|((a, _), _)| *a == account_id).map(|(_, s)| s.clone()).collect();
+        for slot in slots {
+            if let Ok(mut conn) = slot.try_lock() {
+                *conn = None;
+            }
+        }
+    }
+
+    /// A sync holds the account's folders or its sync connection (between two folders, replaying
+    /// the queue, listing).
+    fn sync_busy(&self, account_id: i64) -> bool {
+        !crate::sync::folders_idle(account_id)
+            || self.slots.lock().unwrap().get(&(account_id, Purpose::Sync)).is_some_and(|slot| slot.try_lock().is_err())
+    }
+
+    /// What the listening connection reported while a sync ran: gathered into one scope, synced
+    /// once that sync is over by one task per account, tried again once if it fails.
+    fn defer_sync(self: &Arc<Self>, account_id: i64, scope: sync::Scope) {
+        {
+            let mut deferred = self.deferred_syncs.lock().unwrap();
+            if let Some(waiting) = deferred.get_mut(&account_id) {
+                // A task is there already: it takes this too.
+                *waiting = Some(match waiting.take() {
+                    Some(before) => merged_scope(before, scope),
+                    None => scope,
+                });
+                return;
+            }
+            deferred.insert(account_id, Some(scope));
+        }
+        let this = self.clone();
+        self.spawn(async move {
+            let mut failed = false;
+            loop {
+                while this.sync_busy(account_id) && this.store.account(account_id).is_ok() {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                let scope = {
+                    let mut deferred = this.deferred_syncs.lock().unwrap();
+                    match deferred.get_mut(&account_id).and_then(Option::take) {
+                        Some(scope) => scope,
+                        None => {
+                            deferred.remove(&account_id);
+                            return;
+                        }
+                    }
+                };
+                if let Err(e) = this.sync_scoped(account_id, scope.clone()).await {
+                    tracing::info!("sync after IDLE, behind a running sync: {e}");
+                    if !failed {
+                        failed = true;
+                        {
+                            let mut deferred = this.deferred_syncs.lock().unwrap();
+                            let waiting = deferred.entry(account_id).or_default();
+                            *waiting = Some(match waiting.take() {
+                                Some(newer) => merged_scope(scope, newer),
+                                None => scope,
+                            });
+                        }
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                }
+            }
+        });
     }
 
     /// Another open connection of the account, free and alive.
@@ -1508,6 +1642,10 @@ impl Engine {
             let Some(slot) = self.slots.lock().unwrap().get(&(account_id, purpose)).cloned() else { continue };
             let Ok(mut guard) = slot.try_lock_owned() else { continue };
             let Some(conn) = guard.as_mut() else { continue };
+            if self.renewed.lock().unwrap().get(&account_id).is_some_and(|at| conn.opened < *at) {
+                *guard = None;
+                continue;
+            }
             if conn.used.elapsed() > POOL_CHECK_AFTER
                 && !matches!(tokio::time::timeout(Duration::from_secs(3), conn.session.run_command_and_check_ok("NOOP")).await, Ok(Ok(_)))
             {
@@ -1612,6 +1750,10 @@ impl Engine {
         // refusal, a cached secret or token) may apply to this account.
         self.forget_account_state(id);
         if let Err(e) = self.store_secret(id, &secret, KEYCHAIN_READ_WAIT).await {
+            // A write still waiting for the keychain lands later: deleted then, as on removal.
+            if let Some(forgotten) = self.secret_writes.lock().unwrap().get_mut(&id) {
+                *forgotten = true;
+            }
             self.store.delete_account(id)?;
             return Err(e);
         }
@@ -1724,7 +1866,7 @@ impl Engine {
         self.calendar_tokens.lock().unwrap().remove(&account_id);
         self.calendar_read_only.lock().unwrap().remove(&account_id);
         self.clear_refusal(account_id);
-        self.slots.lock().unwrap().retain(|(a, _), _| *a != account_id);
+        self.renew_connections(account_id);
         self.resume.notify_waiters();
         if let Some(url) = &tokens.picture {
             self.store_picture(account_id, url).await;
@@ -2102,6 +2244,8 @@ impl Engine {
                 if !current.is_label {
                     let inbox = current.role == Some(Role::Inbox);
                     let all_mail = current.role == Some(Role::All);
+                    // Taken up after a cut first pass (or reset): old mail, no arrivals.
+                    let first_pass = current.uidvalidity.is_none() || current.uidnext.is_none();
                     // A folder the server refuses does not stop the others, as in a sync.
                     let (ids, _) = match sync::sync_mailbox_watched(&self.store, account_id, &mut session, &caps, current, &mut |_| {}, None).await {
                         Err(Error::Imap(async_imap::error::Error::No(msg))) => {
@@ -2111,9 +2255,9 @@ impl Engine {
                         res => res?.unwrap_or_default(),
                     };
                     // Arrivals: the inbox's, or All Mail's labelled inbox (Gmail), as after a sync.
-                    if inbox {
+                    if !first_pass && inbox {
                         fresh_inbox.extend(ids);
-                    } else if all_mail && self.store.labels_model(account_id)? {
+                    } else if !first_pass && all_mail && self.store.labels_model(account_id)? {
                         fresh_inbox.extend(self.store.with_label_role(&ids, &[Role::Inbox])?);
                     }
                     added += self.store.uid_stats(state.id)?.0.saturating_sub(before);
@@ -2183,11 +2327,12 @@ impl Engine {
         self.flush_requests.lock().unwrap().remove(&id);
         self.oauth_locks.lock().unwrap().remove(&id);
         self.forget_account_state(id);
-        self.secrets.delete(id)?;
-        // A write still waiting for the keychain would put it back: deleted once it lands.
+        // A write still waiting for the keychain would put it back: marked first, so it is deleted
+        // once it lands whatever the keychain does first.
         if let Some(forgotten) = self.secret_writes.lock().unwrap().get_mut(&id) {
             *forgotten = true;
         }
+        self.secrets.delete(id)?;
         self.store.delete_account(id)
     }
 
@@ -2331,7 +2476,18 @@ impl Engine {
     /// Like [`Engine::raw`], but a body just downloaded is left for the caller to cache, with its
     /// folder, UID and UIDVALIDITY then (see [`sync::keep_body`]).
     async fn raw_unkept(&self, id: i64) -> Result<(Vec<u8>, Option<(String, u32, Option<u32>)>)> {
-        match self.body_download(id, Purpose::Interactive, false).await? {
+        // A large one on a connection of its own: opening another message must not wait behind it.
+        let large = self.store.message_size(id).unwrap_or(0) >= u64::from(crate::partial::PARTIAL_FROM);
+        // The Completion one also fetches the rest of messages opened on their text: when it is
+        // busy, the Interactive one if free.
+        let account = self.store.location(id).map_or(0, |l| l.account_id);
+        let free = |purpose: Purpose| self.slots.lock().unwrap().get(&(account, purpose)).is_none_or(|slot| slot.try_lock().is_ok());
+        let purpose = match large {
+            false => Purpose::Interactive,
+            true if !free(Purpose::Completion) && free(Purpose::Interactive) => Purpose::Interactive,
+            true => Purpose::Completion,
+        };
+        match self.body_download(id, purpose, false).await? {
             (sync::Download::Whole(raw), downloaded) => Ok((raw, downloaded)),
             (sync::Download::Partial(_), _) => unreachable!("only asked for reading"),
         }
@@ -2518,9 +2674,18 @@ impl Engine {
     /// or one of its https images downloaded again; never an address the message does not hold.
     pub async fn message_image(self: &Arc<Self>, id: i64, src: &str) -> Result<(String, Vec<u8>)> {
         const MAX_IMAGE: usize = 50 * 1024 * 1024;
-        let detail = self.message(id).await?;
         let not_found = || Error::Other(crate::tr!("cette image ne fait pas partie du message", "this image is not part of the message"));
-        if src.is_empty() || !html_escape::decode_html_entities(&detail.html).contains(src) {
+        if src.is_empty() {
+            return Err(not_found());
+        }
+        // The body kept: its HTML only, not the whole opening (trust, DKIM, appointment).
+        let uid = self.store.location(id)?.uid;
+        let html = match self.kept_body(id, uid)? {
+            Some(raw) => blocking(move || Ok(mime::parse_body(&raw)?.html)).await?,
+            None => self.message(id).await?.html,
+        };
+        let wanted = src.to_string();
+        if !blocking(move || Ok(html_escape::decode_html_entities(&html).contains(&wanted))).await? {
             return Err(not_found());
         }
         let (hint, data) = if src.starts_with("data:") {
@@ -2576,7 +2741,7 @@ impl Engine {
                 let appointment = match invite {
                     Some(_) => None,
                     None => {
-                        let text = parsed.text.clone().unwrap_or_else(|| crate::mime::html_to_text(&parsed.html));
+                        let text = crate::mime::shown_text(parsed.text.as_deref(), &parsed.html, parsed.is_plain);
                         let received = chrono::DateTime::from_timestamp(date, 0).map(|d| d.with_timezone(&chrono::Local).date_naive());
                         received.and_then(|day| crate::ai::appointment(&crate::ai::fresh(&text), &subject_core(&subject), day, crate::store::now()))
                     }
@@ -2992,11 +3157,13 @@ impl Engine {
             self.emit(Event::OpsChanged);
             return Err(Error::Other(crate::tr!("opération déjà partie", "operation already sent")));
         };
+        let claim = crate::ops::claim();
         if crate::ops::being_sent(id) {
             return Err(Error::Other(crate::tr!("opération en cours d'envoi au serveur", "operation being sent to the server")));
         }
         let op = serde_json::from_str::<Op>(&payload).ok();
         self.store.finish_replayed(id, &payload)?;
+        drop(claim);
         // What it hid (moved or deleted locally) shows again at the next sync, in full.
         if let (Some(row), Some(op)) = (row, op) {
             crate::ops::recheck_folders(&self.store, row.account_id, &op);
@@ -3114,6 +3281,8 @@ impl Engine {
         let labels_leave = matches!(dest.role, Some(Role::Trash | Role::Junk)) || from.and_then(role_of) == Some(Role::Drafts);
         let mut dropped = Vec::new();
         let mut queued: HashMap<i64, HashSet<String>> = HashMap::new();
+        // From the check to the removal, no replay may take one of those saves (see ops::claim).
+        let claim = crate::ops::claim();
         for (id, loc, _) in &plan {
             if !(if labels_model { labels_leave } else { role_of(loc.mailbox_id) == Some(Role::Drafts) }) {
                 continue;
@@ -3144,6 +3313,7 @@ impl Engine {
                 self.delete_old_draft(account_id, &drafts.name, uid, uidvalidity)?;
             }
         }
+        drop(claim);
         if labels_model {
             return self.file_labelled(plan, &dest, from, undo);
         }
@@ -4120,7 +4290,14 @@ impl Engine {
                 let uids: Vec<u32> = in_trash.iter().filter_map(|(_, l)| l.uid).collect();
                 let mailbox = in_trash[0].1.mailbox.clone();
                 self.store.delete_uids(trash, &uids)?;
-                let label = crate::i18n::both(|| crate::tr!("Supprimer définitivement {} message(s)", "Permanently delete {} message(s)", uids.len()));
+                let n = uids.len();
+                let label = crate::i18n::both(|| {
+                    if n == 1 {
+                        crate::tr!("Supprimer définitivement 1 message", "Permanently delete 1 message")
+                    } else {
+                        crate::tr!("Supprimer définitivement {n} messages", "Permanently delete {n} messages")
+                    }
+                });
                 self.enqueue(account_id, &Op::DeleteSet { mailbox, uids, uidvalidity: self.uidvalidity(trash) }, &label)?;
             }
             // The move reports the change and starts the replay itself.
@@ -4352,10 +4529,17 @@ impl Engine {
         let source = draft.source?;
         let res = (|| -> Result<Option<(u32, Option<u32>)>> {
             let Ok(loc) = self.store.location(source) else { return Ok(None) };
-            let in_drafts = self.store.mailbox_state(loc.mailbox_id)?.role == Some(Role::Drafts);
-            // Still a Drafts copy without a Message-ID: a local id can be reused once its message is gone,
+            let role = self.store.mailbox_state(loc.mailbox_id)?.role;
+            let mid = self.store.message_ids(source)?.0;
+            // Still a Drafts copy without a Message-ID, or the very draft resumed from another folder
+            // (flagged \Draft, same Message-ID): a local id can be reused once its message is gone,
             // and nothing else must ever be deleted through this.
-            if loc.account_id != draft.account_id || !in_drafts || self.store.message_ids(source)?.0.is_some() {
+            let ours = match role {
+                Some(Role::Drafts) => mid.is_none(),
+                Some(Role::All) => false,
+                _ => mid.is_some() && mid == draft.draft_id && self.store.summary(source)?.flags.draft,
+            };
+            if loc.account_id != draft.account_id || !ours {
                 return Ok(None);
             }
             let Some(uid) = loc.uid else { return Ok(None) };
@@ -4401,7 +4585,21 @@ impl Engine {
         }))
     }
 
-    pub fn discard_draft(self: &Arc<Self>, account_id: i64, draft_id: &str) -> Result<()> {
+    /// `source`: the copy the draft was resumed from; one outside Drafts (another client's
+    /// folder, flagged \Draft, the same Message-ID) goes too, as a save would have deleted it.
+    pub fn discard_draft(self: &Arc<Self>, account_id: i64, draft_id: &str, source: Option<i64>) -> Result<()> {
+        if let Some(source) = source
+            && let Ok(loc) = self.store.location(source)
+            && loc.account_id == account_id
+            && !matches!(self.store.mailbox_state(loc.mailbox_id)?.role, Some(Role::Drafts | Role::All))
+            && self.store.message_ids(source)?.0.as_deref() == Some(draft_id)
+            && self.store.summary(source)?.flags.draft
+            && let Some(uid) = loc.uid
+        {
+            let uidvalidity = self.uidvalidity(loc.mailbox_id);
+            self.store.delete_uids(loc.mailbox_id, &[uid])?;
+            self.delete_old_draft(account_id, &loc.mailbox, uid, uidvalidity)?;
+        }
         self.draft_prints.lock().unwrap().remove(&(account_id, draft_id.to_string()));
         let Some(drafts) = self.store.mailbox_by_role(account_id, Role::Drafts)? else { return Ok(()) };
         // A save still queued was to delete the copy it came from: that copy goes all the same.
@@ -4433,10 +4631,16 @@ impl Engine {
         // Threading headers as saved: the message replied to may have left the cache since.
         let reply_ids = parts.in_reply_to.clone().map(|irt| (irt, parts.references.clone()));
         // The account's own address is no alias: the composer knows no "account|its own address" sender.
-        let account_email = self.store.account(account_id)?.email;
-        let from = parts.from.filter(|f| !f.eq_ignore_ascii_case(&account_email));
-        // Without a Message-ID, the next save cannot replace this copy: it is deleted then.
-        let source = parts.message_id.is_none().then_some(id);
+        let account = self.store.account(account_id)?;
+        // Read back as sent (an accented domain in its `xn--` form): the address as the account keeps it.
+        let from = parts
+            .from
+            .filter(|f| !crate::smtp::same_address(f, &account.email))
+            .map(|f| account.identities.iter().find(|i| crate::smtp::same_address(&i.email, &f)).map_or(f, |i| i.email.clone()));
+        // Without a Message-ID, the next save cannot replace this copy: it is deleted then. So is a
+        // copy outside Drafts (another client's folder), which saves and sends look for in Drafts only.
+        let outside = self.store.location(id).and_then(|l| self.store.mailbox_state(l.mailbox_id)).is_ok_and(|m| !matches!(m.role, Some(Role::Drafts | Role::All)));
+        let source = (parts.message_id.is_none() || outside).then_some(id);
         Ok(Draft {
             account_id,
             to: parts.to,
@@ -4491,9 +4695,9 @@ impl Engine {
             let label = state.is_label || arrivals_via_labels(state.role, self.store.labels_model(account_id)?);
             // A first pass (one cut before it ended, taken up here) brings old mail, no arrivals.
             let first_pass = if label {
-                self.store.mailbox_by_role(account_id, Role::All)?.is_none_or(|all| all.uidvalidity.is_none())
+                self.store.mailbox_by_role(account_id, Role::All)?.is_none_or(|all| all.uidvalidity.is_none() || all.uidnext.is_none())
             } else {
-                state.uidvalidity.is_none()
+                state.uidvalidity.is_none() || state.uidnext.is_none()
             };
             // The wait for the folder's turn is bounded too: the sync may have taken it since the
             // check above, and the Background connection is held meanwhile.
@@ -4647,7 +4851,22 @@ impl Engine {
                 return Err(e);
             }
         };
-        let criteria = crate::search::imap_criteria(&q, caps.literal_plus);
+        let mut criteria = crate::search::imap_criteria(&q, caps.literal_plus);
+        // Gmail searches its labels itself: not only among the newest messages kept per folder.
+        // Labelled as facteur means it: not by its own labels (New senders, Snoozed…), left out by
+        // name. "Without a label" stays a local filter: Gmail would drop what only those carry.
+        if caps.gmail && q.labelled == Some(true) {
+            let mut raw = "has:userlabels".to_string();
+            for m in self.store.mailbox_states(account_id)?.iter().filter(|m| m.is_label && m.role.is_some()) {
+                let name: String = crate::utf7::decode(&m.name).chars().map(|c| if c.is_whitespace() || c == '/' || c == '"' || c == '\\' { '-' } else { c }).collect();
+                // A quoted IMAP string: ASCII only.
+                if name.is_ascii() {
+                    raw.push_str(&format!(" -label:{}", name.to_lowercase()));
+                }
+            }
+            let raw = format!("X-GM-RAW \"{raw}\"");
+            criteria = if criteria == "ALL" { raw } else { format!("{criteria} {raw}") };
+        }
         // One SELECT and one SEARCH per folder: on an account with many, the folders are shared
         // between a few more connections, opened for the search alone (never on an account limited
         // to one). A lane that cannot connect leaves its folders to the main one.
@@ -4787,7 +5006,7 @@ impl Engine {
         // It leaves Drafts now: left there until delivery, it could be sent a second time from there
         // (or from another client). Cancelling puts it back (`cancel_send`).
         if let Some(saved) = saved
-            && let Err(e) = self.discard_draft(account.id, &saved)
+            && let Err(e) = self.discard_draft(account.id, &saved, None)
         {
             tracing::warn!("draft left in Drafts: {e}");
         }
@@ -4923,7 +5142,7 @@ impl Engine {
         let after_send = || -> Result<Vec<i64>> {
             let mut changed = vec![account.id];
             if let Some(id) = &draft.draft_id
-                && let Err(e) = self.discard_draft(account.id, id)
+                && let Err(e) = self.discard_draft(account.id, id, None)
             {
                 tracing::warn!("sent draft not deleted: {e}");
             }
@@ -6346,7 +6565,11 @@ impl Engine {
             },
             Err(e) => return Err(e),
         };
-        self.keep_rotated_refresh(account.id, &refresh_token, &fresh).await;
+        self.keep_rotated_refresh(account, &refresh_token, &fresh).await;
+        // Removed while the refresh ran: nothing of it kept (an account given the same id later).
+        if !self.still_there(account) {
+            return Err(Error::NotFound(crate::tr!("compte {}", "account {}", account.id)));
+        }
         if writable {
             self.calendar_read_only.lock().unwrap().remove(&account.id);
         } else {
@@ -6356,9 +6579,12 @@ impl Engine {
         Ok(fresh.access_token)
     }
 
-    async fn keep_rotated_refresh(&self, account_id: i64, refresh_token: &str, fresh: &oauth::Tokens) {
-        if let Some(new_refresh) = fresh.refresh_token.as_deref().filter(|t| *t != refresh_token)
+    async fn keep_rotated_refresh(&self, account: &Account, refresh_token: &str, fresh: &oauth::Tokens) {
+        let account_id = account.id;
+        if self.still_there(account)
+            && let Some(new_refresh) = fresh.refresh_token.as_deref().filter(|t| *t != refresh_token)
             && let Err(e) = self.store_secret(account_id, new_refresh, KEYCHAIN_WAIT).await
+            && self.still_there(account)
         {
             tracing::error!("account {account_id}: new refresh token not saved to the keychain (retried later): {e}");
             self.secret_cache.lock().unwrap().insert(account_id, new_refresh.to_string());
@@ -6376,7 +6602,7 @@ impl Engine {
             Err(Error::Auth(_)) => return Err(crate::contacts::needs_consent()),
             Err(e) => return Err(e),
         };
-        self.keep_rotated_refresh(account.id, &refresh_token, &fresh).await;
+        self.keep_rotated_refresh(account, &refresh_token, &fresh).await;
         Ok(fresh.access_token)
     }
 
@@ -6599,7 +6825,9 @@ impl Engine {
             .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
             .map(|d| {
                 let d = d.with_timezone(&chrono::Local);
-                if invite.all_day { d.format("%d/%m/%Y").to_string() } else { d.format("%d/%m/%Y %H:%M").to_string() }
+                // Read by guests anywhere: no day-month order to guess in English, the offset given.
+                let day = if crate::i18n::english() { "%Y-%m-%d" } else { "%d/%m/%Y" };
+                if invite.all_day { d.format(day).to_string() } else { d.format(&format!("{day} %H:%M (UTC%:z)")).to_string() }
             })
             .unwrap_or_default();
         let summary = invite.summary.clone();
@@ -6698,7 +6926,7 @@ impl Engine {
                 if series {
                     let id = target.series.as_deref().ok_or_else(not_editable)?;
                     let (rule, first) = bounded(EVENT_TIMEOUT, &what, crate::gcal::series_rule(&token, &target.calendar_remote_id, id)).await?;
-                    let rule = series_repeat(rule.and_then(|r| crate::repeat::Repeat::from_rrule(&r, first)));
+                    let rule = series_repeat(rule.and_then(|r| crate::repeat::Repeat::from_rrule(&r, first, e.zone.as_deref())));
                     match series_plan(e, &draft, &changes, &rule, first)? {
                         Some(repeat) => {
                             let first = rebuilt_first(first, e, &draft)?;
@@ -6739,7 +6967,7 @@ impl Engine {
                 let ics = bounded(EVENT_TIMEOUT, &what, client.rewrite(&url, |ics| match (series, e.recurring, original) {
                     (true, _, _) => {
                         let (rule, first) = crate::calendar::series_rule(ics)?;
-                        let rule = series_repeat(rule.and_then(|r| crate::repeat::Repeat::from_rrule(&r, first)));
+                        let rule = series_repeat(rule.and_then(|r| crate::repeat::Repeat::from_rrule(&r, first, e.zone.as_deref())));
                         match series_plan(e, &draft, &changes, &rule, first) {
                             Err(err) => {
                                 refused = Some(err);
@@ -6810,7 +7038,7 @@ impl Engine {
                 let token = self.google_token(&account).await?;
                 let id = target.series.as_deref().ok_or_else(not_editable)?;
                 let (rule, first) = bounded(EVENT_TIMEOUT, &what, crate::gcal::series_rule(&token, &target.calendar_remote_id, id)).await?;
-                series_repeat(rule.and_then(|r| crate::repeat::Repeat::from_rrule(&r, first)))
+                series_repeat(rule.and_then(|r| crate::repeat::Repeat::from_rrule(&r, first, e.zone.as_deref())))
             }
             CalendarSource::Microsoft => {
                 let token = self.calendar_token(&account, true).await?;
@@ -6822,7 +7050,7 @@ impl Engine {
                 let (client, url) = self.caldav_target(&account, &target).await?;
                 let (ics, _) = bounded(EVENT_TIMEOUT, &what, client.object(&url)).await?;
                 let (rule, first) = crate::calendar::series_rule(&ics).ok_or_else(not_editable)?;
-                series_repeat(rule.and_then(|r| crate::repeat::Repeat::from_rrule(&r, first)))
+                series_repeat(rule.and_then(|r| crate::repeat::Repeat::from_rrule(&r, first, e.zone.as_deref())))
             }
         })
     }
@@ -6898,6 +7126,7 @@ impl Engine {
             return Err(Error::Other(crate::tr!("facteur ne peut pas répondre à cet événement", "facteur cannot answer this event")));
         }
         let series = series && e.recurring;
+        let mut told = Ok(());
         let account = self.event_writer(e.account_id, target.source)?;
         let what = crate::tr!("réponse à l'invitation", "invitation answer");
         let id = if series { target.series.as_deref().unwrap_or(&e.instance) } else { e.instance.as_str() };
@@ -6929,13 +7158,14 @@ impl Engine {
                         Some((original, _)) => crate::calendar::occurrence_ics(&written, original).unwrap_or(written),
                         None => written,
                     };
-                    self.mail_invite_reply(&account, &reply, partstat, answer_words(partstat)?, None).await?;
+                    // The server holds the answer already: shown as such even when the mail fails.
+                    told = self.mail_invite_reply(&account, &reply, partstat, answer_words(partstat)?, None).await;
                 }
             }
         }
         self.store.set_event_response(event_id, answer, series)?;
         self.after_event_change(account.id);
-        Ok(())
+        told
     }
 
     /// The event the user saw: a row id given back to another occurrence since (a sync rewrote
@@ -7687,7 +7917,7 @@ impl Engine {
                     continue;
                 }
             };
-            let body = detail.text.clone().unwrap_or_else(|| crate::mime::html_to_text(&detail.html));
+            let body = crate::mime::shown_text(detail.text.as_deref(), &detail.html, detail.is_plain);
             let from = m.from.as_ref().map(|a| a.name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| a.email.clone())).unwrap_or_default();
             used += crate::ai::fresh(&body).len().min(3000) + from.len() + 40;
             messages.push((from, m.date, body));
@@ -7713,7 +7943,7 @@ impl Engine {
     pub async fn ai_find_event(self: &Arc<Self>, id: i64) -> Result<Option<crate::ai::FoundEvent>> {
         let detail = self.message(id).await?;
         let m = &detail.summary;
-        let body = detail.text.clone().unwrap_or_else(|| crate::mime::html_to_text(&detail.html));
+        let body = crate::mime::shown_text(detail.text.as_deref(), &detail.html, detail.is_plain);
         let sent = chrono::DateTime::from_timestamp(m.date, 0).map(|d| d.with_timezone(&chrono::Local)).unwrap_or_else(chrono::Local::now);
         let from = m.from.as_ref().map(|a| a.email.clone()).unwrap_or_default();
         let fresh: String = crate::ai::fresh(&body).chars().take(6000).collect();
@@ -7884,6 +8114,13 @@ Subject: {}
                     drain_unsolicited(&mut session, &mut changes);
                 }
                 let Some(scope) = changes.take_scope() else { break };
+                // A sync already running (a first one takes hours) would hold this connection
+                // silent behind it, past the server's autologout and out of reach of a stop: this
+                // one waits its turn on its own, the connection goes back to listening.
+                if self.sync_busy(account_id) {
+                    self.defer_sync(account_id, scope);
+                    break;
+                }
                 self.diag.listener(account_id, |l| l.set("syncing"));
                 if let Err(e) = self.sync_scoped(account_id, scope.clone()).await {
                     tracing::warn!("sync after IDLE: {e}");
@@ -7943,12 +8180,16 @@ Subject: {}
                     _ => return Ok(()),
                 }
             };
+            // End of stream: the server closed the connection, there is no IDLE left to end. A
+            // drop all the same (counted, and waited for), not an end asked for.
+            if matches!(res, IdleResponse::ManualInterrupt) {
+                return Err(Error::Dropped(crate::tr!("le serveur a fermé la connexion d'écoute", "the server closed the listening connection")));
+            }
             session = bounded(30, &crate::tr!("fin de l'écoute", "ending listening"), async { Ok(handle.done().await?) }).await?;
             match &res {
                 IdleResponse::NewData(data) => changes.note(data.parsed()),
                 IdleResponse::Timeout => self.idle_held_full(account_id),
-                // End of stream: the server closed the connection.
-                IdleResponse::ManualInterrupt => return Ok(()),
+                IdleResponse::ManualInterrupt => {}
             }
         }
     }
@@ -9502,7 +9743,7 @@ In-Reply-To: <parent@x>\r\nReferences: <root@x> <parent@x>\r\n\r\nBrouillon\r\n"
         assert_eq!(op_kinds(store, acc), ["save_draft"]);
         assert_eq!(source(), [Some((7, None))]);
         // Discarded before it went: the old copy still goes.
-        engine.discard_draft(acc, &saved).unwrap();
+        engine.discard_draft(acc, &saved, None).unwrap();
         assert_eq!(op_kinds(store, acc), ["delete", "delete_draft"]);
     }
 
@@ -9658,7 +9899,7 @@ In-Reply-To: <parent@x>\r\nReferences: <root@x> <parent@x>\r\n\r\nBrouillon\r\n"
         store.upsert_mailbox(acc, "Drafts", Some("/"), Some(Role::Drafts), true).unwrap();
         let draft = Draft { account_id: acc, subject: "x".into(), body: "a".into(), ..Default::default() };
         let id = engine.save_draft(draft.clone()).await.unwrap();
-        engine.discard_draft(acc, &id).unwrap();
+        engine.discard_draft(acc, &id, None).unwrap();
         assert_eq!(op_kinds(store, acc), vec!["delete_draft"]);
         // The send cancelled: the draft back, under the same Message-ID.
         engine.save_draft(Draft { draft_id: Some(id), body: "b".into(), ..draft }).await.unwrap();

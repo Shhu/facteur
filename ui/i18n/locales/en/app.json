@@ -263,7 +263,7 @@
         "syncProblems": "Sync failing",
         "offline": "Offline: syncing resumes when the network is back"
       },
-      "failedTooltip": "{n} action rejected by the server | {n} actions rejected by the server",
+      "failedTooltip": "{n} action could not be sent | {n} actions could not be sent",
       "pendingTooltip": "{n} action waiting to be sent to the server | {n} actions waiting to be sent to the server",
       "failed": "{n} failed",
       "pending": "{n} pending",
@@ -281,15 +281,15 @@
         "blocked": "Blocked",
         "waiting": "Waiting",
         "retrying": "Retrying",
-        "failed": "Refused"
+        "failed": "Failed"
       },
       "reason": {
         "held": "Still undoable: leaves in {n} s.",
         "blocked": "Waits for action #{n}, still undoable: actions leave in order.",
         "waiting": "Ready: will leave at the next connection to the server.",
         "waitingError": "Ready, but the server could not be reached: {error}",
-        "retrying": "Sending failed ({n} attempt(s)); retried at the next sync. Error: {error}",
-        "failed": "Refused by the server ({n} attempts); it no longer retries by itself: retry or give up. Error: {error}"
+        "retrying": "Sending failed ({n} attempt); retried at the next sync. Error: {error} | Sending failed ({n} attempts); retried at the next sync. Error: {error}",
+        "failed": "Could not go through; it no longer retries by itself: retry or give up. Error: {error}"
       },
       "kinds": {
         "store": "Flag",
@@ -310,6 +310,7 @@
       }
     },
     "cropper": {
+      "frame": "Frame: arrows move it, Shift + arrows resize it",
       "title": "Crop the image",
       "free": "Free",
       "square": "Square",

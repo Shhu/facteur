@@ -23,6 +23,11 @@ const headers = computed(() => {
   return end === -1 ? s : s.slice(0, end)
 })
 const shown = computed(() => (tab.value === 'headers' ? headers.value : source.value ?? ''))
+/** Laid out at most: millions of characters in one block freeze the window. Copy and the .eml
+ *  file keep everything. */
+const SHOWN_MAX = 200_000
+const displayed = computed(() => shown.value.length > SHOWN_MAX ? shown.value.slice(0, SHOWN_MAX) : shown.value)
+const cut = computed(() => shown.value.length > SHOWN_MAX)
 
 async function copy() {
   try {
@@ -61,7 +66,10 @@ async function saveEml() {
       <div v-if="source === null" class="flex items-center gap-2 py-10 text-sm text-muted">
         <UIcon name="i-lucide-loader-circle" class="size-4 animate-spin" /> {{ $t('mail.source.loading') }}
       </div>
-      <pre v-else class="max-h-[65vh] overflow-auto whitespace-pre-wrap break-all rounded-md bg-elevated/50 p-3 font-mono text-xs text-default">{{ shown }}</pre>
+      <template v-else>
+        <pre class="max-h-[65vh] overflow-auto whitespace-pre-wrap break-all rounded-md bg-elevated/50 p-3 font-mono text-xs text-default">{{ displayed }}</pre>
+        <p v-if="cut" class="text-xs text-muted">{{ $t('mail.source.cut') }}</p>
+      </template>
     </template>
   </UModal>
 </template>

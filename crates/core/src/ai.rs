@@ -231,9 +231,17 @@ pub async fn download(model: &Model, dest: &Path, cancel: &std::sync::atomic::At
                 if !resp.status().is_success() {
                     return Err(Error::Other(crate::tr!("téléchargement refusé ({})", "download refused ({})", resp.status())));
                 }
+                let too_long = || Error::Other(crate::tr!("le serveur envoie plus que le modèle", "the server sends more than the model"));
+                if resp.content_length().is_some_and(|n| n > model.bytes.saturating_sub(done)) {
+                    return Err(too_long());
+                }
                 while let Some(chunk) = resp.chunk().await.map_err(cut)? {
                     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                         return Err(Error::Other(crate::tr!("téléchargement arrêté", "download stopped")));
+                    }
+                    // Never written past the model's size: a server that keeps sending would fill the disk.
+                    if done + chunk.len() as u64 > model.bytes {
+                        return Err(too_long());
                     }
                     file.write_all(&chunk)?;
                     hash.update(&chunk);
@@ -472,15 +480,17 @@ pub fn found_event(answer: &str, received: chrono::NaiveDate) -> Option<FoundEve
 /// The times are those of `zone` when the text names one, the computer's otherwise.
 fn span(day: chrono::NaiveDate, from: Option<chrono::NaiveTime>, to: Option<chrono::NaiveTime>, zone: Option<Zone>) -> Option<(Option<i64>, Option<i64>, bool)> {
     use chrono::TimeZone;
+    // A time the clocks skip is read an hour later, as the calendar does.
     let local = |d: chrono::NaiveDateTime| match zone {
-        None => chrono::Local.from_local_datetime(&d).earliest().map(|t| t.timestamp()),
+        None => chrono::Local.from_local_datetime(&d).earliest().or_else(|| chrono::Local.from_local_datetime(&(d + chrono::Duration::hours(1))).earliest()).map(|t| t.timestamp()),
         Some(Zone::Fixed(offset)) => chrono::FixedOffset::east_opt(offset)?.from_local_datetime(&d).single().map(|t| t.timestamp()),
-        Some(Zone::Named(tz)) => tz.from_local_datetime(&d).earliest().map(|t| t.timestamp()),
+        Some(Zone::Named(tz)) => tz.from_local_datetime(&d).earliest().or_else(|| tz.from_local_datetime(&(d + chrono::Duration::hours(1))).earliest()).map(|t| t.timestamp()),
     };
     Some(match from {
         Some(from) => {
             let start = local(day.and_time(from));
-            let end = to.filter(|t| *t > from).and_then(|t| local(day.and_time(t))).or(start.map(|s| s + 3600));
+            // After the start even when a skipped hour pushed it later.
+            let end = to.filter(|t| *t > from).and_then(|t| local(day.and_time(t))).filter(|e| start.is_none_or(|s| *e > s)).or(start.map(|s| s + 3600));
             (start, end, false)
         }
         None => (local(day.and_hms_opt(0, 0, 0)?), day.succ_opt().and_then(|n| local(n.and_hms_opt(0, 0, 0)?)), true),
@@ -497,7 +507,8 @@ enum Zone {
 /// A time zone written right after a time ("9 AM NZT", "14h CET", "10:00 UTC+2"), in capitals as
 /// they are written: "et" is a word too. A zone that changes for the summer ("NZT", "PT") follows
 /// it; "PST", "CEST" are the offsets they say.
-fn zone(word: &str) -> Option<Zone> {
+/// `caps`: the date and time are written in capitals, where "ET", "PT" are words ("14H ET LE 4").
+fn zone(word: &str, caps: bool) -> Option<Zone> {
     use chrono_tz::{America, Australia, Pacific};
     let word = word.trim_matches(|c: char| !c.is_alphanumeric());
     if word.is_empty() || word.chars().any(char::is_lowercase) {
@@ -524,6 +535,7 @@ fn zone(word: &str) -> Option<Zone> {
         "mdt" => hours(-6),
         "pst" => hours(-8),
         "pdt" => hours(-7),
+        "et" | "ct" | "mt" | "pt" if caps => None,
         "et" => Some(Zone::Named(America::New_York)),
         "ct" => Some(Zone::Named(America::Chicago)),
         "mt" => Some(Zone::Named(America::Denver)),
@@ -539,6 +551,9 @@ fn zone(word: &str) -> Option<Zone> {
                 _ => return None,
             };
             let digits = &rest[rest.chars().next()?.len_utf8()..];
+            if !digits.bytes().all(|b| b.is_ascii_digit() || b == b':') {
+                return None;
+            }
             let (h, m) = match digits.split_once(':') {
                 Some((h, m)) => (h, m),
                 None if digits.len() == 4 => digits.split_at(2),
@@ -593,6 +608,11 @@ pub fn appointment(text: &str, title: &str, received: chrono::NaiveDate, now: i6
         } else if month(&w) && i + 1 < words.len() && day_number(&norm(i + 1)).is_some() {
             (i, i + 1)
         } else if numeric(&w) {
+            // A share or a rate, not a day: "1/2 journée", "support 24/7".
+            let next = if i + 1 < words.len() { norm(i + 1) } else { String::new() };
+            if w.split('/').count() == 2 && (w == "24/7" || matches!(next.as_str(), "journee" | "journees" | "temps")) {
+                continue;
+            }
             (i, i)
         } else {
             continue;
@@ -640,7 +660,20 @@ pub fn appointment(text: &str, title: &str, received: chrono::NaiveDate, now: i6
         let mut named = None;
         if end + 1 < words.len() && !ends(end) {
             let next = &text[words[end + 1].0..words[end + 1].1];
-            named = zone(next);
+            // Written in capitals: told by the words around the phrase and its own, not by "PM" or
+            // "14H" alone ("Call 12/11 2:30 PM ET" is a zone, "RÉUNION LE 12/11 À 14H ET LE 4" is not).
+            let around = words[first.saturating_sub(3)..first].iter().chain(&words[(end + 2).min(words.len())..(end + 5).min(words.len())]);
+            let worded = |w: &str| {
+                let letters: String = w.chars().filter(|c| c.is_alphabetic()).collect();
+                letters.chars().count() >= 2 && !matches!(letters.to_lowercase().as_str(), "am" | "pm" | "h")
+            };
+            let caps = around
+                .map(|&(a, b)| &text[a..b])
+                .chain(when.split_whitespace())
+                .filter(|w| worded(w))
+                .fold((false, false), |(upper, lower), w| (upper || !w.chars().any(char::is_lowercase), lower || w.chars().any(char::is_lowercase)));
+            let caps = caps.0 && !caps.1;
+            named = zone(next, caps);
             if named.is_some() {
                 let name = next.trim_matches(|c: char| !c.is_alphanumeric());
                 let at = next.find(name).unwrap_or(0) + name.len();
@@ -839,7 +872,15 @@ fn times(text: &str) -> Vec<chrono::NaiveTime> {
             out.extend(at(12, 0));
         } else if matches!(t, "minuit" | "midnight") {
             out.extend(at(0, 0));
-        } else if let Some(h) = number(Some(&tokens[i])).filter(|h| *h <= 24) {
+        } else if let Some(h) = number(Some(&tokens[i])).filter(|h| *h < 24) {
+            // A length, not a time of day: "durée 7h", "sous 24h", "comptez 2 heures".
+            let length = i.checked_sub(1).and_then(|j| tokens.get(j)).is_some_and(|w| {
+                matches!(w.as_str(), "duree" | "pendant" | "sous" | "comptez" | "compter" | "en" | "dans" | "within" | "lasts")
+            });
+            if length {
+                i += 1;
+                continue;
+            }
             // "14h", "14h30", "14:30": the hour, the minutes when given, and what was read.
             let minutes_at = |j: usize| number(tokens.get(j)).filter(|m| *m < 60);
             let (minutes, read) = match tokens.get(i + 1).map(String::as_str) {
@@ -853,7 +894,7 @@ fn times(text: &str) -> Vec<chrono::NaiveTime> {
                 let h = match meridiem {
                     Some("pm") if h < 12 => h + 12,
                     Some("am") if h == 12 => 0,
-                    _ => h % 24,
+                    _ => h,
                 };
                 out.extend(at(h, minutes.unwrap_or(0)));
                 i += read + usize::from(meridiem.is_some());
@@ -1929,6 +1970,19 @@ mod tests {
         assert_eq!(a.phrase, "7 novembre à 14h (UTC+2)");
         assert_eq!(a.event.start, Some(utc(7, 12)));
         let a = appointment("Rendez-vous le 7 novembre à 14h et on déjeune après.", "", received, now).unwrap();
+        assert_eq!(a.phrase, "7 novembre à 14h");
+        assert!(appointment("Formation le 12 novembre, durée 7h.", "", received, now).is_none());
+        assert!(appointment("Formation : 1/2 journée à 14h", "", received, now).is_none());
+        assert!(appointment("Support 24/7 dès 9h", "", received, now).is_none());
+        assert!(appointment("Le 3 décembre, réponse sous 24h.", "", received, now).is_none());
+        // A zone after a capital PM with a numeric date; the time after "about".
+        let a = appointment("Call on 11/12/2026 at 2:30 PM ET please", "", received, now).unwrap();
+        assert!(a.phrase.ends_with("ET"), "{}", a.phrase);
+        assert!(appointment("Dinner on November 7 about 7 pm.", "", received, now).is_some());
+        let a = appointment("RÉUNION LE 7 NOVEMBRE À 14H ET LE 8 À 10H", "", received, now).unwrap();
+        assert_eq!(a.phrase, "7 NOVEMBRE À 14H");
+        // Not a zone, and no panic inside a character.
+        let a = appointment("Rendez-vous le 7 novembre à 14h UTC+1中 merci", "", received, now).unwrap();
         assert_eq!(a.phrase, "7 novembre à 14h");
 
         let a = appointment("The call is on Thursday, October 15 at 2:30 pm. Thanks!", "", received, now).unwrap();

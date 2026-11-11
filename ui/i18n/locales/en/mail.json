@@ -338,6 +338,7 @@
       "yourDay": "Your calendar that day"
     },
     "source": {
+      "cut": "Only the start is shown: copy the source or save the .eml to get all of it.",
       "unavailable": "Source unavailable",
       "copied": "Copied",
       "copyFailed": "Couldn't copy",

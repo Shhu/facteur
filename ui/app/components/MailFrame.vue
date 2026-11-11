@@ -486,6 +486,26 @@ function prepare(doc: Document) {
     clearTimeout(showTimer)
     scheduleHide()
   })
+  // Reached with the keyboard: its card (the warnings first) shows as well.
+  doc.addEventListener('focusin', (e) => {
+    const link = (e.target as Element | null)?.closest('a')
+    const href = link?.getAttribute('href')
+    // A click focuses the link too: only the keyboard's focus is meant.
+    if (props.messageId === undefined || !link || !href || !/^https?:/i.test(href) || !link.matches(':focus-visible')) return
+    clearTimeout(showTimer)
+    clearTimeout(hideTimer)
+    if (preview.value?.anchor === link) return
+    // After the scroll that brings the link into view: placed from where it lands, and that
+    // scroll does not hide it.
+    focusScrollUntil = Date.now() + 400
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (link.isConnected && link.ownerDocument.activeElement === link) show(link, href)
+    }))
+  })
+  doc.addEventListener('focusout', (e) => {
+    if (!(e.target as Element | null)?.closest('a')) return
+    scheduleHide()
+  })
 }
 
 interface Preview {
@@ -548,10 +568,15 @@ function hide() {
   preview.value = null
 }
 
+/** Until then, a scroll is the one focusing a link made (see the focusin listener). */
+let focusScrollUntil = 0
+const hideOnScroll = () => {
+  if (Date.now() >= focusScrollUntil) hide()
+}
 // The card is placed in window coordinates: scrolling would offset it.
-onMounted(() => window.addEventListener('scroll', hide, true))
+onMounted(() => window.addEventListener('scroll', hideOnScroll, true))
 onBeforeUnmount(() => {
-  window.removeEventListener('scroll', hide, true)
+  window.removeEventListener('scroll', hideOnScroll, true)
   hide()
 })
 

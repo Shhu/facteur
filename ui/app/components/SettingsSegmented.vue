@@ -20,10 +20,10 @@ function move(step: number) {
     role="radiogroup"
     :aria-label="label"
     class="flex shrink-0 gap-0.5 rounded-[10px] bg-elevated p-[3px]"
-    @keydown.right.prevent="move(1)"
-    @keydown.down.prevent="move(1)"
-    @keydown.left.prevent="move(-1)"
-    @keydown.up.prevent="move(-1)"
+    @keydown.right.prevent.stop="move(1)"
+    @keydown.down.prevent.stop="move(1)"
+    @keydown.left.prevent.stop="move(-1)"
+    @keydown.up.prevent.stop="move(-1)"
   >
     <button
       v-for="o in items"

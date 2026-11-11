@@ -47,6 +47,19 @@ export function instantAt(date: string, time: string, zone: string): number | nu
   const asUtc = Date.UTC(y, m - 1, d, h, min)
   let ms = asUtc - offset(asUtc, zone)
   ms = asUtc - offset(ms, zone)
+  const day = 86_400_000
+  const same = (t: number) => {
+    const w = wallParts(t, zone)
+    return w.y === y && w.m === m && w.d === d && w.h === h && w.min === min
+  }
+  if (!same(ms)) {
+    // In the gap: the offset before it pushes the time past it (east and west of UTC alike).
+    ms = Math.max(asUtc - offset(asUtc - day, zone), asUtc - offset(asUtc + day, zone))
+  } else {
+    // A time the clocks go through twice: the first, as the engine reads it.
+    const earlier = Math.min(asUtc - offset(asUtc - day, zone), asUtc - offset(asUtc + day, zone))
+    if (earlier < ms && same(earlier)) ms = earlier
+  }
   return Math.round(ms / 1000)
 }
 

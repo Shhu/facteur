@@ -128,12 +128,19 @@ export const api = {
   setSignature: (accountId: number, signature: string) => invoke<void>('set_signature', { accountId, signature }),
   contacts: (query: string) => invoke<Address[]>('contacts', { query }),
   saveDraft: (draft: Draft) => invoke<string>('save_draft', { draft }),
-  discardDraft: (accountId: number, draftId: string) => invoke<void>('discard_draft', { accountId, draftId }),
+  /** `source`: the copy it was resumed from, deleted too when outside Drafts. */
+  discardDraft: (accountId: number, draftId: string, source: number | null = null) => invoke<void>('discard_draft', { accountId, draftId, source }),
   openDraft: (id: number) => invoke<Draft>('open_draft', { id }),
   loadOlder: (mailboxId: number) => invoke<number>('load_older', { mailboxId }),
   /** `bins`: also search the bin and junk folders. */
   searchServer: (accountId: number, query: string, bins = false) => invoke<MessageSummary[]>('search_server', { accountId, query, bins }),
   backup: (accountId: number, dest: string) => invoke<BackupStats>('backup', { accountId, dest }),
+  /** Kept by the engine: the commands below take this folder only. */
+  backupFolder: () => invoke<string>('backup_folder'),
+  /** Opens the folder dialog; `null`: none picked. */
+  chooseBackupFolder: () => invoke<string | null>('choose_backup_folder'),
+  /** The folder kept here before, taken over at the first call only (made at start, `null`: none). */
+  adoptBackupFolder: (dest: string | null) => invoke<boolean>('adopt_backup_folder', { dest }),
   backupBusy: () => invoke<number[]>('backup_busy'),
   backupStatus: (dest: string) => invoke<BackupStatus[]>('backup_status', { dest }),
   listBackups: (dest: string) => invoke<BackupManifest[]>('list_backups', { dest }),

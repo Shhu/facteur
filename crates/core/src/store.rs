@@ -890,7 +890,14 @@ pub struct Store {
     /// server's flags read before then leaves them alone (see [`Store::flags_tick`]).
     flag_marks: Mutex<HashMap<i64, FlagMarks>>,
     flag_clock: std::sync::atomic::AtomicU64,
+    /// Per folder: its message and unread counts when its threads were last counted, those, and
+    /// when. Read again during a sync every second or so, a folder unchanged is not counted again.
+    thread_counts: Mutex<HashMap<i64, ThreadCount>>,
 }
+
+/// A folder's (messages, unread, thread epoch) when counted, its (threads, unread threads), and
+/// when.
+type ThreadCount = ((i64, i64, u64), (i64, i64), std::time::Instant);
 
 const READERS: usize = 3;
 
@@ -1009,13 +1016,7 @@ const LIST_MAILBOXES: &str = "SELECT b.id, b.account_id, b.name, b.delimiter, b.
               + (SELECT COUNT(*) FROM labels l JOIN messages m ON m.id = l.message_id WHERE l.mailbox_id = b.id AND m.seen = 0 AND m.unscreened = 0),
             (SELECT COUNT(*) FROM messages m WHERE m.mailbox_id = b.id)
               + (SELECT COUNT(*) FROM labels l WHERE l.mailbox_id = b.id),
-            b.server_count, b.count_base,
-            (SELECT COUNT(*) FROM (SELECT thread_id FROM messages WHERE mailbox_id = b.id
-                                   UNION SELECT m.thread_id FROM labels l JOIN messages m ON m.id = l.message_id
-                                         WHERE l.mailbox_id = b.id)),
-            (SELECT COUNT(*) FROM (SELECT thread_id FROM messages WHERE mailbox_id = b.id AND seen = 0 AND unscreened = 0
-                                   UNION SELECT m.thread_id FROM labels l JOIN messages m ON m.id = l.message_id
-                                         WHERE l.mailbox_id = b.id AND m.seen = 0 AND m.unscreened = 0)),
+            b.server_count, b.count_base, NULL, NULL,
             b.is_label
      FROM mailboxes b
      WHERE b.account_id = ?1
@@ -1023,6 +1024,26 @@ const LIST_MAILBOXES: &str = "SELECT b.id, b.account_id, b.name, b.delimiter, b.
          WHEN 'inbox' THEN 0 WHEN 'screener' THEN 1 WHEN 'flagged' THEN 2 WHEN 'snoozed' THEN 3
          WHEN 'drafts' THEN 4 WHEN 'sent' THEN 5 WHEN 'archive' THEN 6 WHEN 'all' THEN 7
          WHEN 'refused' THEN 8 WHEN 'junk' THEN 9 WHEN 'trash' THEN 10 ELSE 11 END, b.name";
+
+/// A folder's threads, all and unread: `?1` the folder. A pass over its rows (deduplicated), so
+/// run again only when its counts moved (see [`Store::list_mailboxes`]).
+const THREAD_COUNTS: &str = "SELECT
+            (SELECT COUNT(*) FROM (SELECT thread_id FROM messages WHERE mailbox_id = ?1
+                                   UNION SELECT m.thread_id FROM labels l JOIN messages m ON m.id = l.message_id
+                                         WHERE l.mailbox_id = ?1)),
+            (SELECT COUNT(*) FROM (SELECT thread_id FROM messages WHERE mailbox_id = ?1 AND seen = 0 AND unscreened = 0
+                                   UNION SELECT m.thread_id FROM labels l JOIN messages m ON m.id = l.message_id
+                                         WHERE l.mailbox_id = ?1 AND m.seen = 0 AND m.unscreened = 0))";
+/// Bumped whenever messages change thread (joined, regrouped by Gmail): every folder's thread
+/// counts are then read again.
+static THREAD_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn threads_regrouped() {
+    THREAD_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Thread counts kept at most this long while the folder's own counts stay the same.
+const THREAD_COUNTS_FOR: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// [`Store::inbox_from_blocked`]: `?1` the account.
 fn inbox_from_blocked_sql() -> String {
@@ -1152,7 +1173,7 @@ pub(crate) fn fold(s: &str) -> String {
 }
 
 /// SQL functions of facteur's own, on every connection (the writer and each reader): `fold`.
-fn register_functions(conn: &Connection) -> rusqlite::Result<()> {
+pub(crate) fn register_functions(conn: &Connection) -> rusqlite::Result<()> {
     use rusqlite::functions::FunctionFlags;
     conn.create_scalar_function("fold", 1, FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
         Ok(ctx.get_raw(0).as_str_or_null()?.map(fold))
@@ -1192,7 +1213,10 @@ fn check_integrity(path: &Path) -> Result<()> {
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     // A passing failure (a full disk, a busy file) is said as such, the marker left to check again
     // at the next start; anything else is damage, offered to be set aside.
-    let rebuilt = drop_duplicate_copies(&conn).and_then(|()| conn.execute_batch("REINDEX;")).map_err(|e| {
+    // A base from before the migrations it relies on (handled_quiet): its indexes rebuilt only.
+    let migrated: bool = conn.query_row("SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE name = 'handled_quiet')", [], |r| r.get(0))?;
+    let cleaned = if migrated { drop_duplicate_copies(&conn) } else { Ok(()) };
+    let rebuilt = cleaned.and_then(|()| conn.execute_batch("REINDEX;")).map_err(|e| {
         tracing::error!("database check failed (indexes not rebuilt): {e}");
         use rusqlite::ErrorCode::*;
         let passing = e.sqlite_error_code().is_some_and(|c| {
@@ -1214,14 +1238,41 @@ fn check_integrity(path: &Path) -> Result<()> {
 /// a bare connection has foreign keys off, and a new message reusing a freed id would show a
 /// deleted copy's body.
 fn drop_duplicate_copies(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
+    // A body held by a copy that goes is handed to the one kept (when it has none), and a row
+    // left claiming a body that went with its copy is marked as having none.
+    conn.execute_batch(&format!(
         "PRAGMA foreign_keys = ON;
          BEGIN;
          INSERT INTO handled_quiet VALUES (1);
-         DELETE FROM messages WHERE uid IS NOT NULL AND id NOT IN (SELECT MIN(id) FROM messages NOT INDEXED WHERE uid IS NOT NULL GROUP BY mailbox_id, uid);
+         CREATE TEMP TABLE kept_copies AS SELECT mailbox_id, uid, MIN(id) AS id FROM messages NOT INDEXED WHERE uid IS NOT NULL GROUP BY mailbox_id, uid;
+         CREATE TEMP TABLE moved_bodies AS
+             SELECT d.id AS dropped, k.id AS kept FROM kept_copies k JOIN messages d NOT INDEXED ON d.mailbox_id = k.mailbox_id AND d.uid = k.uid
+             WHERE d.id != k.id AND EXISTS (SELECT 1 FROM bodies b WHERE b.message_id = d.id)
+               AND NOT EXISTS (SELECT 1 FROM bodies b WHERE b.message_id = k.id)
+             GROUP BY k.id;
+         UPDATE OR IGNORE bodies SET message_id = (SELECT kept FROM moved_bodies WHERE dropped = bodies.message_id)
+         WHERE message_id IN (SELECT dropped FROM moved_bodies);
+         -- What the body gave its holder goes with it: preview, attachments, links, search text.
+         UPDATE messages SET
+             preview = (SELECT d.preview FROM moved_bodies mb JOIN messages d ON d.id = mb.dropped WHERE mb.kept = messages.id),
+             has_attachments = (SELECT d.has_attachments FROM moved_bodies mb JOIN messages d ON d.id = mb.dropped WHERE mb.kept = messages.id),
+             link_domains = (SELECT d.link_domains FROM moved_bodies mb JOIN messages d ON d.id = mb.dropped WHERE mb.kept = messages.id),
+             list_id = COALESCE(list_id, (SELECT d.list_id FROM moved_bodies mb JOIN messages d ON d.id = mb.dropped WHERE mb.kept = messages.id))
+         WHERE id IN (SELECT kept FROM moved_bodies);
+         INSERT OR IGNORE INTO message_links (domain, message_id)
+             SELECT l.domain, mb.kept FROM moved_bodies mb JOIN message_links l ON l.message_id = mb.dropped;
+         UPDATE messages_fts SET body = (SELECT f.body FROM moved_bodies mb JOIN messages_fts f ON f.rowid = mb.dropped WHERE mb.kept = messages_fts.rowid)
+         WHERE rowid IN (SELECT kept FROM moved_bodies);
+         DROP TABLE moved_bodies;
+         UPDATE messages SET has_body = 1 WHERE has_body = 0 AND id IN (SELECT message_id FROM bodies);
+         DELETE FROM messages WHERE uid IS NOT NULL AND id NOT IN (SELECT id FROM kept_copies);
+         DROP TABLE kept_copies;
+         UPDATE messages AS m SET has_body = 0
+         WHERE m.has_body = 1 AND NOT EXISTS (SELECT 1 FROM bodies b WHERE b.message_id = m.id)
+           AND NOT EXISTS (SELECT 1 FROM messages o JOIN bodies b ON b.message_id = o.id WHERE {SAME_COPY});
          DELETE FROM handled_quiet;
-         COMMIT;",
-    )
+         COMMIT;"
+    ))
     .inspect_err(|_| {
         let _ = conn.execute_batch("ROLLBACK;");
     })
@@ -1426,6 +1477,7 @@ impl Store {
             last_shrink: Default::default(),
             flag_marks: Default::default(),
             flag_clock: Default::default(),
+            thread_counts: Mutex::default(),
         })
     }
 
@@ -2037,8 +2089,8 @@ impl Store {
                         Ok(Some(base)) => (count + r.get::<_, i64>(7).unwrap_or(base) - base).max(0),
                         _ => count,
                     }),
-                    threads: r.get(10)?,
-                    unread_threads: r.get(11)?,
+                    threads: 0,
+                    unread_threads: 0,
                     user_label: false,
                 })
                 .and_then(|mut m: Mailbox| {
@@ -2047,7 +2099,23 @@ impl Store {
                     Ok(m)
                 })
             })?
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<Vec<Mailbox>, _>>()?;
+        let mut rows = rows;
+        let mut counted = self.thread_counts.lock().unwrap_or_else(|e| e.into_inner());
+        let mut count = db.prepare_cached(THREAD_COUNTS)?;
+        for m in &mut rows {
+            let stamp = (m.total, m.unread, THREAD_EPOCH.load(std::sync::atomic::Ordering::Relaxed));
+            let (threads, unread) = match counted.get(&m.id) {
+                Some((at, counts, when)) if *at == stamp && when.elapsed() < THREAD_COUNTS_FOR => *counts,
+                _ => {
+                    let counts: (i64, i64) = count.query_row([m.id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                    counted.insert(m.id, (stamp, counts, std::time::Instant::now()));
+                    counts
+                }
+            };
+            m.threads = threads;
+            m.unread_threads = unread;
+        }
         Ok(rows)
     }
 
@@ -2315,8 +2383,27 @@ impl Store {
                 set.execute(params![id, target, thrid])?;
                 changed |= *thread_id != target;
             }
+            drop(set);
+            // A local thread left without messages, and not one of Gmail's: its state follows.
+            let mut left: Vec<i64> = rows.iter().map(|(_, t, _)| *t).filter(|t| *t != target && *t != 0).collect();
+            left.sort_unstable();
+            left.dedup();
+            for old in left {
+                let kept: bool = tx.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM messages WHERE account_id = ?1 AND thread_id = ?2)
+                         OR EXISTS (SELECT 1 FROM gmail_threads WHERE account_id = ?1 AND thread_id = ?2)",
+                    params![account_id, old],
+                    |r| r.get(0),
+                )?;
+                if !kept {
+                    carry_thread_state(&tx, account_id, old, target)?;
+                }
+            }
         }
         tx.commit()?;
+        if changed {
+            threads_regrouped();
+        }
         Ok(changed)
     }
 
@@ -2590,11 +2677,21 @@ impl Store {
 
     /// The folder was recreated on the server (UIDVALIDITY changed): its cache and window start over.
     pub fn clear_mailbox(&self, mailbox_id: i64) -> Result<()> {
+        self.reset_mailbox(mailbox_id, None)
+    }
+
+    /// `validity`: the folder recreated on the server with this UIDVALIDITY, noted with the wipe so
+    /// that what is read again carries it; its UIDNEXT unknown until a sync gets through (until
+    /// then each try is a first pass, see [`crate::sync`]).
+    pub fn reset_mailbox(&self, mailbox_id: i64, validity: Option<u32>) -> Result<()> {
         self.shed_mailbox_rows(mailbox_id)?;
         let mut db = self.db();
         let tx = db.transaction()?;
         delete_mailbox_rows(&tx, mailbox_id)?;
         tx.execute("UPDATE mailboxes SET sync_from_uid = NULL, highestmodseq = NULL WHERE id = ?1", [mailbox_id])?;
+        if let Some(v) = validity {
+            tx.execute("UPDATE mailboxes SET uidvalidity = ?2, uidnext = NULL WHERE id = ?1", params![mailbox_id, v])?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -2616,7 +2713,10 @@ impl Store {
         let db = self.read();
         let mut st = db.prepare_cached(
             "SELECT json_extract(op, '$.below') FROM pending_ops
-             WHERE account_id = ?1 AND mailbox = ?2 AND kind = ?3 AND failed = 0",
+             WHERE account_id = ?1 AND mailbox = ?2 AND kind = ?3 AND failed = 0
+               AND (json_extract(op, '$.uidvalidity') IS NULL
+                    OR json_extract(op, '$.uidvalidity') IS (SELECT uidvalidity FROM mailboxes WHERE account_id = ?1 AND name = ?2)
+                    OR (SELECT uidvalidity FROM mailboxes WHERE account_id = ?1 AND name = ?2) IS NULL)",
         )?;
         let mut below: Option<u32> = None;
         for b in st.query_map(params![account_id, mailbox, kind], |r| r.get::<_, Option<i64>>(0))? {
@@ -5790,9 +5890,19 @@ impl Store {
         let mut st = db.prepare(&format!(
             "SELECT op FROM pending_ops WHERE account_id = ?1 AND mailbox = ?2 AND failed = ?3 AND kind IN {kinds}"
         ))?;
+        // An operation from before the folder was recreated names UIDs given again since.
+        let validity: Option<i64> = db
+            .query_row("SELECT uidvalidity FROM mailboxes WHERE account_id = ?1 AND name = ?2", params![account_id, mailbox], |r| r.get(0))
+            .optional()?
+            .flatten();
         let mut out = HashSet::new();
         for op in st.query_map(params![account_id, mailbox, failed], |r| r.get::<_, String>(0))? {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&op?) else { continue };
+            if let (Some(theirs), Some(now)) = (v["uidvalidity"].as_i64(), validity)
+                && theirs != now
+            {
+                continue;
+            }
             out.extend(v["uid"].as_u64().map(|u| u as u32));
             out.extend(v["uids"].as_array().into_iter().flatten().filter_map(|u| u.as_u64()).map(|u| u as u32));
             // The old copy a draft save replaces (one without a Message-ID).
@@ -5965,7 +6075,10 @@ impl Store {
         let db = self.read();
         let mut st = db.prepare_cached(
             "SELECT op FROM pending_ops WHERE account_id = ?1 AND mailbox = ?2 AND id != ?3 AND kind IN ('move', 'move_set')
-               AND (?4 = 0 OR failed = 0) AND (?5 = 0 OR id < ?3)",
+               AND (?4 = 0 OR failed = 0) AND (?5 = 0 OR id < ?3)
+               AND (json_extract(op, '$.uidvalidity') IS NULL
+                    OR (SELECT uidvalidity FROM mailboxes WHERE account_id = ?1 AND name = ?2) IS NULL
+                    OR json_extract(op, '$.uidvalidity') IS (SELECT uidvalidity FROM mailboxes WHERE account_id = ?1 AND name = ?2))",
         )?;
         let rows = st.query_map(params![account_id, mailbox, except, waiting_only, earlier_only], |r| r.get(0))?.collect::<Result<_, _>>()?;
         Ok(rows)
@@ -6269,7 +6382,22 @@ fn assign_thread(tx: &Transaction, account_id: i64, id: i64, h: &HeaderInfo) -> 
                 "UPDATE messages SET thread_id = ?3 WHERE account_id = ?1 AND thread_id = ?2",
                 params![account_id, t, thread_id],
             )?;
+            carry_thread_state(tx, account_id, t, thread_id)?;
+            threads_regrouped();
         }
+    }
+    Ok(())
+}
+
+/// A thread joined into another: its mute, snooze and Done go with its messages. The thread's
+/// own state wins where both have one.
+fn carry_thread_state(tx: &rusqlite::Transaction, account_id: i64, from: i64, to: i64) -> Result<()> {
+    if from == to {
+        return Ok(());
+    }
+    for table in ["muted_threads", "snoozes", "handled"] {
+        tx.execute(&format!("UPDATE OR IGNORE {table} SET thread_id = ?3 WHERE account_id = ?1 AND thread_id = ?2"), params![account_id, from, to])?;
+        tx.execute(&format!("DELETE FROM {table} WHERE account_id = ?1 AND thread_id = ?2"), params![account_id, from])?;
     }
     Ok(())
 }
@@ -6557,7 +6685,9 @@ impl Store {
     /// Events of the shown calendars matching `q` within what is synced, upcoming first (by
     /// start), then those over (latest first). An empty query finds nothing.
     pub fn search_calendar_events(&self, q: &EventQuery, now: i64) -> Result<EventSearch> {
-        let words = |s: &str| crate::ai::folded(s).split_whitespace().map(str::to_string).collect::<Vec<_>>();
+        // As mail search folds: any accent, written precomposed or not.
+        let folded = |s: &str| fold(&s.replace('’', "'"));
+        let words = |s: &str| folded(s).split_whitespace().map(str::to_string).collect::<Vec<_>>();
         let (mut text, who, place) = (Vec::new(), words(&q.who), words(&q.place));
         let mut without = words(&q.without);
         // `-word` in the main text leaves out what has it.
@@ -6585,14 +6715,14 @@ impl Store {
             if !q.calendars.is_empty() && !q.calendars.contains(&e.calendar_id) {
                 continue;
             }
-            let people = crate::ai::folded(
+            let people = folded(
                 &std::iter::once(e.organizer.clone().unwrap_or_default())
                     .chain(e.attendees.iter().flat_map(|a| [a.email.clone(), a.name.clone().unwrap_or_default()]))
                     .collect::<Vec<_>>()
                     .join("\n"),
             );
-            let location = crate::ai::folded(e.location.as_deref().unwrap_or(""));
-            let all = format!("{}\n{location}\n{}\n{people}", crate::ai::folded(&e.summary), crate::ai::folded(e.description.as_deref().unwrap_or("")));
+            let location = folded(e.location.as_deref().unwrap_or(""));
+            let all = format!("{}\n{location}\n{}\n{people}", folded(&e.summary), folded(e.description.as_deref().unwrap_or("")));
             if !has_all(&all, &text) || !has_all(&people, &who) || !has_all(&location, &place) || without.iter().any(|w| all.contains(w.as_str())) {
                 continue;
             }
@@ -7315,18 +7445,35 @@ mod tests {
     fn duplicate_cleanup_takes_what_hangs_on_the_copies() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE messages (id INTEGER PRIMARY KEY, mailbox_id INTEGER, uid INTEGER);
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, mailbox_id INTEGER, uid INTEGER, account_id INTEGER DEFAULT 1, message_id TEXT,
+                                    size INTEGER DEFAULT 0, date INTEGER DEFAULT 0, from_addr TEXT, has_body INTEGER DEFAULT 0,
+                                    preview TEXT DEFAULT '', has_attachments INTEGER DEFAULT 0, link_domains TEXT, list_id TEXT);
+             CREATE TABLE message_links (domain TEXT NOT NULL, message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE, PRIMARY KEY (domain, message_id));
+             CREATE VIRTUAL TABLE messages_fts USING fts5 (subject, sender, recipients, body);
              CREATE TABLE bodies (message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE, raw BLOB);
              CREATE TABLE labels (mailbox_id INTEGER, message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE);
              CREATE TABLE handled_quiet (on_ INTEGER NOT NULL);
-             INSERT INTO messages VALUES (1, 5, 7), (2, 5, 7);
-             INSERT INTO bodies VALUES (1, 'a'), (2, 'b');
+             INSERT INTO messages (id, mailbox_id, uid, message_id, has_body) VALUES (1, 5, 7, 'a', 1), (2, 5, 7, 'a', 1), (3, 5, 8, 'c', 1);
+             INSERT INTO messages (id, mailbox_id, uid, message_id, has_body, preview, has_attachments) VALUES (4, 5, 8, 'c', 1, 'Bonjour', 1);
+             INSERT INTO message_links VALUES ('x.fr', 4);
+             INSERT INTO messages_fts (rowid, body) VALUES (3, ''), (4, 'le texte');
+             INSERT INTO bodies VALUES (1, 'a'), (2, 'b'), (4, 'd');
              INSERT INTO labels VALUES (9, 1), (9, 2);",
         )
         .unwrap();
         drop_duplicate_copies(&conn).unwrap();
         let orphans = |table: &str| conn.query_row(&format!("SELECT COUNT(*) FROM {table} WHERE message_id NOT IN (SELECT id FROM messages)"), [], |r| r.get::<_, i64>(0)).unwrap();
         assert_eq!((orphans("bodies"), orphans("labels")), (0, 0));
+        // The body only the dropped copy held stays with the one kept.
+        assert_eq!(conn.query_row("SELECT raw FROM bodies WHERE message_id = 3", [], |r| r.get::<_, String>(0)).unwrap(), "d");
+        let kept: (String, i64, i64, String) = conn
+            .query_row(
+                "SELECT preview, has_attachments, (SELECT COUNT(*) FROM message_links WHERE message_id = 3), (SELECT body FROM messages_fts WHERE rowid = 3) FROM messages WHERE id = 3",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, ("Bonjour".into(), 1, 1, "le texte".into()));
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM handled_quiet", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
     }
 

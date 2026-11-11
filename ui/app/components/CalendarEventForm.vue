@@ -260,7 +260,7 @@ function fill() {
     endDate: dateText(last),
     endTime: timeText(end),
     location: found?.place ?? '',
-    description: ''
+    description: found?.notes ?? ''
   })
 }
 watch(open, isOpen => isOpen && fill(), { immediate: true })
@@ -273,9 +273,16 @@ watch(() => [form.startDate, form.startTime] as const, ([date, time], [oldDate, 
   const after = parse(date, form.allDay ? '00:00' : time)
   const end = parse(form.endDate, form.allDay ? '00:00' : form.endTime)
   if (!before || !after || !end) return
-  const moved = new Date(end.getTime() + (after.getTime() - before.getTime()))
-  form.endDate = dateText(moved)
-  if (!form.allDay) form.endTime = timeText(moved)
+  if (form.allDay) {
+    form.endDate = dateText(new Date(end.getTime() + (after.getTime() - before.getTime())))
+  } else {
+    // In the event's zone, where the fields are: a time the computer's clock skips stays as is.
+    const [b, a, e] = [instantAt(oldDate, oldTime, zone.value), instantAt(date, time, zone.value), instantAt(form.endDate, form.endTime, zone.value)]
+    if (b === null || a === null || e === null) return
+    const moved = wallFields(e + (a - b), zone.value)
+    form.endDate = moved.date
+    form.endTime = moved.time
+  }
   // Weekly on the start's day only: it follows the start.
   const r = repeat.value
   if (r.kind === 'weekly' && r.weekdays.length === 1 && r.weekdays[0] === weekdayOf(before)) r.weekdays = [weekdayOf(after)]

@@ -124,6 +124,7 @@ impl Index {
         // A backup and a catalog read of the same backup may write at once: wait for the other
         // writer rather than fail with "database is locked".
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
+        crate::store::register_functions(&conn)?;
         conn.execute_batch(SCHEMA)?;
         Ok(Index { conn })
     }
@@ -446,8 +447,10 @@ fn conditions(filter: &RestoreFilter, with_folders: bool) -> (String, Vec<Value>
         args.push(Value::Integer(until));
     }
     if let Some(q) = filter.query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        // Accents and case aside, as the mail search.
+        let q = crate::store::fold(q);
         let like = format!("%{}%", q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
-        cond.push("(e.subject LIKE ? ESCAPE '\\' OR e.from_name LIKE ? ESCAPE '\\' OR e.from_addr LIKE ? ESCAPE '\\')".into());
+        cond.push("(fold(e.subject) LIKE ? ESCAPE '\\' OR fold(e.from_name) LIKE ? ESCAPE '\\' OR fold(e.from_addr) LIKE ? ESCAPE '\\')".into());
         args.extend(std::iter::repeat_n(Value::Text(like), 3));
     }
     if filter.flagged_only {

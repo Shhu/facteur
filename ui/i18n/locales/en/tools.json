@@ -238,6 +238,8 @@
       "deleteMany": "Delete {n} folders"
     },
     "calendar": {
+      "notesMore": "Show all",
+      "notesLess": "Show less",
       "title": "Calendar",
       "calendars": "Calendars",
       "today": "Today",

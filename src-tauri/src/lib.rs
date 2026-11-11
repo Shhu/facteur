@@ -2,7 +2,7 @@ mod mailclient;
 mod notify;
 mod selfupdate;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -166,9 +166,85 @@ async fn dashboard(engine: Eng<'_>, since: i64) -> Res<Dashboard> {
     blocking(&engine, move |e| e.dashboard(since, 6)).await
 }
 
+/// The backup folder, kept by Rust: written only by its own folder dialog, so that a hijacked
+/// script cannot have mail written to (or folders listed in) any place on disk.
+const BACKUP_FOLDER: &str = "backup_folder";
+
+fn backup_folder_of(app: &AppHandle, engine: &Engine) -> Res<PathBuf> {
+    if let Some(chosen) = engine.setting(BACKUP_FOLDER)?.filter(|f| !f.is_empty()) {
+        return Ok(PathBuf::from(chosen));
+    }
+    let documents = app.path().document_dir().map_err(|e| Error::Other(e.to_string()))?;
+    Ok(documents.join("facteur-sauvegardes"))
+}
+
+/// `dest` as the UI gives it: the backup folder only.
+fn backup_dest(app: &AppHandle, engine: &Engine, dest: &str) -> Res<PathBuf> {
+    let folder = backup_folder_of(app, engine)?;
+    if Path::new(dest) != folder {
+        return Err(Error::Other(facteur_core::tr!("ce n'est pas le dossier des sauvegardes", "this is not the backup folder")));
+    }
+    Ok(folder)
+}
+
 #[tauri::command]
-async fn backup(engine: Eng<'_>, account_id: i64, dest: String) -> Res<BackupStats> {
-    on_engine!(engine, |e| e.backup(account_id, Path::new(&dest)).await)
+async fn backup_folder(app: AppHandle, engine: Eng<'_>) -> Res<String> {
+    Ok(backup_folder_of(&app, &engine)?.to_string_lossy().into_owned())
+}
+
+/// The folder dialog is opened here: the folder picked is the one backups use. `None`: none picked.
+#[tauri::command]
+async fn choose_backup_folder(app: AppHandle, engine: Eng<'_>) -> Res<Option<String>> {
+    #[cfg(not(desktop))]
+    {
+        let _ = (app, engine);
+        Ok(None)
+    }
+    #[cfg(desktop)]
+    {
+        use tauri_plugin_dialog::DialogExt;
+        let current = backup_folder_of(&app, &engine)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.dialog().file().set_directory(&current).pick_folder(move |path| {
+            let _ = tx.send(path);
+        });
+        let Some(path) = rx.await.ok().flatten().and_then(|p| p.into_path().ok()) else { return Ok(None) };
+        // Kept as text: a name that is not would be another folder once read back.
+        let Some(shown) = path.to_str().map(str::to_string) else {
+            return Err(Error::Other(facteur_core::tr!("ce nom de dossier ne peut pas être utilisé", "this folder name cannot be used")));
+        };
+        let value = shown.clone();
+        blocking(&engine, move |e| e.set_setting(BACKUP_FOLDER, &value)).await?;
+        Ok(Some(shown))
+    }
+}
+
+const BACKUP_FOLDER_ADOPTED: &str = "backup_folder_adopted";
+
+/// The folder an earlier version kept in the UI (picked through the dialog then), taken over at
+/// the first call only, made by the UI at its start: later calls change nothing, so a hijacked
+/// script cannot point the backups elsewhere. `None`: no such folder.
+#[tauri::command]
+async fn adopt_backup_folder(engine: Eng<'_>, dest: Option<String>) -> Res<bool> {
+    blocking(&engine, move |e| {
+        if e.setting(BACKUP_FOLDER_ADOPTED)?.is_some() {
+            return Ok(false);
+        }
+        e.set_setting(BACKUP_FOLDER_ADOPTED, "1")?;
+        let Some(dest) = dest.filter(|d| Path::new(d).is_absolute()) else { return Ok(false) };
+        if e.setting(BACKUP_FOLDER)?.is_some_and(|f| !f.is_empty()) {
+            return Ok(false);
+        }
+        e.set_setting(BACKUP_FOLDER, &dest)?;
+        Ok(true)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn backup(app: AppHandle, engine: Eng<'_>, account_id: i64, dest: String) -> Res<BackupStats> {
+    let dest = backup_dest(&app, &engine, &dest)?;
+    on_engine!(engine, |e| e.backup(account_id, &dest).await)
 }
 
 #[tauri::command]
@@ -177,17 +253,20 @@ async fn backup_busy(engine: Eng<'_>) -> Res<Vec<i64>> {
 }
 
 #[tauri::command]
-async fn backup_status(engine: Eng<'_>, dest: String) -> Res<Vec<BackupStatus>> {
-    blocking(&engine, move |e| e.backup_status(Path::new(&dest))).await
+async fn backup_status(app: AppHandle, engine: Eng<'_>, dest: String) -> Res<Vec<BackupStatus>> {
+    let dest = backup_dest(&app, &engine, &dest)?;
+    blocking(&engine, move |e| e.backup_status(&dest)).await
 }
 
 #[tauri::command]
-async fn list_backups(engine: Eng<'_>, dest: String) -> Res<Vec<Manifest>> {
-    blocking(&engine, move |e| e.list_backups(Path::new(&dest))).await
+async fn list_backups(app: AppHandle, engine: Eng<'_>, dest: String) -> Res<Vec<Manifest>> {
+    let dest = backup_dest(&app, &engine, &dest)?;
+    blocking(&engine, move |e| e.list_backups(&dest)).await
 }
 
 #[tauri::command]
 async fn backup_catalog(
+    app: AppHandle,
     engine: Eng<'_>,
     dest: String,
     email: String,
@@ -195,23 +274,27 @@ async fn backup_catalog(
     limit: usize,
     offset: usize,
 ) -> Res<Catalog> {
-    on_engine!(engine, |e| e.backup_catalog(Path::new(&dest), &email, filter, limit, offset).await)
+    let dest = backup_dest(&app, &engine, &dest)?;
+    on_engine!(engine, |e| e.backup_catalog(&dest, &email, filter, limit, offset).await)
 }
 
 #[tauri::command]
-async fn backup_message(engine: Eng<'_>, dest: String, email: String, id: i64) -> Res<BackupMessage> {
-    on_engine!(engine, |e| e.backup_message(Path::new(&dest), &email, id).await)
+async fn backup_message(app: AppHandle, engine: Eng<'_>, dest: String, email: String, id: i64) -> Res<BackupMessage> {
+    let dest = backup_dest(&app, &engine, &dest)?;
+    on_engine!(engine, |e| e.backup_message(&dest, &email, id).await)
 }
 
 #[tauri::command]
 async fn restore(
+    app: AppHandle,
     engine: Eng<'_>,
     dest: String,
     source: String,
     account_id: i64,
     request: RestoreRequest,
 ) -> Res<RestoreStats> {
-    on_engine!(engine, |e| e.restore(Path::new(&dest), &source, account_id, request).await)
+    let dest = backup_dest(&app, &engine, &dest)?;
+    on_engine!(engine, |e| e.restore(&dest, &source, account_id, request).await)
 }
 
 #[tauri::command]
@@ -464,6 +547,10 @@ async fn answer_connection_advice(engine: Eng<'_>, account_id: i64, accept: Opti
 
 #[tauri::command]
 async fn set_setting(engine: Eng<'_>, key: String, value: String) -> Res<()> {
+    // Written by its own dialog only.
+    if key == BACKUP_FOLDER || key == BACKUP_FOLDER_ADOPTED {
+        return Err(Error::Other(format!("setting {key}")));
+    }
     blocking(&engine, move |e| e.set_setting(&key, &value)).await
 }
 
@@ -764,8 +851,8 @@ async fn save_draft(engine: Eng<'_>, draft: Draft) -> Res<String> {
 }
 
 #[tauri::command]
-async fn discard_draft(engine: Eng<'_>, account_id: i64, draft_id: String) -> Res<()> {
-    blocking(&engine, move |e| e.discard_draft(account_id, &draft_id)).await
+async fn discard_draft(engine: Eng<'_>, account_id: i64, draft_id: String, source: Option<i64>) -> Res<()> {
+    blocking(&engine, move |e| e.discard_draft(account_id, &draft_id, source)).await
 }
 
 #[tauri::command]
@@ -1388,6 +1475,9 @@ pub fn run() {
             to_inbox,
             dashboard,
             backup,
+            backup_folder,
+            choose_backup_folder,
+            adopt_backup_folder,
             backup_status,
             backup_busy,
             restore,

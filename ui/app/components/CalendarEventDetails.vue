@@ -32,6 +32,13 @@ const notesOpen = ref(false)
 watch(() => e.value.id, () => {
   notesOpen.value = false
 })
+/** The notes are cut at six lines: a button shows the rest (links inside stay links). */
+const notesEl = useTemplateRef<HTMLElement>('notesEl')
+const notesClamped = ref(false)
+watch([notes, notesEl, notesOpen], () => nextTick(() => {
+  const el = notesEl.value
+  if (el && !notesOpen.value) notesClamped.value = el.scrollHeight > el.clientHeight + 1
+}), { immediate: true })
 
 /** "Name <address>", "mailto:address" or a bare address. */
 const organizer = computed(() => {
@@ -182,13 +189,27 @@ async function respond(p: Partstat) {
         </span>
       </span>
 
-      <div v-if="notes" class="cursor-pointer rounded-xl bg-elevated/50 px-3 py-2.5 text-[13px] text-toned" @click="notesOpen = !notesOpen">
-        <p class="whitespace-pre-line break-words" :class="notesOpen ? '' : 'line-clamp-6'">
+      <div
+        v-if="notes"
+        class="cursor-pointer rounded-xl bg-elevated/50 px-3 py-2.5 text-[13px] text-toned"
+        @click="notesOpen = !notesOpen"
+      >
+        <p id="event-notes" ref="notesEl" class="whitespace-pre-line break-words" :class="notesOpen ? '' : 'line-clamp-6'">
           <template v-for="(part, i) in notes" :key="i">
             <a v-if="part.href" :href="part.href" class="break-all text-primary hover:underline" @click.prevent.stop="openWritten(part.href, part.text)">{{ part.text }}</a>
             <template v-else>{{ part.text }}</template>
           </template>
         </p>
+        <button
+          v-if="notesClamped || notesOpen"
+          type="button"
+          class="mt-1 text-xs font-medium text-primary hover:underline"
+          aria-controls="event-notes"
+          :aria-expanded="notesOpen"
+          @click.stop="notesOpen = !notesOpen"
+        >
+          {{ notesOpen ? t('tools.calendar.notesLess') : t('tools.calendar.notesMore') }}
+        </button>
       </div>
     </div>
 

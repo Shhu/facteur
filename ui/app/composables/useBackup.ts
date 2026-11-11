@@ -1,4 +1,3 @@
-import { documentDir, join } from '@tauri-apps/api/path'
 import type { BackupStatus, RestoreRequest } from '~/utils/types'
 
 const KEY = 'facteur:backup'
@@ -21,6 +20,8 @@ export interface BackupProgress {
 
 /** Settings persistence is wired once, however many callers. */
 let persisting = false
+/** The folder kept here before, offered to the engine once a session: every caller waits for it. */
+let handover: Promise<unknown> | null = null
 /** Later hourly attempts fail quietly; the settings show the failure until a backup succeeds. */
 let autoFailureToasted = false
 
@@ -57,9 +58,23 @@ export function useBackup() {
     }, { deep: true })
   }
 
+  /** The engine keeps the folder (picked through its own dialog); one chosen here by an
+   *  earlier version is handed over once. */
   async function dest(): Promise<string> {
-    settings.value.dest ??= await join(await documentDir(), 'facteur-sauvegardes')
-    return settings.value.dest
+    const before = settings.value.dest
+    // Made once, always (with no folder too): the engine accepts it at its first call only.
+    handover ??= api.adoptBackupFolder(before).catch(() => false)
+    await handover
+    const folder = await api.backupFolder()
+    settings.value.dest = folder
+    return folder
+  }
+
+  async function choose(): Promise<boolean> {
+    const picked = await api.chooseBackupFolder()
+    if (picked === null) return false
+    settings.value.dest = picked
+    return true
   }
 
   async function syncBusy() {
@@ -169,5 +184,5 @@ export function useBackup() {
     }
   }
 
-  return { settings, status, running, busy, progress, autoFailure, dest, refresh, syncBusy, backupAll, autoBackup, restore }
+  return { settings, status, running, busy, progress, autoFailure, dest, choose, refresh, syncBusy, backupAll, autoBackup, restore }
 }

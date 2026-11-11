@@ -69,8 +69,27 @@ function onPointerDown(e: PointerEvent, handle: Handle) {
 
 function onPointerMove(e: PointerEvent) {
   if (!drag) return
-  const dx = (e.clientX - drag.x) * drag.scale
-  const dy = (e.clientY - drag.y) * drag.scale
+  dragBy((e.clientX - drag.x) * drag.scale, (e.clientY - drag.y) * drag.scale)
+}
+
+/** With the keyboard: arrows move the frame, Shift + arrows move its bottom right corner, by a
+ *  fiftieth of the image (one pixel with Alt). */
+function onKey(e: KeyboardEvent) {
+  const dirs: Record<string, [number, number]> = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }
+  const d = dirs[e.key]
+  if (!d) return
+  e.preventDefault()
+  const step = e.altKey ? 1 : Math.max(1, Math.round(Math.max(natural.value.w, natural.value.h) / 50))
+  drag = { handle: e.shiftKey ? 'se' : 'move', x: 0, y: 0, start: { ...crop.value }, scale: 1 }
+  // A shape with a ratio follows its width: up and down resize through it.
+  const r = ratio.value
+  const [dx, dy] = e.shiftKey && r && !d[0] ? [d[1] * step * r, 0] : [d[0] * step, d[1] * step]
+  dragBy(dx, dy)
+  drag = null
+}
+
+function dragBy(dx: number, dy: number) {
+  if (!drag) return
   const { w: nw, h: nh } = natural.value
   const s = drag.start
   if (drag.handle === 'move') {
@@ -246,7 +265,11 @@ function apply() {
             class="absolute cursor-move border-2 border-white shadow-[0_0_0_9999px_rgb(0_0_0/0.55)]"
             :class="shape === 'circle' ? 'rounded-full' : ''"
             :style="box"
+            tabindex="0"
+            role="group"
+            :aria-label="$t('app.cropper.frame')"
             @pointerdown="onPointerDown($event, 'move')"
+            @keydown="onKey"
           >
             <span
               v-for="h in handles"

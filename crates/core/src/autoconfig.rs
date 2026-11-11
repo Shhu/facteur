@@ -164,7 +164,8 @@ async fn autoconfig_direct(http: &reqwest::Client, domain: &str, email: &str) ->
     let urls = [
         format!("https://autoconfig.{domain}/mail/config-v1.1.xml?emailaddress={encoded}"),
         format!("https://{domain}/.well-known/autoconfig/mail/config-v1.1.xml?emailaddress={encoded}"),
-        format!("http://autoconfig.{domain}/mail/config-v1.1.xml?emailaddress={encoded}"),
+        // In clear: the domain only, never the address.
+        format!("http://autoconfig.{domain}/mail/config-v1.1.xml"),
     ];
     // In parallel: a host that does not answer must not delay the others.
     let mut results = futures::future::join_all(urls.iter().map(|url| fetch_config(http, url, email))).await;

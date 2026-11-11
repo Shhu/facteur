@@ -238,6 +238,8 @@
       "deleteMany": "Supprimer les {n} dossiers"
     },
     "calendar": {
+      "notesMore": "Afficher tout",
+      "notesLess": "Afficher moins",
       "title": "Agenda",
       "calendars": "Agendas",
       "today": "Aujourd'hui",

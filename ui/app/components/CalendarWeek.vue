@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { useElementSize } from '@vueuse/core'
+import type { DragSpot } from '~/composables/useEventDrag'
 import type { TimedBlock } from '~/utils/calendar'
 import type { CalendarEvent } from '~/utils/types'
 
-const props = defineProps<{ days: Date[], events: CalendarEvent[], selected: number | null }>()
+const props = defineProps<{ days: Date[], events: CalendarEvent[], selected: number | null, move: (e: CalendarEvent, start: number, end: number) => Promise<void> }>()
 const emit = defineEmits<{ select: [event: CalendarEvent, el: HTMLElement], pick: [day: Date], create: [start: Date] }>()
 const { eventColor } = useCalendar()
 const now = useNow()
@@ -23,8 +24,21 @@ const nowMinutes = computed(() => {
   return d.getHours() * 60 + d.getMinutes()
 })
 
-const blocks = computed(() => props.days.map(d => layoutDay(props.events, d, 22)))
-const band = computed(() => layoutBand(props.events, props.days))
+function locate(x: number, y: number): DragSpot | null {
+  const cols = [...(scroller.value?.querySelectorAll<HTMLElement>('[data-day]') ?? [])]
+  if (!cols.length) return null
+  let day = 0
+  cols.forEach((c, i) => {
+    if (x >= c.getBoundingClientRect().left) day = i
+  })
+  const top = cols[day]!.getBoundingClientRect().top
+  return { day, minutes: Math.min(24 * 60, Math.max(0, ((y - top) / hourH.value) * 60)) }
+}
+const drag = useEventDrag({ days: () => props.days, events: () => props.events, locate, commit: (e, start, end) => props.move(e, start, end), scroller, covered: () => headHeight.value })
+const shown = computed(() => drag.shown(props.events))
+
+const blocks = computed(() => props.days.map(d => layoutDay(shown.value, d, 22)))
+const band = computed(() => layoutBand(shown.value, props.days))
 const lanes = computed(() => Math.max(0, ...band.value.map(b => b.lane + 1)))
 
 const hourLabel = (h: number) => {
@@ -49,9 +63,14 @@ watch([hourH, () => props.days.length], () => {
   el.scrollTop = Math.max(0, top * hourH.value - 10)
 }, { flush: 'post' })
 
-const select = (e: CalendarEvent, ev: MouseEvent) => emit('select', e, ev.currentTarget as HTMLElement)
+function select(e: CalendarEvent, ev: MouseEvent) {
+  if (!drag.clicksBlocked()) emit('select', e, ev.currentTarget as HTMLElement)
+}
+const startsOn = (e: CalendarEvent, d: Date) => sameDay(new Date(e.start * 1000), d)
+const endsOn = (e: CalendarEvent, d: Date) => e.end <= unix(addDays(d, 1))
 /** A click on a free spot starts an event there, on the half hour above. */
 function createAt(d: Date, ev: MouseEvent) {
+  if (drag.clicksBlocked()) return
   const minutes = Math.floor(((ev.offsetY / hourH.value) * 60) / 30) * 30
   emit('create', new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, Math.min(minutes, 23 * 60 + 30)))
 }
@@ -102,6 +121,7 @@ const tall = (b: TimedBlock) => blockHeight(b) >= 36
           class="cal-tint relative z-1 mx-0.75 my-0.5 flex min-w-0 items-center gap-1 rounded-md border-s-3 border-(--ev) px-1.5 text-start text-xs font-medium text-highlighted transition-shadow hover:shadow-sm"
           :class="[selected === b.event.id && 'ring-2 ring-(--ev)', b.event.status === 'cancelled' && 'line-through opacity-60', past(b.event) && 'opacity-70']"
           :style="{ gridColumn: `${b.from + 2} / ${b.to + 3}`, gridRow: b.lane + 1, '--ev': eventColor(b.event) }"
+          @pointerdown="drag.start($event, b.event, 'move', true)"
           @click="select(b.event, $event)"
         >
           <UIcon v-if="b.continuesBefore" name="i-lucide-chevron-left" class="size-3 shrink-0 text-muted" />
@@ -124,6 +144,7 @@ const tall = (b: TimedBlock) => blockHeight(b) >= 36
         v-for="(d, i) in days"
         :key="dayKey(d)"
         class="relative border-s border-default"
+        data-day
         :class="isWeekend(d) && days.length > 1 ? 'bg-elevated/30' : ''"
         :style="{ backgroundImage: 'linear-gradient(to bottom, var(--ui-border) 1px, transparent 1px)', backgroundSize: `100% ${hourH}px` }"
         @click.self="createAt(d, $event)"
@@ -141,8 +162,13 @@ const tall = (b: TimedBlock) => blockHeight(b) >= 36
             past(b.event) && 'opacity-70'
           ]"
           :style="blockStyle(b)"
+          @pointerdown="drag.start($event, b.event, 'move', false)"
           @click="select(b.event, $event)"
         >
+          <template v-if="b.event.editable">
+            <span v-if="startsOn(b.event, d)" class="absolute inset-x-0 top-0 h-1.5 cursor-ns-resize" aria-hidden="true" @pointerdown="drag.start($event, b.event, 'start', false)" />
+            <span v-if="endsOn(b.event, d)" class="absolute inset-x-0 bottom-0 h-1.5 cursor-ns-resize" aria-hidden="true" @pointerdown="drag.start($event, b.event, 'end', false)" />
+          </template>
           <template v-if="tall(b)">
             <span class="font-semibold" :class="[blockHeight(b) >= 56 ? 'line-clamp-2' : 'truncate', b.event.status === 'cancelled' && 'line-through']">{{ b.event.summary || t('tools.calendar.untitled') }}</span>
             <span class="truncate text-[11px] text-toned">{{ eventTime(b.event) }}</span>

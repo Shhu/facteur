@@ -359,7 +359,7 @@ async function discard() {
   const d = draft.value
   open.value = false
   draft.value = null
-  if (d?.draft_id) await api.discardDraft(d.account_id, d.draft_id).catch(showError)
+  if (d?.draft_id) await api.discardDraft(d.account_id, d.draft_id, d.source ?? null).catch(showError)
   // Reopened from a copy without a Message-ID (another client's): that copy goes, to the bin.
   else if (d?.source) await api.trash([d.source]).catch(showError)
 }
@@ -436,7 +436,7 @@ function retire(d: Draft) {
   const oldAccount = d.account_id
   const oldId = d.draft_id
   // Reopened from another client's copy without a Message-ID: that copy goes to the bin itself.
-  const oldSource = oldId ? null : d.source
+  const oldSource = d.source
   const pending = inFlight
   d.draft_id = null
   d.source = null
@@ -444,7 +444,7 @@ function retire(d: Draft) {
   if (!oldId && !oldSource) return
   ;(async () => {
     if (pending) await pending
-    if (oldId) await api.discardDraft(oldAccount, oldId).catch(showError)
+    if (oldId) await api.discardDraft(oldAccount, oldId, oldSource ?? null).catch(showError)
     else if (oldSource) await api.trash([oldSource]).catch(showError)
   })()
 }

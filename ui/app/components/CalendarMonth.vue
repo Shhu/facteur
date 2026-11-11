@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { useElementSize } from '@vueuse/core'
+import type { DragSpot } from '~/composables/useEventDrag'
 import type { CalendarEvent } from '~/utils/types'
 
-const props = defineProps<{ month: Date, days: Date[], events: CalendarEvent[], selected: number | null }>()
+const props = defineProps<{ month: Date, days: Date[], events: CalendarEvent[], selected: number | null, move: (e: CalendarEvent, start: number, end: number) => Promise<void> }>()
 const emit = defineEmits<{ select: [event: CalendarEvent, el: HTMLElement], pick: [day: Date] }>()
 const { eventColor } = useCalendar()
 const now = useNow()
@@ -15,7 +16,18 @@ const fits = computed(() => Math.max(1, Math.floor((height.value / 6 - 30) / 21)
 
 const today = computed(() => dayStart(new Date(now.value)))
 const weekdays = computed(() => props.days.slice(0, 7).map(d => dateFormat({ weekday: 'short' }).format(d)))
-const byDay = computed(() => props.days.map(d => props.events
+function locate(x: number, y: number): DragSpot | null {
+  const cells = [...(grid.value?.querySelectorAll<HTMLElement>('[data-day]') ?? [])]
+  const day = cells.findIndex((c) => {
+    const r = c.getBoundingClientRect()
+    return x >= r.left && x < r.right && y >= r.top && y < r.bottom
+  })
+  return day < 0 ? null : { day, minutes: null }
+}
+const drag = useEventDrag({ days: () => props.days, events: () => props.events, locate, commit: (e, start, end) => props.move(e, start, end) })
+const shownEvents = computed(() => drag.shown(props.events))
+
+const byDay = computed(() => props.days.map(d => shownEvents.value
   .filter(e => onDay(e, d))
   .sort((a, b) => Number(inBand(b)) - Number(inBand(a)) || a.start - b.start)))
 const shown = (i: number) => {
@@ -26,7 +38,9 @@ const shown = (i: number) => {
 const hidden = (i: number) => (byDay.value[i]?.length ?? 0) - shown(i).length
 const outside = (d: Date) => d.getMonth() !== props.month.getMonth()
 
-const select = (e: CalendarEvent, ev: MouseEvent) => emit('select', e, ev.currentTarget as HTMLElement)
+function select(e: CalendarEvent, ev: MouseEvent) {
+  if (!drag.clicksBlocked()) emit('select', e, ev.currentTarget as HTMLElement)
+}
 </script>
 
 <template>
@@ -39,6 +53,7 @@ const select = (e: CalendarEvent, ev: MouseEvent) => emit('select', e, ev.curren
         v-for="(d, i) in days"
         :key="dayKey(d)"
         class="flex min-h-0 min-w-0 flex-col gap-px overflow-hidden border-default px-1 pt-1 pb-0.5"
+        data-day
         :class="[i % 7 && 'border-s', i >= 7 && 'border-t', outside(d) && 'bg-elevated/30']"
       >
         <button
@@ -57,6 +72,7 @@ const select = (e: CalendarEvent, ev: MouseEvent) => emit('select', e, ev.curren
             class="cal-tint flex h-5 min-w-0 shrink-0 items-center rounded-[5px] border-s-3 border-(--ev) px-1.5 text-start text-[11.5px] font-medium text-highlighted"
             :class="[selected === e.id && 'ring-2 ring-(--ev)', e.status === 'cancelled' && 'line-through opacity-60']"
             :style="{ '--ev': eventColor(e) }"
+            @pointerdown="drag.start($event, e, 'move', true)"
             @click="select(e, $event)"
           >
             <span class="truncate">{{ e.summary || t('tools.calendar.untitled') }}</span>
@@ -66,6 +82,7 @@ const select = (e: CalendarEvent, ev: MouseEvent) => emit('select', e, ev.curren
             type="button"
             class="flex h-5 min-w-0 shrink-0 items-center gap-1.5 rounded-[5px] px-1 text-start text-[11.5px] text-default hover:bg-elevated/70"
             :class="[selected === e.id && 'bg-elevated', e.status === 'cancelled' && 'line-through opacity-60']"
+            @pointerdown="drag.start($event, e, 'move', true)"
             @click="select(e, $event)"
           >
             <span class="size-2 shrink-0 rounded-full" :style="{ background: eventColor(e) }" />

@@ -263,7 +263,7 @@
         "syncProblems": "Synchro en échec",
         "offline": "Hors ligne : la synchro reprendra au retour du réseau"
       },
-      "failedTooltip": "{n} action refusée par le serveur | {n} actions refusées par le serveur",
+      "failedTooltip": "{n} action n'a pas pu partir | {n} actions n'ont pas pu partir",
       "pendingTooltip": "{n} action en attente d'envoi au serveur | {n} actions en attente d'envoi au serveur",
       "failed": "{n} en échec",
       "pending": "{n} en attente",
@@ -281,15 +281,15 @@
         "blocked": "Bloquée",
         "waiting": "En attente",
         "retrying": "Nouvel essai",
-        "failed": "Refusée"
+        "failed": "En échec"
       },
       "reason": {
         "held": "Encore annulable : part dans {n} s.",
         "blocked": "Attend l'action #{n}, encore annulable : les actions partent dans l'ordre.",
         "waiting": "Prête : partira à la prochaine connexion au serveur.",
         "waitingError": "Prête, mais le serveur n'a pas pu être joint : {error}",
-        "retrying": "L'envoi a échoué ({n} essai(s)) ; nouvel essai à la prochaine synchronisation. Erreur : {error}",
-        "failed": "Refusée par le serveur ({n} essais), elle ne part plus d'elle-même : réessayez ou abandonnez. Erreur : {error}"
+        "retrying": "L'envoi a échoué ({n} essai) ; nouvel essai à la prochaine synchronisation. Erreur : {error} | L'envoi a échoué ({n} essais) ; nouvel essai à la prochaine synchronisation. Erreur : {error}",
+        "failed": "N'a pas pu passer, elle ne part plus d'elle-même : réessayez ou abandonnez. Erreur : {error}"
       },
       "kinds": {
         "store": "Drapeau",
@@ -310,6 +310,7 @@
       }
     },
     "cropper": {
+      "frame": "Cadre : flèches pour le déplacer, Maj + flèches pour le redimensionner",
       "title": "Recadrer l'image",
       "free": "Libre",
       "square": "Carré",

@@ -119,6 +119,26 @@ function select(event: CalendarEvent, el: HTMLElement | null = null) {
   if (selected.value && eventKey(selected.value.event) === eventKey(event)) selected.value = null
   else selected.value = { event, el }
 }
+let lastOpened: HTMLElement | null = null
+/** The popover has no trigger of its own: focus goes back to the event it was opened from, unless
+ *  something else took it meanwhile. */
+function refocus(e: Event) {
+  e.preventDefault()
+  const el = lastOpened
+  const outside = closedOutside
+  lastOpened = null
+  closedOutside = false
+  const active = document.activeElement
+  // Closed by a click elsewhere: focus stays where that click left it.
+  if (!outside && el?.isConnected && (!active || active === document.body)) el.focus({ preventScroll: true })
+}
+let closedOutside = false
+function markOutside() {
+  closedOutside = true
+}
+watch(selected, (s) => {
+  if (s) lastOpened = s.el
+})
 // After a sync, follow the same occurrence (its row may be new); close only if it is gone.
 watch(list, (l) => {
   const s = selected.value
@@ -150,6 +170,20 @@ function editSelected() {
   Object.assign(form, { open: true, event: e, start: null, allDay: false })
 }
 
+const showError = useErrorToast()
+/** Dragged or resized in the view: that occurrence alone, the rest as it is. */
+async function moveEvent(e: CalendarEvent, start: number, end: number) {
+  selected.value = null
+  try {
+    // In its own zone, as the form keeps it: `null` would rewrite it in UTC.
+    const zone = e.all_day ? null : validZone(e.zone)
+    await api.updateEvent(e, { summary: e.summary, location: e.location, description: e.description, start, end, all_day: e.all_day, repeat: null, zone, reminders: null }, false)
+  } catch (err) {
+    showError(err)
+    throw err
+  }
+}
+
 const busyDays = computed(() => new Set(days.value.filter(d => list.value.some(e => onDay(e, d))).map(dayKey)))
 function scrollToDay(d: Date) {
   document.getElementById(`agenda-${dayKey(d)}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
@@ -173,9 +207,15 @@ function openFound(e: CalendarEvent) {
   if (!desktop.value) nextTick(() => scrollToDay(dayStart(new Date(e.start * 1000))))
 }
 // Not through defineShortcuts: its preventDefault would stop a dialog's or menu's own Escape.
+// Captured and taken: the overlay the calendar may float in would close on the same Escape.
 useEventListener('keydown', (e: KeyboardEvent) => {
-  if (e.key === 'Escape' && !e.defaultPrevented && showResults.value && !overlayOpen()) closeSearch()
-})
+  if (e.key !== 'Escape' || e.defaultPrevented || !showResults.value || overlayOpen()) return
+  // In the search field: its own Escape (the text first, then the search) runs; only the overlay
+  // is kept from closing on it.
+  e.preventDefault()
+  if ((e.target as HTMLElement | null)?.closest('input, textarea')) return
+  closeSearch()
+}, { capture: true })
 function focusSearch() {
   search.open.value = true
   nextTick(() => (desktop.value ? searchBar : touchSearchBar).value?.focus())
@@ -302,14 +342,14 @@ defineShortcuts({
               <CalendarSearchResults @select="openFound" />
             </div>
           </div>
-          <CalendarMonth v-else-if="shownView === 'month'" :month="date" :days="days" :events="list" :selected="selected?.event.id ?? null" @select="select" @pick="pickDay" />
-          <CalendarWeek v-else :key="shownView" :days="days" :events="list" :selected="selected?.event.id ?? null" @select="select" @pick="pickDay" @create="createAt" />
+          <CalendarMonth v-else-if="shownView === 'month'" :month="date" :days="days" :events="list" :selected="selected?.event.id ?? null" :move="moveEvent" @select="select" @pick="pickDay" />
+          <CalendarWeek v-else :key="shownView" :days="days" :events="list" :selected="selected?.event.id ?? null" :move="moveEvent" @select="select" @pick="pickDay" @create="createAt" />
         </main>
 
         <UPopover
           v-model:open="popoverOpen"
           :reference="selected?.el ?? undefined"
-          :content="{ side: 'right', align: 'start', sideOffset: 8, collisionPadding: 12 }"
+          :content="{ side: 'right', align: 'start', sideOffset: 8, collisionPadding: 12, onCloseAutoFocus: refocus, onInteractOutside: markOutside }"
           :ui="{ content: 'w-88 max-w-[calc(100vw-2rem)] rounded-2xl p-4' }"
         >
           <template #content>

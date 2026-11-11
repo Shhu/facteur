@@ -257,16 +257,33 @@ const originalExcerpt = computed(() => {
   return text.length > 48 ? `${text.slice(0, 47).trimEnd()}…` : text
 })
 
+
+/** Opened or closed from the keyboard, the element that had focus is gone: the new one takes it. */
+const collapsedEl = useTemplateRef<HTMLElement>('collapsedEl')
+const headerEl = useTemplateRef<HTMLElement>('headerEl')
+watch(() => props.expanded, (now) => {
+  // Before the swap: was the focus on the part that goes?
+  const active = document.activeElement
+  const had = !!active && [collapsedEl.value, headerEl.value].some(el => el?.contains(active))
+  if (!had) return
+  nextTick(() => {
+    if (document.activeElement && document.activeElement !== document.body) return
+    ;(now ? headerEl.value : collapsedEl.value)?.focus({ preventScroll: true })
+  })
+}, { flush: 'pre' })
 </script>
 
 <template>
   <div
     v-if="!expanded"
+    ref="collapsedEl"
     role="button"
     tabindex="0"
+    aria-expanded="false"
     class="flex cursor-pointer items-start gap-3 rounded-2xl border border-default bg-(--surface-card) px-3.5 py-3 text-left shadow-xs transition-colors hover:bg-elevated/40 lg:items-center lg:px-4 dark:shadow-none"
     @click="$emit('toggle', message.id)"
     @keydown.enter.self="$emit('toggle', message.id)"
+    @keydown.space.self.prevent="$emit('toggle', message.id)"
   >
     <MailAvatar :address="message.from" />
     <div class="flex min-w-0 flex-1 flex-col gap-0.5">
@@ -300,6 +317,7 @@ const originalExcerpt = computed(() => {
       class="flex items-center gap-2.5 px-1 text-left lg:hidden"
       @click="$emit('toggle', message.id)"
       @keydown.enter.self="$emit('toggle', message.id)"
+      @keydown.space.self.prevent="$emit('toggle', message.id)"
     >
       <MailAvatar :address="message.from" />
       <div class="flex min-w-0 flex-1 flex-col gap-px">
@@ -328,12 +346,15 @@ const originalExcerpt = computed(() => {
       </UDropdownMenu>
     </div>
     <div
+      ref="headerEl"
       role="button"
       tabindex="0"
+      aria-expanded="true"
       class="flex w-full items-start gap-3 border-b border-default/60 px-3.5 pt-3.5 pb-3 text-left lg:px-4.5 lg:py-4"
       :class="invite && 'max-lg:hidden'"
       @click="$emit('toggle', message.id)"
       @keydown.enter.self="$emit('toggle', message.id)"
+      @keydown.space.self.prevent="$emit('toggle', message.id)"
     >
       <MailAvatar :address="message.from" />
       <div class="flex min-w-0 flex-1 flex-col gap-1">

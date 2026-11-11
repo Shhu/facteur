@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { open as pickFolder } from '@tauri-apps/plugin-dialog'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { useMediaQuery } from '@vueuse/core'
 import type { Neutral } from '~/composables/useAppearance'
@@ -144,10 +143,10 @@ onMounted(async () => {
 })
 
 async function chooseBackupFolder() {
-  const picked = await pickFolder({ directory: true, defaultPath: backupSettings.value.dest ?? undefined })
-  if (typeof picked === 'string') {
-    backupSettings.value.dest = picked
-    backup.refresh()
+  try {
+    if (await backup.choose()) backup.refresh()
+  } catch (e) {
+    showError(e)
   }
 }
 

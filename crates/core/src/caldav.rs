@@ -379,7 +379,7 @@ impl Client {
 
     /// Already gone counts as deleted.
     pub async fn delete(&self, href: &Url) -> Result<()> {
-        match self.send_with("DELETE", href, &[], "", Access::Password, MAX_PROPFIND).await.and_then(checked) {
+        match self.send_with("DELETE", href, &[], "", Access::Password, MAX_PROPFIND).await.and_then(written) {
             Ok(_) | Err(Error::NotFound(_)) => Ok(()),
             Err(e) => Err(e),
         }
@@ -394,9 +394,9 @@ impl Client {
         let href = base.join(&format!("{uid}.ics")).map_err(|e| Error::Other(e.to_string()))?;
         let answer = self.put(&href, ics, Some(("If-None-Match", "*"))).await?;
         if answer.status == StatusCode::PRECONDITION_FAILED {
-            checked(self.put(&href, ics, None).await?)?;
+            written(self.put(&href, ics, None).await?)?;
         } else {
-            checked(answer)?;
+            written(answer)?;
         }
         Ok(href)
     }
@@ -406,7 +406,7 @@ impl Client {
     pub async fn rewrite(&self, href: &Url, change: impl FnOnce(&str) -> Option<String>) -> Result<Option<String>> {
         let (ics, etag) = self.object(href).await?;
         let Some(changed) = change(&ics) else { return Ok(None) };
-        checked(self.put(href, &changed, etag.as_deref().map(|tag| ("If-Match", tag))).await?)?;
+        written(self.put(href, &changed, etag.as_deref().map(|tag| ("If-Match", tag))).await?)?;
         Ok(Some(changed))
     }
 
@@ -777,6 +777,15 @@ fn parse_calendar_data(xml: &str) -> Result<Vec<(String, String)>> {
         })
         .filter(|(_, ics)| !ics.is_empty())
         .collect())
+}
+
+/// A write's answer: a 403 there is the server refusing the change (RFC 4791 §5.3.2.1: invalid
+/// data, a calendar shared read-only), not the password.
+fn written(answer: Answer) -> Result<Answer> {
+    if answer.status == StatusCode::FORBIDDEN {
+        return Err(Error::Other(crate::tr!("le serveur d'agenda refuse cette modification (403)", "the calendar server refuses this change (403)")));
+    }
+    checked(answer)
 }
 
 fn checked(answer: Answer) -> Result<Answer> {

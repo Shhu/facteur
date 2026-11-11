@@ -16,6 +16,19 @@ fn smtp_err(e: impl std::fmt::Display) -> Error {
 
 /// The parser stops at the first address: make sure no other one hides after it
 /// (« Patron <pirate@x.fr> <patron@y.fr> »).
+/// One address, an accented domain written either way (`café.fr` or its `xn--` form): facteur
+/// sends the ASCII one, the account keeps what was typed.
+pub(crate) fn same_address(a: &str, b: &str) -> bool {
+    let ascii = |s: &str| {
+        let s = s.trim();
+        match s.rsplit_once('@') {
+            Some((user, domain)) => format!("{}@{}", user.to_lowercase(), idna::domain_to_ascii(domain).unwrap_or_else(|_| domain.to_lowercase())),
+            None => s.to_lowercase(),
+        }
+    };
+    a.trim().eq_ignore_ascii_case(b.trim()) || ascii(a) == ascii(b)
+}
+
 fn mailbox(s: &str) -> Result<Mailbox> {
     let s = s.trim();
     let m: Mailbox = s.parse().map_err(|e| Error::Smtp(crate::tr!("adresse invalide « {s} » : {e}", "invalid address “{s}”: {e}")))?;
@@ -65,8 +78,8 @@ fn build_inner(
     keep_bcc: bool,
     lenient: bool,
 ) -> Result<Message> {
-    let (name, email) = match draft.from.as_deref().filter(|f| !f.eq_ignore_ascii_case(&account.email)) {
-        Some(alias) => match account.identities.iter().find(|i| i.email.eq_ignore_ascii_case(alias)) {
+    let (name, email) = match draft.from.as_deref().filter(|f| !same_address(f, &account.email)) {
+        Some(alias) => match account.identities.iter().find(|i| same_address(&i.email, alias)) {
             Some(identity) => (if identity.name.is_empty() { account.name.clone() } else { identity.name.clone() }, identity.email.clone()),
             // A draft written from an alias removed since then is still saved, from the account.
             None if lenient => (account.name.clone(), account.email.clone()),
@@ -74,7 +87,8 @@ fn build_inner(
         },
         None => (account.name.clone(), account.email.clone()),
     };
-    let from = Mailbox::new(Some(name).filter(|n| !n.is_empty()), email.parse().map_err(smtp_err)?);
+    // An accented domain in its ASCII form, as for the recipients.
+    let from = Mailbox::new(Some(name).filter(|n| !n.is_empty()), mailbox(&email)?.email);
     let mut b = Message::builder().from(from.clone()).subject(&draft.subject).date_now();
     if let Some(id) = &draft.draft_id {
         b = b.message_id(Some(format!("<{id}>")));
@@ -532,8 +546,10 @@ pub fn server_saves_sent(account: &Account) -> bool {
 }
 
 fn host_saves_sent(smtp_host: &str) -> bool {
-    let h = smtp_host.to_lowercase();
-    ["gmail.com", "googlemail.com", "office365.com", "outlook.com"].iter().any(|d| h.ends_with(d))
+    // The submission hosts that file what they send: not their relays (smtp-relay.gmail.com,
+    // *.mail.protection.outlook.com), which file nothing.
+    let h = smtp_host.trim().trim_end_matches('.').to_lowercase();
+    ["smtp.gmail.com", "smtp.googlemail.com", "smtp.office365.com", "smtp-mail.outlook.com", "smtp.outlook.com"].contains(&h.as_str())
 }
 
 /// What to check before sending again a message that may have gone. Sent only says so where the
@@ -588,6 +604,8 @@ mod tests {
 
     #[test]
     fn sent_is_named_as_proof_only_where_the_provider_files_it() {
+        assert!(same_address("Yann@café.fr", "yann@xn--caf-dma.fr") && !same_address("yann@cafe.fr", "yann@xn--caf-dma.fr"));
+        assert!(!maybe_sent_advice("smtp-relay.gmail.com").contains("Envoyés"));
         assert!(maybe_sent_advice("smtp.gmail.com").contains("Envoyés"));
         assert!(maybe_sent_advice("smtp.office365.com").contains("Envoyés"));
         let elsewhere = maybe_sent_advice("ssl0.ovh.net");

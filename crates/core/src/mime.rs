@@ -778,6 +778,12 @@ fn redecoded<'t>(raw: &[u8], part: &mail_parser::MessagePart, text: &'t str, htm
     }
     let Some(bytes) = original_bytes(raw, part) else { return Cow::Borrowed(text) };
     let declared = if html { meta_charset(&bytes) } else { None };
+    // Said to be UTF-8 and holding real UTF-8 accents: a stray byte costs one character, not all.
+    let charset = part.content_type().and_then(|c| c.attribute("charset")).map(str::to_string).or_else(|| declared.clone());
+    let utf8 = charset.is_some_and(|c| encoding_rs::Encoding::for_label(c.trim().as_bytes()) == Some(encoding_rs::UTF_8));
+    if utf8 && String::from_utf8_lossy(&bytes).chars().any(|c| !c.is_ascii() && c != '\u{FFFD}') {
+        return Cow::Borrowed(text);
+    }
     match String::from_utf8(text_as_utf8(&bytes, declared.as_deref()).into_owned()) {
         Ok(again) => Cow::Owned(again),
         Err(_) => Cow::Borrowed(text),
@@ -848,7 +854,12 @@ fn sanitize_html_budgeted(html: &str, cids: HashMap<String, (usize, String)>) ->
         // inside the scheme…): decisions are made on the URL as a browser would parse it.
         .attribute_filter(move |element, attribute, value| {
             if attribute == "style" {
-                flag.lock().unwrap_or_else(|e| e.into_inner()).add(css_remote(value));
+                // Never shown, even once remote content is allowed: the router, a local service.
+                if css_reaches_private(value) {
+                    return None;
+                }
+                let remote = css_remote(value);
+                flag.lock().unwrap_or_else(|e| e.into_inner()).add(remote);
                 return Some(value.into());
             }
             let is_url = matches!((element, attribute), ("img", "src") | ("a", "href"));
@@ -874,6 +885,9 @@ fn sanitize_html_budgeted(html: &str, cids: HashMap<String, (usize, String)>) ->
                     }
                     "cid" => None,
                     "http" | "https" => {
+                        if image && url.host_str().is_some_and(private_host) {
+                            return None;
+                        }
                         if image {
                             let mut r = flag.lock().unwrap_or_else(|e| e.into_inner());
                             r.any = true;
@@ -896,6 +910,9 @@ fn sanitize_html_budgeted(html: &str, cids: HashMap<String, (usize, String)>) ->
                     let trimmed = value.trim_matches(|c: char| c <= ' ');
                     if trimmed.starts_with("//") || trimmed.starts_with("\\\\") || trimmed.starts_with("/\\") || trimmed.starts_with("\\/") {
                         let absolute = url::Url::parse(&format!("https:{}", trimmed.replace('\\', "/"))).ok()?;
+                        if image && absolute.host_str().is_some_and(private_host) {
+                            return None;
+                        }
                         if image {
                             let mut r = flag.lock().unwrap_or_else(|e| e.into_inner());
                             r.any = true;
@@ -917,10 +934,16 @@ fn sanitize_html_budgeted(html: &str, cids: HashMap<String, (usize, String)>) ->
         })
         .clean(&defused(html))
         .to_string();
-    let clean = match body_colors(html) {
+    let mut clean = match body_colors(html) {
         Some(sheet) => format!("{sheet}{clean}"),
         None => clean,
     };
+    // A sheet reaching this computer or its network goes whole, as such a style attribute does:
+    // cut by its place in the markup, never by its text (which may stand elsewhere too).
+    let private: Vec<(usize, usize)> = style_ranges(&clean).into_iter().filter(|&(a, b)| css_reaches_private(&clean[a..b])).collect();
+    for (a, b) in private.into_iter().rev() {
+        clean.replace_range(a..b, "");
+    }
     // <style> sheets can load resources too.
     let mut remote = std::mem::take(&mut *remote.lock().unwrap_or_else(|e| e.into_inner()));
     for block in style_blocks(&clean) {
@@ -933,7 +956,11 @@ fn sanitize_html_budgeted(html: &str, cids: HashMap<String, (usize, String)>) ->
 /// The colours a mail sets on its `<body>`, which goes with the element: written back as a sheet,
 /// or the reader would take a black newsletter for a white one and invert it.
 fn body_colors(html: &str) -> Option<String> {
-    let lower = html.get(..html.len().min(200_000))?.to_ascii_lowercase();
+    let mut cut = html.len().min(200_000);
+    while !html.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let lower = html[..cut].to_ascii_lowercase();
     let start = lower.match_indices("<body").map(|(i, _)| i + 5).find(|&i| lower[i..].starts_with(|c: char| c.is_ascii_whitespace()))?;
     let tag = &lower[start..start + lower[start..].find('>')?];
     let attribute = |name: &str| {
@@ -969,8 +996,16 @@ fn body_colors(html: &str) -> Option<String> {
             css_color(value).or_else(function).or_else(|| value.split_whitespace().find_map(css_color))
         })
     };
-    let background = declared("background-color").or_else(|| declared("background")).or_else(|| attribute("bgcolor").and_then(css_color));
-    let text = declared("color").or_else(|| attribute("text").and_then(css_color));
+    // The old attributes take a hex colour without its "#" too (bgcolor="000000").
+    let legacy = |name: &str| {
+        let v = attribute(name)?.trim();
+        if v.len() == 6 && v.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(format!("#{v}"));
+        }
+        css_color(v).map(str::to_string)
+    };
+    let background = declared("background-color").or_else(|| declared("background")).map(str::to_string).or_else(|| legacy("bgcolor"));
+    let text = declared("color").map(str::to_string).or_else(|| legacy("text"));
     if background.is_none() && text.is_none() {
         return None;
     }
@@ -1023,18 +1058,99 @@ fn percent_decode(s: &str) -> String {
 
 /// Contents of the `<style>` elements of sanitized HTML (ammonia writes lowercase tags).
 fn style_blocks(html: &str) -> impl Iterator<Item = &str> {
-    let mut rest = html;
-    std::iter::from_fn(move || {
-        let start = rest.find("<style")?;
-        let open_end = start + rest[start..].find('>')? + 1;
-        let close = rest[open_end..].find("</style").map_or(rest.len(), |c| open_end + c);
-        let block = &rest[open_end..close];
-        rest = &rest[close..];
-        if rest.starts_with("</style") {
-            rest = &rest[7..];
+    style_ranges(html).into_iter().map(move |(a, b)| &html[a..b])
+}
+
+/// A tag of serialised markup: where it starts and ends (after its `>`), its name in lowercase,
+/// and whether it closes. Quoted attribute values may hold `<` and `>`; comments are skipped.
+struct MarkupTag {
+    start: usize,
+    end: usize,
+    name: String,
+    closing: bool,
+}
+
+/// The next tag at or after `from` (see [`MarkupTag`]).
+fn next_tag(html: &str, from: usize) -> Option<MarkupTag> {
+    let mut from = from;
+    loop {
+        let start = from + html.get(from..)?.find('<')?;
+        let rest = &html[start..];
+        if rest.starts_with("<!--") {
+            from = start + rest.find("-->").map_or(rest.len(), |e| e + 3);
+            continue;
         }
-        Some(block)
-    })
+        let closing = rest.starts_with("</");
+        let name: String = rest[1 + usize::from(closing)..].chars().take_while(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase();
+        if name.is_empty() {
+            from = start + 1;
+            continue;
+        }
+        let mut quote = None;
+        let end = rest.char_indices().find(|&(_, c)| {
+            match quote {
+                Some(q) if c == q => quote = None,
+                Some(_) => {}
+                None if c == '"' || c == '\'' => quote = Some(c),
+                None => return c == '>',
+            }
+            false
+        });
+        let end = end.map_or(html.len(), |(i, _)| start + i + 1);
+        return Some(MarkupTag { start, end, name, closing });
+    }
+}
+
+/// Where the contents of each `<style>` element are (a sheet's text, raw up to its `</style`).
+fn style_ranges(html: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(tag) = next_tag(html, from) {
+        from = tag.end;
+        if tag.name == "style" && !tag.closing {
+            let close = html[from..].find("</style").map_or(html.len(), |c| from + c);
+            out.push((from, close));
+            from = close;
+        }
+    }
+    out
+}
+
+/// CSS naming a host of this computer or its network anywhere it could load from: `url()`,
+/// `@import` and `image-set()` strings, with escapes, comments, backslashes and tabs undone as a
+/// browser reads them.
+fn css_reaches_private(css: &str) -> bool {
+    let css: String = css_normalize(css).replace('\\', "/").chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).collect();
+    // Inline `data:` images go first: their base64 holds "//" too.
+    let mut css = css;
+    while let Some(at) = css.find("data:") {
+        let end = css[at..].find([')', '"', '\'']).map_or(css.len(), |e| at + e);
+        css.replace_range(at..end, "");
+    }
+    // After "http:" any slashes or none ("http:10.0.0.1" is a host to a browser), or after "//".
+    let starts = css.match_indices("http:").map(|(i, _)| i + 5).chain(css.match_indices("https:").map(|(i, _)| i + 6)).chain(css.match_indices("//").map(|(i, _)| i + 2));
+    for at in starts {
+        let rest = css[at..].trim_start_matches('/');
+        let authority = rest.split(['/', '\'', '"', ')', ' ', '?', '#', ';', ',']).next().unwrap_or("");
+        let host = authority.rsplit('@').next().unwrap_or("");
+        let host = if host.starts_with('[') { host.split(']').next().map(|h| format!("{h}]")).unwrap_or_default() } else { host.split(':').next().unwrap_or("").to_string() };
+        if !host.is_empty() && private_host(&host) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A host on this computer or its network, as a URL names it (the URL parser writes numeric and
+/// hex IPv4 forms as dotted ones): what a mail never gets to load, whatever is allowed.
+fn private_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return !crate::avatars::is_public(ip);
+    }
+    // Names only a local network answers: one label ("router"), or its usual suffixes.
+    !host.contains('.') || [".localhost", ".local", ".lan", ".home.arpa", ".internal", ".intranet", ".home", ".corp", ".localdomain"].iter().any(|s| host.ends_with(s))
 }
 
 /// What CSS would load from the network, by host (see [`css_loads_remote`]).
@@ -1409,6 +1525,94 @@ fn crafted_tags(html: &str, tags: &[Tag<'_>]) -> Vec<(usize, usize)> {
 /// preview. Blocks and `<br>` become line breaks (a blank line between paragraphs), quotes get
 /// `> ` prefixes, list items keep a marker, and a link whose text is not its address gets the
 /// address after it.
+/// The text a reader of the message sees: its HTML as shown when it has one, hidden parts left
+/// out (a preheader, words styled away), not a plain-text alternative only the machine reads.
+/// For what reads the message on the user's behalf (appointments, the local AI).
+pub fn shown_text(text: Option<&str>, html: &str, is_plain: bool) -> String {
+    match text {
+        Some(text) if is_plain => text.to_string(),
+        _ => html_to_text(&without_hidden(html)),
+    }
+}
+
+/// A style that hides its element: `display: none`, `visibility: hidden`, Outlook's `mso-hide`,
+/// no opacity. Not a font size of 0: layouts set it on wrappers whose cells set their own.
+fn hides(style: &str) -> bool {
+    let css: String = style.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
+    css.split(';').any(|d| {
+        let Some((key, value)) = d.split_once(':') else { return false };
+        let value = value.trim_end_matches("!important");
+        match key {
+            "display" => value == "none",
+            "visibility" => value == "hidden",
+            "mso-hide" => value == "all",
+            "opacity" => !value.is_empty() && value.chars().all(|c| c == '0' || c == '.') && value.contains('0'),
+            _ => false,
+        }
+    })
+}
+
+/// `html` without its hidden elements, in one pass over its tags (see [`next_tag`]).
+fn without_hidden(html: &str) -> std::borrow::Cow<'_, str> {
+    const VOID: [&str; 10] = ["br", "img", "hr", "input", "meta", "link", "wbr", "area", "col", "source"];
+    if !html.contains("style=") {
+        return std::borrow::Cow::Borrowed(html);
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut from = 0;
+    // The hidden element being left out: its name and how deep inside it.
+    let mut skipping: Option<(String, usize)> = None;
+    while let Some(tag) = next_tag(html, from) {
+        if skipping.is_none() {
+            out.push_str(&html[from..tag.start]);
+        }
+        let text = &html[tag.start..tag.end];
+        from = tag.end;
+        match &mut skipping {
+            Some((name, depth)) => {
+                if tag.name == *name {
+                    if tag.closing {
+                        *depth -= 1;
+                        if *depth == 0 {
+                            skipping = None;
+                        }
+                    } else if !text.ends_with("/>") {
+                        *depth += 1;
+                    }
+                }
+            }
+            None => {
+                let hidden = !tag.closing && !VOID.contains(&tag.name.as_str()) && !text.ends_with("/>") && style_of(text).is_some_and(|s| hides(&html_escape::decode_html_entities(s)));
+                if hidden {
+                    skipping = Some((tag.name, 1));
+                } else {
+                    out.push_str(text);
+                }
+            }
+        }
+    }
+    if skipping.is_none() {
+        out.push_str(&html[from..]);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// The `style` attribute of a start tag as written (quoted).
+fn style_of(tag: &str) -> Option<&str> {
+    let mut from = 0;
+    while let Some(at) = tag[from..].find("style=") {
+        let at = from + at;
+        from = at + 6;
+        if !tag[..at].ends_with(|c: char| c.is_ascii_whitespace()) {
+            continue;
+        }
+        let rest = &tag[at + 6..];
+        let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        return rest[1..].split(quote).next();
+    }
+    None
+}
+
 pub fn html_to_text(html: &str) -> String {
     // Normalised first: lowercase tags, only the structural ones, text and attributes escaped.
     let cleaned = ammonia::Builder::empty()
@@ -1701,6 +1905,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hidden_words_are_not_read_for_the_reader() {
+        let html = r#"<div><span style="display: none">mardi 10 novembre à 14h</span><p>Bonjour <b>Yann</b></p><div style="font-size:0px"><div>caché</div> aussi</div><br>fin</div>"#;
+        let text = shown_text(Some("plain only the machine reads"), html, false);
+        assert!(!text.contains("novembre") && !text.contains("machine"), "{text}");
+        assert!(text.contains("Bonjour") && text.contains("Yann") && text.contains("fin"), "{text}");
+        assert_eq!(shown_text(Some("texte"), "<p>texte</p>", true), "texte");
+        // Unclosed: what follows goes, nothing breaks.
+        assert!(!shown_text(None, r#"<p style="display:none">x"#, false).contains('x'));
+        // A layout's wrapper of font-size 0 holds the mail; the next element after a hidden one
+        // of the same name shows; a '>' in an attribute does not end the tag.
+        let mjml = r#"<div style="font-size:0px"><div style="font-size:14px">Rendez-vous</div></div><span style="display:none">a</span><span>visible</span><p title="a>b" style="display:none">caché</p>fin"#;
+        let text = shown_text(None, mjml, false);
+        assert!(text.contains("Rendez-vous") && text.contains("visible") && text.contains("fin") && !text.contains("caché") && !text.contains("b\""), "{text}");
+    }
+
+    #[test]
+    fn nothing_is_loaded_from_this_computer_or_its_network() {
+        let (html, remote, _) = sanitize_html_inlining(
+            r#"<img src="http://192.168.1.1/reboot"><img src="//127.0.0.1:11434/x"><img src="http://[::1]:8080/"><img src="http://3232235777/"><img src="http://router.localhost/"><div style="background:url(http://10.0.0.2/p)">a</div><style>p { background: url(http://172.16.0.9/x) }</style><img src="https://cdn.example/a.png">"#,
+            HashMap::new(),
+        );
+        for private in ["192.168", "127.0.0.1", "[::1]", "localhost", "10.0.0.2", "3232235777", "172.16.0.9"] {
+            assert!(!html.contains(private), "{private} in {html}");
+        }
+        assert!(html.contains("https://cdn.example/a.png"));
+        assert!(remote.hosts.contains("cdn.example"));
+        // The same text earlier in the body stays; the sheet goes, whatever way it names the host.
+        let sheet = "p { background: url(http://10.1.1.1/x) }";
+        let (html, _, _) = sanitize_html_inlining(&format!("<p>{sheet}</p><style>{sheet}</style>"), HashMap::new());
+        assert_eq!(html.matches("10.1.1.1").count(), 1, "{html}");
+        let (html, _, _) = sanitize_html_inlining("<style>p { background: url(data:image/png;base64,AB//CD+/) }</style><p>x</p>", HashMap::new());
+        assert!(html.contains("AB//CD"), "{html}");
+        for css in ["@import 'http://192.168.0.1/a.css';", "p { background: image-set('//nas/x.png' 1x) }", "p { background: url(http:\\\\10.0.0.3/x) }"] {
+            let (html, _, _) = sanitize_html_inlining(&format!("<style>{css}</style><p>x</p>"), HashMap::new());
+            assert!(!html.contains("192.168") && !html.contains("nas/") && !html.contains("10.0.0.3"), "{css} → {html}");
+        }
+    }
+
+    #[test]
+    fn one_stray_byte_does_not_undo_utf8_accents() {
+        let raw = b"Content-Type: text/plain; charset=utf-8\r\n\r\nHello\xa0world, caf\xc3\xa9 cr\xc3\xa8me\r\n";
+        assert!(body_info(raw).preview.contains("café crème"));
+    }
+
+    #[test]
     fn keeps_the_colours_of_the_body() {
         let (html, _) = sanitize_html(r##"<html><body style="text-align: center; background-color: #000000; padding: 0" bgcolor="#000000" text="#3b3f44"><p>x</p></body></html>"##, HashMap::new());
         assert!(html.starts_with("<style>body { background-color: #000000; color: #3b3f44; }</style>"));
@@ -1711,6 +1960,11 @@ mod tests {
         assert!(!html.contains("<style>"));
         let (html, _) = sanitize_html("<body><p>x</p></body>", HashMap::new());
         assert!(!html.contains("<style>"));
+        let (html, _) = sanitize_html(r#"<body bgcolor="000000" text="ffffff">x</body>"#, HashMap::new());
+        assert!(html.starts_with("<style>body { background-color: #000000; color: #ffffff; }</style>"));
+        // Cut at 200 KB inside a character: still read.
+        let long = format!(r#"<body bgcolor="black" >{}</body>"#, "é".repeat(150_000));
+        assert!(body_colors(&long[..]).is_some());
     }
 
     #[test]

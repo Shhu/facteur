@@ -160,8 +160,14 @@ pub async fn flush(store: &Store, account_id: i64, session: &mut Session, caps: 
             held = true;
             continue;
         }
-        // Read again: the id listed may since belong to another operation.
-        let Some(payload) = store.replay_payload(pending.id, now)? else { continue };
+        // Marked as being sent before it is read again (the id listed may since belong to another
+        // operation), under the lock a discard takes: one discarded is not sent after all.
+        let (_sending, payload) = {
+            let _claim = claim();
+            let sending = Replaying::start(pending.id);
+            (sending, store.replay_payload(pending.id, now)?)
+        };
+        let Some(payload) = payload else { continue };
         let op: Op = match serde_json::from_str(&payload) {
             Ok(op) => op,
             Err(e) => {
@@ -198,10 +204,11 @@ pub async fn flush(store: &Store, account_id: i64, session: &mut Session, caps: 
         };
         // Without MOVE: copy, then expunge. A try cut in between (or a crash) must not copy twice,
         // even after the user's retry has reset the attempts.
-        if !caps.mv && matches!(op, Op::Move { .. } | Op::MoveSet { .. } | Op::DeleteMailbox { dest: Some(_), .. }) && !pending.tried {
+        // A folder deleted or renamed by a try cut short (or a crash before its end is noted) is
+        // looked for again at the retry, not refused.
+        if (matches!(op, Op::DeleteMailbox { .. } | Op::Rename { .. }) || !caps.mv && matches!(op, Op::Move { .. } | Op::MoveSet { .. })) && !pending.tried {
             store.mark_op_started(pending.id)?;
         }
-        let _sending = Replaying::start(pending.id);
         match bounded(op.timeout_secs(), &what, apply(session, caps, &op, pending.tried, &protected)).await {
             Ok(()) => {
                 store.finish_replayed(pending.id, &payload)?;
@@ -740,6 +747,12 @@ impl Drop for Replaying {
     fn drop(&mut self) {
         replaying().remove(&self.0);
     }
+}
+
+/// Held while an operation is claimed for sending or for a discard, never across an await.
+pub(crate) fn claim() -> std::sync::MutexGuard<'static, ()> {
+    static CLAIM: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    CLAIM.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub(crate) fn being_sent(id: i64) -> bool {

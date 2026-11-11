@@ -168,6 +168,7 @@ async function openPreview(rule: Rule, confirm: () => Promise<void>) {
     const data = await api.previewRule(rule)
     if (preview.value?.rule === rule) preview.value = { ...preview.value, data }
   } catch (e) {
+    if (preview.value?.rule !== rule) return
     preview.value = null
     showError(e)
   }

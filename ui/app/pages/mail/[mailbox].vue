@@ -109,14 +109,16 @@ const listLoading = ref(true)
  *  (they may have moved further down rather than left the list). */
 const MERGE_MISSING = 5
 
-function fetchThreads(count: number) {
+function fetchThreads(count: number, offset = 0) {
   const cat = smartView.value && smart.category.value !== 'all' ? smart.category.value : null
   return doneView.value
-    ? api.doneThreads(filter.value, count, 0)
+    ? api.doneThreads(filter.value, count, offset)
     : unified.value
-      ? api.unifiedThreads(filter.value, count, 0, cat)
-      : api.threads(mailboxId.value!, filter.value, count, 0, cat)
+      ? api.unifiedThreads(filter.value, count, offset, cat)
+      : api.threads(mailboxId.value!, filter.value, count, offset, cat)
 }
+/** Rows read again before a next page: they must be the list's last ones, or it moved meanwhile. */
+const PAGE_OVERLAP = 10
 
 /** Rereads the whole list (`limit` rows): view, filter or tab change, next page. */
 const load = () => read(true)
@@ -137,6 +139,9 @@ async function read(full: boolean) {
   inflight = key
   inflightGrows = loadedFor !== key
   queued = null
+  // A page more of the list already read, nothing asking for everything again.
+  const before = loadedFor.slice(0, loadedFor.lastIndexOf('|'))
+  const grown = !fullNext && before === key.slice(0, key.lastIndexOf('|')) && Number(loadedFor.slice(loadedFor.lastIndexOf('|') + 1)) < limit.value
   if (fullNext) {
     fullNext = false
     full = true
@@ -144,7 +149,7 @@ async function read(full: boolean) {
   try {
     // Another view's list: nothing to merge. Older messages loaded at the end ask for a full read
     // themselves (`fullNext`): a refresh only merges the first page, even into a long list.
-    if (full || loadedFor !== key) await readAll(request, key)
+    if (full || loadedFor !== key) await readAll(request, key, grown)
     else await merge(request, key)
   } catch (e) {
     if (request === loadRequest) showError(e)
@@ -163,12 +168,29 @@ async function read(full: boolean) {
   }
 }
 
-async function readAll(request: number, key: string) {
+async function readAll(request: number, key: string, grown = false) {
+  const shown = (k: string) => k.slice(0, k.lastIndexOf('|'))
+  // A next page of the same view: only it is read (rereading the whole list for each page made
+  // scrolling deep slower and slower), after a few rows already shown that must still be there.
+  const old = threads.value
+  if (grown && shown(loadedFor) === shown(key) && old.length >= PAGE_OVERLAP && limit.value > old.length) {
+    const from = old.length - PAGE_OVERLAP
+    const page = await fetchThreads(limit.value - from, from)
+    if (request !== loadRequest) return
+    const id = (t: ThreadSummary) => `${t.account_id}-${t.thread_id}`
+    const steady = old.slice(from).every((t, i) => page[i] && id(page[i]!) === id(t))
+    if (steady) {
+      const known = new Set(old.map(id))
+      threads.value = [...old, ...page.slice(PAGE_OVERLAP).filter(t => !known.has(id(t)))]
+      complete.value = page.length < limit.value - from
+      loadedFor = key
+      return
+    }
+  }
   const list = await fetchThreads(limit.value)
   if (request !== loadRequest) return
   // The same view read again (a page added, a full refresh; its length aside): its unchanged rows
   // kept, so they are not all rebuilt and rendered again.
-  const shown = (k: string) => k.slice(0, k.lastIndexOf('|'))
   if (shown(loadedFor) === shown(key)) assignKept(list, threads.value, t => `${t.account_id}-${t.thread_id}`)
   else threads.value = list
   complete.value = list.length < limit.value
@@ -266,17 +288,24 @@ watch([view, filter, () => smart.category.value], () => {
 watch([view, filter, limit, () => smart.category.value, smartView], load, { immediate: true })
 /** A sync ticks a few times a second, and each tick would aggregate the whole folder (tab
  *  counts) and reread the list: at most one round a second, one at a time. */
-const tickReloader = useReloader(() => Promise.all([loadCategoryUnread(), refresh(), refreshSearch()]), 1000)
+const tickReloader = useReloader(() => Promise.all([loadCategoryUnread(), refresh()]), 1000)
+/** An open search scans the accounts again (an operator alone, `from:`, uses no index): during a
+ *  sync, every ten seconds at most. The user's own actions refresh it at once. */
+const searchReloader = useReloader(refreshSearch, 10_000)
 // Under another screen (stats, settings…) the list is read once, when it shows again.
 let staleWhileCovered = false
 watch(tick, () => {
   if (covered.value) staleWhileCovered = true
-  else tickReloader.schedule()
+  else {
+    tickReloader.schedule()
+    searchReloader.schedule()
+  }
 })
 watch(covered, (now) => {
   if (!now && staleWhileCovered) {
     staleWhileCovered = false
     tickReloader.schedule()
+    searchReloader.schedule()
   }
 })
 // Saved search opened from the sidebar (`?q=`). Declared after the view reset so it runs last

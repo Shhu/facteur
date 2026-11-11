@@ -73,9 +73,9 @@ function reason(o: OpView, accountError: string | null): string {
     case 'blocked':
       return t('app.ops.reason.blocked', { n: o.blocked_by ?? '?' })
     case 'retrying':
-      return t('app.ops.reason.retrying', { n: o.attempts, error: o.error ?? accountError ?? '?' })
+      return t('app.ops.reason.retrying', { n: o.attempts, error: o.error ?? accountError ?? '?' }, o.attempts)
     case 'failed':
-      return t('app.ops.reason.failed', { n: o.attempts, error: o.error ?? '?' })
+      return t('app.ops.reason.failed', { error: o.error ?? '?' })
     default:
       return accountError ? t('app.ops.reason.waitingError', { error: accountError }) : t('app.ops.reason.waiting')
   }

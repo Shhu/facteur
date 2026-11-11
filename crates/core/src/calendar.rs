@@ -1,7 +1,7 @@
 //! iCalendar (RFC 5545) invitations received by mail (iMIP, RFC 6047), replies to them, and the
 //! expansion of calendar events.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{NaiveDate, NaiveDateTime, TimeZone};
 use serde::Serialize;
@@ -955,11 +955,19 @@ fn expand(ics: &str, from: i64, to: i64, me: &[String], only: Option<&str>, mut 
     let mut overridden: HashSet<(String, i64)> = HashSet::new();
     let mut budget = MAX_PERIODS;
     let mut masters: HashSet<(String, Option<i64>)> = HashSet::new();
+    // A floating RECURRENCE-ID is read in the zone of its series' start, as the editors do: not in
+    // that of the override's own start (written in UTC once moved).
+    let series_starts: HashMap<String, Stamp> = blocks
+        .iter()
+        .filter(|b| !b.iter().any(|l| l.name == "RECURRENCE-ID"))
+        .filter_map(|b| Some((uid_of(b)?, b.iter().find(|l| l.name == "DTSTART").and_then(|l| stamp_of(l, &zones))?)))
+        .collect();
     // Overrides first: the series skips the occurrences they replace.
     for block in &blocks {
         let (Some(uid), Some(rid)) = (uid_of(block), block.iter().find(|l| l.name == "RECURRENCE-ID")) else { continue };
         let Some(shape) = Shape::read_for(block, &zones, me) else { continue };
-        let Some(original) = stamp_of(rid, &zones).map(|s| s.in_zone_of(shape.start)).and_then(Stamp::timestamp) else { continue };
+        let base = series_starts.get(&uid).copied().unwrap_or(shape.start);
+        let Some(original) = stamp_of(rid, &zones).map(|s| s.in_zone_of(base)).and_then(Stamp::timestamp) else { continue };
         overridden.insert((uid.clone(), original));
         // Only those that may fall in the window count towards MAX_INSTANCES: years of past
         // overrides must not use it up before the series' current occurrences.
@@ -1443,10 +1451,13 @@ impl EventChanges {
         let rezoned = zone.is_some() && zone != old.zone;
         let reminders = draft.reminders.as_deref().map(reminder_list).filter(|r| *r != reminder_list(&old.reminders));
         let times = (times != (old.start, old.end, old.all_day) || rezoned).then_some(times);
+        // A draft is capped (see the engine's checked_draft): a longer text sent back unedited is
+        // not a change, or its end would be cut off on the server.
+        let capped = |v: Option<&str>, n: usize| clean(v.map(|s| s.trim().chars().take(n).collect::<String>()).as_deref());
         EventChanges {
-            summary: (summary != old.summary.trim()).then(|| summary.to_string()),
-            location: (location != clean(old.location.as_deref())).then_some(location),
-            description: (description != clean(old.description.as_deref())).then_some(description),
+            summary: (summary != old.summary.trim() && Some(summary) != capped(Some(&old.summary), 1000).as_deref()).then(|| summary.to_string()),
+            location: (location != clean(old.location.as_deref()) && location != capped(old.location.as_deref(), 1000)).then_some(location),
+            description: (description != clean(old.description.as_deref()) && description != capped(old.description.as_deref(), 20_000)).then_some(description),
             times,
             // Kept even with the times unchanged: a series rebuilt for its repetition stays in it.
             zone,
@@ -1614,15 +1625,35 @@ fn vtimezone(name: &str, tz: chrono_tz::Tz) -> Vec<String> {
         if now == before {
             continue;
         }
-        let Some(wall) = chrono::DateTime::from_timestamp(t + i64::from(before), 0).map(|d| d.naive_utc()) else { break };
+        // The exact minute within that hour: some zones change at half past (Lord Howe).
+        let mut at = t - 3600;
+        while at < t && offset(at + 60) == before {
+            at += 60;
+        }
+        let at = at + 60;
+        let Some(wall) = chrono::DateTime::from_timestamp(at + i64::from(before), 0).map(|d| d.naive_utc()) else { break };
         let day = wall.date();
         let last = day.checked_add_signed(chrono::Duration::days(7)).is_none_or(|d| d.month() != day.month());
         let week = if last { -1 } else { (day.day() as i32 - 1) / 7 + 1 };
         let code = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"][day.weekday().num_days_from_monday() as usize];
         let kind = if now > before { "DAYLIGHT" } else { "STANDARD" };
+        // A change some days before the month's last Sunday (Israel's Friday, Nuuk's Saturday)
+        // follows that Sunday, not a week of its own weekday: the days it can fall on are named.
+        let to_sunday = (7 - day.weekday().num_days_from_monday() as i64 - 1).rem_euclid(7);
+        let sunday = day.checked_add_signed(chrono::Duration::days(to_sunday));
+        let before_last_sunday = to_sunday > 0
+            && sunday.is_some_and(|s| s.month() == day.month() && s.checked_add_signed(chrono::Duration::days(7)).is_none_or(|n| n.month() != s.month()));
+        let next_month = if day.month() == 12 { chrono::NaiveDate::from_ymd_opt(day.year() + 1, 1, 1) } else { chrono::NaiveDate::from_ymd_opt(day.year(), day.month() + 1, 1) };
+        let month_days = next_month.and_then(|d| d.pred_opt()).map_or(31, |d| i64::from(d.day()));
+        let rule = if before_last_sunday {
+            let days: Vec<String> = (month_days - 6 - to_sunday..=month_days - to_sunday).map(|d| d.to_string()).collect();
+            format!("RRULE:FREQ=YEARLY;BYMONTH={};BYDAY={code};BYMONTHDAY={}", day.month(), days.join(","))
+        } else {
+            format!("RRULE:FREQ=YEARLY;BYMONTH={};BYDAY={week}{code}", day.month())
+        };
         out.push(format!("BEGIN:{kind}"));
         out.push(format!("DTSTART:{}", wall.format("%Y%m%dT%H%M%S")));
-        out.push(format!("RRULE:FREQ=YEARLY;BYMONTH={};BYDAY={week}{code}", day.month()));
+        out.push(rule);
         out.push(format!("TZOFFSETFROM:{}", hhmm(before)));
         out.push(format!("TZOFFSETTO:{}", hhmm(now)));
         out.push(format!("END:{kind}"));
@@ -1742,7 +1773,7 @@ fn head(l: &Line) -> &str {
 
 /// The parameters of a property, as written (`;TZID=Europe/Paris`).
 fn params_of(l: &Line) -> &str {
-    &head(l)[l.name.len()..]
+    head(l).find(';').map_or("", |at| &head(l)[at..])
 }
 
 fn quote_param(v: &str) -> String {
@@ -3283,6 +3314,22 @@ BEGIN:VEVENT\r\nUID:x\r\nDTSTART:20261001T080000Z\r\nRRULE:FREQ=MONTHLY;BYSETPOS
         }
         assert_eq!(named_zone("pacific standard time"), Some(chrono_tz::America::Los_Angeles));
         assert_eq!(named_zone("Tasmania Standard Time"), Some(chrono_tz::Australia::Hobart));
+    }
+
+    #[test]
+    fn a_change_before_the_last_sunday_follows_that_sunday() {
+        let lines = vtimezone("Asia/Jerusalem", chrono_tz::Asia::Jerusalem);
+        assert!(lines.iter().any(|l| l.contains("BYMONTH=3;BYDAY=FR;BYMONTHDAY=23,24,25,26,27,28,29")), "{lines:?}");
+        // A plain last Sunday stays as it was.
+        assert!(vtimezone("Europe/Paris", chrono_tz::Europe::Paris).iter().any(|l| l.ends_with("BYMONTH=3;BYDAY=-1SU")));
+    }
+
+    #[test]
+    fn a_zone_changing_at_half_past_is_written_to_the_minute() {
+        let lines = vtimezone("Australia/Lord_Howe", chrono_tz::Australia::Lord_Howe);
+        let starts: Vec<&String> = lines.iter().filter(|l| l.starts_with("DTSTART:")).collect();
+        assert_eq!(starts.len(), 2, "{lines:?}");
+        assert!(starts.iter().all(|l| l.ends_with("T020000")), "{starts:?}");
     }
 
     #[test]

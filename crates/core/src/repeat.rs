@@ -94,9 +94,9 @@ impl Repeat {
         parts.join(";")
     }
 
-    /// The rule in the form's terms, for a series starting on `start`; `None` when it says more
-    /// than they can (it then stays as it is).
-    pub fn from_rrule(value: &str, start: NaiveDate) -> Option<Repeat> {
+    /// The rule in the form's terms, for a series starting on `start` (set in `zone`, an IANA name;
+    /// `None`: the computer's); `None` when it says more than they can (it then stays as it is).
+    pub fn from_rrule(value: &str, start: NaiveDate, zone: Option<&str>) -> Option<Repeat> {
         let mut freq = None;
         let mut out = Repeat { freq: Freq::Daily, interval: 1, weekdays: Vec::new(), by_weekday: false, until: None, count: None };
         let (mut by_day, mut by_month_day, mut by_month) = (None, None, None);
@@ -117,9 +117,12 @@ impl Repeat {
                 "COUNT" => out.count = Some(v.parse().ok()?),
                 "UNTIL" => {
                     let date = NaiveDate::parse_from_str(v.get(..8)?, "%Y%m%d").ok()?;
-                    // A UTC time: its day where the computer is.
+                    // A UTC time: its day in the series' zone, which it was written from.
                     let date = match NaiveDateTime::parse_from_str(v.trim_end_matches('Z'), "%Y%m%dT%H%M%S") {
-                        Ok(t) if v.ends_with('Z') => t.and_utc().with_timezone(&chrono::Local).date_naive(),
+                        Ok(t) if v.ends_with('Z') => match zone.and_then(|z| z.parse::<chrono_tz::Tz>().ok()) {
+                            Some(tz) => t.and_utc().with_timezone(&tz).date_naive(),
+                            None => t.and_utc().with_timezone(&chrono::Local).date_naive(),
+                        },
                         _ => date,
                     };
                     out.until = Some(date.format("%Y-%m-%d").to_string());
@@ -256,21 +259,24 @@ mod tests {
         let start = day(2026, 10, 20);
         let weekly = Repeat { freq: Freq::Weekly, interval: 2, weekdays: vec![1, 3], by_weekday: false, until: None, count: Some(10) };
         assert_eq!(weekly.rrule(start, None), "FREQ=WEEKLY;INTERVAL=2;BYDAY=TU,TH;COUNT=10");
-        assert_eq!(Repeat::from_rrule("RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=TU,TH;COUNT=10", start), Some(weekly));
+        assert_eq!(Repeat::from_rrule("RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=TU,TH;COUNT=10", start, None), Some(weekly));
 
         let monthly = Repeat { freq: Freq::Monthly, interval: 1, weekdays: vec![], by_weekday: true, until: Some("2027-06-30".into()), count: None };
         assert_eq!(monthly.rrule(start, None), "FREQ=MONTHLY;BYDAY=3TU;UNTIL=20270630");
-        assert_eq!(Repeat::from_rrule("FREQ=MONTHLY;BYDAY=3TU;UNTIL=20270630", start), Some(monthly));
+        assert_eq!(Repeat::from_rrule("FREQ=MONTHLY;BYDAY=3TU;UNTIL=20270630", start, None), Some(monthly));
         // The last Friday of October 2026 (the 30th, a 5th Friday) is said as the last one.
         let last = Repeat { freq: Freq::Monthly, interval: 1, weekdays: vec![], by_weekday: true, until: None, count: None };
         assert_eq!(last.rrule(day(2026, 10, 30), None), "FREQ=MONTHLY;BYDAY=-1FR");
 
-        assert_eq!(Repeat::from_rrule("FREQ=YEARLY", start).map(|r| r.freq), Some(Freq::Yearly));
-        assert_eq!(Repeat::from_rrule("FREQ=DAILY;INTERVAL=3", start).map(|r| r.interval), Some(3));
+        assert_eq!(Repeat::from_rrule("FREQ=YEARLY", start, None).map(|r| r.freq), Some(Freq::Yearly));
+        // The end of 31 December in New York, read there whatever the computer's zone.
+        let until = Repeat::from_rrule("FREQ=DAILY;UNTIL=20270101T045959Z", start, Some("America/New_York")).and_then(|r| r.until);
+        assert_eq!(until.as_deref(), Some("2026-12-31"));
+        assert_eq!(Repeat::from_rrule("FREQ=DAILY;INTERVAL=3", start, None).map(|r| r.interval), Some(3));
         // More than the form can say: left as it is.
-        assert_eq!(Repeat::from_rrule("FREQ=MONTHLY;BYDAY=TU;BYSETPOS=2", start), None);
-        assert_eq!(Repeat::from_rrule("FREQ=MONTHLY;BYMONTHDAY=1,15", start), None);
-        assert_eq!(Repeat::from_rrule("FREQ=MONTHLY;BYDAY=2TU", start), None, "not the start's week");
+        assert_eq!(Repeat::from_rrule("FREQ=MONTHLY;BYDAY=TU;BYSETPOS=2", start, None), None);
+        assert_eq!(Repeat::from_rrule("FREQ=MONTHLY;BYMONTHDAY=1,15", start, None), None);
+        assert_eq!(Repeat::from_rrule("FREQ=MONTHLY;BYDAY=2TU", start, None), None, "not the start's week");
     }
 
     #[test]

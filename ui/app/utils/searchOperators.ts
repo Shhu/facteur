@@ -128,15 +128,44 @@ export function appendOperator(query: string, operator: string): string {
   return `${base ? `${base} ` : ''}${operator}${operator.endsWith(':') ? '' : ' '}`
 }
 
-/** `text` as HTML, every occurrence of `terms` wrapped in `<mark>` (case-insensitive). The text
- *  is escaped piece by piece: nothing from the message is ever injected as markup. */
+/** `text` as HTML, every occurrence of `terms` wrapped in `<mark>`, case and accents aside as the
+ *  search itself ("reunion" marks "Réunion"). The text is escaped piece by piece: nothing from the
+ *  message is ever injected as markup. */
 export function highlightHtml(text: string, terms: string[], markClass = ''): string {
-  const words = [...new Set(terms.map(t => t.trim()).filter(t => t.length > 0))]
+  // Folded as the engine does: combining marks only (a "ー" or "·" is a letter here).
+  const strip = (t: string) => t.toLowerCase().normalize('NFD').replace(/\p{M}/gu, '')
+  const words = [...new Set(terms.map(t => strip(t.trim())).filter(t => t.length > 0))]
   if (!words.length) return escapeHtml(text)
   words.sort((a, b) => b.length - a.length)
-  const pattern = new RegExp(`(${words.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'giu')
+  // Matched on a decomposed copy, each letter with any accents after it; cut and shown from the
+  // text itself, a match only where it starts and ends on whole characters of it.
+  let flat = ''
+  const from: number[] = []
+  const to: number[] = []
+  for (let i = 0; i < text.length;) {
+    const c = String.fromCodePoint(text.codePointAt(i)!)
+    const d = c.normalize('NFD')
+    for (let k = 0; k < d.length; k++) {
+      from.push(k === 0 ? i : -1)
+      to.push(k === d.length - 1 ? i + c.length : -1)
+    }
+    flat += d
+    i += c.length
+  }
+  const letters = (w: string) => [...w].map(c => `${c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\p{M}*`).join('')
+  const pattern = new RegExp(words.map(letters).join('|'), 'giu')
   const open = markClass ? `<mark class="${escapeHtml(markClass)}">` : '<mark>'
-  return text.split(pattern).map((part, i) => (i % 2 ? `${open}${escapeHtml(part)}</mark>` : escapeHtml(part))).join('')
+  let out = ''
+  let shown = 0
+  for (const m of flat.matchAll(pattern)) {
+    if (!m[0]) continue
+    const a = from[m.index] ?? -1
+    const b = to[m.index + m[0].length - 1] ?? -1
+    if (a < shown || b < 0) continue
+    out += `${escapeHtml(text.slice(shown, a))}${open}${escapeHtml(text.slice(a, b))}</mark>`
+    shown = b
+  }
+  return out + escapeHtml(text.slice(shown))
 }
 
 const CATALOG: { tokens: [fr: string, en: string], key: string }[] = [

@@ -350,6 +350,15 @@ defineShortcuts({
   // stays the field's own undo (defineShortcuts skips them).
   meta_z: () => !shortcutsOff() && undoLast()
 })
+// Ctrl+1 to 4 (Cmd on a Mac) by the key, not the character: on AZERTY it types "&", "é"…
+const { calendarsAvailable } = useCalendar()
+const goTo = (to: string) => ({ usingInput: true, handler: () => !shortcutsOff() && navigateTo(to) })
+defineShortcuts(computed(() => ({
+  meta_1: goTo('/'),
+  meta_2: goTo('/mail/unified'),
+  ...(calendarsAvailable.value ? { meta_3: goTo('/calendar') } : {}),
+  meta_4: goTo('/settings')
+})), { layoutIndependent: true })
 </script>
 
 <template>

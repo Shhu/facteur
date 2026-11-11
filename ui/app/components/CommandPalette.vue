@@ -80,22 +80,27 @@ function complete(insert: string) {
 const found = ref<MessageSummary[]>([])
 const searching = ref(false)
 let timer: ReturnType<typeof setTimeout> | undefined
+/** Only the latest search speaks: an older one ending late changes nothing. */
+let searchSeq = 0
 watch(term, (q) => {
   clearTimeout(timer)
+  // Any new term: an older search still running speaks no more.
+  const mine = ++searchSeq
   // `from:` without its value: searching it would only be a slow lookup of a word nobody means.
   if (q.trim().length < 2 || incompleteOperator(q)) {
     found.value = []
+    searching.value = false
     return
   }
   timer = setTimeout(async () => {
     searching.value = true
     try {
       const lists = await Promise.all(accounts.value.map(a => api.search(a.id, q)))
-      if (term.value === q) found.value = lists.flat().sort((a, b) => b.date - a.date).slice(0, 8)
+      if (mine === searchSeq) found.value = lists.flat().sort((a, b) => b.date - a.date).slice(0, 8)
     } catch {
-      found.value = []
+      if (mine === searchSeq) found.value = []
     } finally {
-      searching.value = false
+      if (mine === searchSeq) searching.value = false
     }
   }, 200)
 })
@@ -117,17 +122,17 @@ const actionItems = computed<PaletteEntry[]>(() => [
 
 const screenerWaiting = computed(() => mailboxes.value.filter(m => m.role === 'screener').reduce((n, m) => n + m.total, 0))
 const pageItems = computed<PaletteEntry[]>(() => [
-  { label: t('app.palette.home'), icon: 'i-lucide-house', onSelect: () => go('/') },
-  { label: t('app.palette.unified'), icon: 'i-lucide-inbox', tone: 'primary', badge: unifiedUnread.value || undefined, onSelect: () => go('/mail/unified') },
+  { label: t('app.palette.home'), icon: 'i-lucide-house', kbds: ['meta', '1'], onSelect: () => go('/') },
+  { label: t('app.palette.unified'), icon: 'i-lucide-inbox', tone: 'primary', kbds: ['meta', '2'], badge: unifiedUnread.value || undefined, onSelect: () => go('/mail/unified') },
   { label: t('app.palette.done'), icon: 'i-lucide-check-check', tone: 'emerald', onSelect: () => go('/mail/done') },
   // Only once an account filters its new senders; the count is of the messages waiting.
   ...(accounts.value.some(a => a.screener_since !== null)
     ? [{ label: t('app.palette.screener'), icon: roleIcons.screener, tone: 'blue' as const, badge: screenerWaiting.value || undefined, onSelect: () => go('/screener') }]
     : []),
-  ...(calendarsAvailable.value ? [{ label: t('app.palette.calendar'), icon: 'i-lucide-calendar', tone: 'orange' as const, onSelect: () => go('/calendar') }] : []),
+  ...(calendarsAvailable.value ? [{ label: t('app.palette.calendar'), icon: 'i-lucide-calendar', tone: 'orange' as const, kbds: ['meta', '3'], onSelect: () => go('/calendar') }] : []),
   { label: t('app.palette.outbox'), icon: 'i-lucide-send-horizontal', tone: 'sky', onSelect: () => go('/outbox') },
   { label: t('app.palette.rules'), icon: 'i-lucide-workflow', tone: 'indigo', onSelect: () => go('/rules') },
-  { label: t('app.palette.settings'), icon: 'i-lucide-settings', onSelect: () => go('/settings') }
+  { label: t('app.palette.settings'), icon: 'i-lucide-settings', kbds: ['meta', '4'], onSelect: () => go('/settings') }
 ])
 
 // The account's name goes in `suffix` so that typing it finds the entry; it is drawn as a pill.

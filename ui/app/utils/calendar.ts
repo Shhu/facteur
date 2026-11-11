@@ -66,8 +66,14 @@ export function onDay(e: CalendarEvent, day: Date): boolean {
 /** Stable across syncs, unlike the row id. */
 export const eventKey = (e: CalendarEvent) => `${e.calendar_id}\u0000${e.uid}\u0000${e.instance}`
 
-/** Shown in the all-day band: all-day events, and timed ones lasting a full day or more. */
-export const inBand = (e: CalendarEvent) => e.all_day || e.end - e.start >= DAY
+/** Shown in the all-day band: all-day events, and timed ones lasting a day or more, or covering a
+ *  whole local day (23 hours when the clocks go forward). */
+export function inBand(e: CalendarEvent): boolean {
+  if (e.all_day || e.end - e.start >= DAY) return true
+  const start = new Date(e.start * 1000)
+  const first = start.getTime() === dayStart(start).getTime() ? start : addDays(dayStart(start), 1)
+  return unix(addDays(first, 1)) <= e.end
+}
 
 export interface TimedBlock {
   event: CalendarEvent
