@@ -217,6 +217,10 @@ fn joined_text<'a>(raw: &[u8], parts: impl Iterator<Item = &'a mail_parser::Mess
         .filter_map(|p| match &p.body {
             PartType::Text(t) => {
                 let t = redecoded(raw, p, t, false);
+                // Some senders put their HTML in the text part as well.
+                if looks_like_html(&t) {
+                    return Some(html_to_text(&t));
+                }
                 let ct = p.content_type();
                 let param = |name: &str, value: &str| ct.and_then(|c| c.attribute(name)).is_some_and(|v| v.trim().eq_ignore_ascii_case(value));
                 Some(if param("format", "flowed") { unflow(&t, param("delsp", "yes")) } else { t.into_owned() })
@@ -240,6 +244,16 @@ fn joined_text<'a>(raw: &[u8], parts: impl Iterator<Item = &'a mail_parser::Mess
         text.truncate(cut);
     }
     Some(text)
+}
+
+/// Text that is HTML markup: it opens with a document, comment or layout tag.
+fn looks_like_html(text: &str) -> bool {
+    let t = text.trim_start();
+    if !t.starts_with('<') {
+        return false;
+    }
+    let head: String = t.chars().take(16).collect::<String>().to_ascii_lowercase();
+    ["<!doctype", "<html", "<!--", "<head", "<body", "<meta", "<style", "<table", "<div", "<center"].iter().any(|p| head.starts_with(p))
 }
 
 /// RFC 3676 `format=flowed` text as plain lines: a soft line break (a line ending with a space)
@@ -1965,6 +1979,14 @@ mod tests {
         // Cut at 200 KB inside a character: still read.
         let long = format!(r#"<body bgcolor="black" >{}</body>"#, "é".repeat(150_000));
         assert!(body_colors(&long[..]).is_some());
+    }
+
+    #[test]
+    fn html_written_in_the_text_part_is_read_as_html() {
+        let raw = b"Content-Type: text/plain; charset=utf-8\r\n\r\n<!--[if gte mso 9]><style>.a div { display: block; }</style><![endif]--><table><tr><td>Bonjour Yann</td></tr></table>\r\n";
+        assert_eq!(body_info(raw).preview, "Bonjour Yann");
+        let raw = b"Content-Type: text/plain; charset=utf-8\r\n\r\n<3 merci pour tout\r\n";
+        assert_eq!(body_info(raw).preview, "<3 merci pour tout");
     }
 
     #[test]

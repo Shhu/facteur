@@ -1,3 +1,8 @@
+<script lang="ts">
+/** The chip being dragged, shared by the fields: dropped on another one, it leaves its own. */
+const carried = shallowRef<{ raw: string, field: string, take: () => void } | null>(null)
+</script>
+
 <script setup lang="ts">
 import type { Address } from '~/utils/types'
 
@@ -8,6 +13,7 @@ const props = withDefaults(defineProps<{
   autofocus?: boolean
   touch?: boolean
 }>(), { placeholder: undefined, autofocus: false, touch: false })
+const emit = defineEmits<{ carry: [] }>()
 const { t } = useI18n()
 
 const id = useId()
@@ -94,6 +100,42 @@ function add(text: string) {
 function remove(i: number) {
   model.value = model.value.filter((_, j) => j !== i)
   picked.value = null
+}
+
+/** Dragged from one field to another (To, Cc, Bcc): moved, never doubled. */
+const over = ref(false)
+function carry(e: DragEvent, raw: string) {
+  if (!e.dataTransfer) return
+  e.dataTransfer.setData('application/x-facteur-recipient', raw)
+  e.dataTransfer.effectAllowed = 'move'
+  carried.value = { raw, field: id, take: () => {
+    model.value = model.value.filter(r => r !== raw)
+    picked.value = null
+  } }
+  emit('carry')
+}
+function endCarry() {
+  carried.value = null
+  over.value = false
+}
+function dropping(e: DragEvent) {
+  const c = carried.value
+  if (!c || c.field === id || !e.dataTransfer) return
+  e.preventDefault()
+  e.dataTransfer.dropEffect = 'move'
+  over.value = true
+}
+function leave(e: DragEvent) {
+  if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node | null)) over.value = false
+}
+function drop(e: DragEvent) {
+  over.value = false
+  const c = carried.value
+  if (!c || c.field === id) return
+  e.preventDefault()
+  carried.value = null
+  if (!model.value.some(r => recipientKey(r) === recipientKey(c.raw))) model.value = [...model.value, c.raw]
+  c.take()
 }
 
 /** Typed text that is a whole address: Enter adds it as typed rather than the first suggestion
@@ -233,7 +275,10 @@ onBeforeUnmount(() => clearTimeout(timer))
     <!-- Label and trailing button stay on the first line when the chips wrap. -->
     <div
       class="flex items-start border-b transition-colors"
-      :class="[focused ? 'border-primary' : 'border-default', touch ? 'gap-2.5' : 'gap-3']"
+      :class="[focused || over ? 'border-primary' : 'border-default', over ? 'bg-primary/5' : '', touch ? 'gap-2.5' : 'gap-3']"
+      @dragover="dropping"
+      @dragleave="leave"
+      @drop="drop"
     >
       <label :for="id" class="flex h-13 shrink-0 items-center text-[13px] text-muted" :class="touch ? 'w-10' : 'w-11'">{{ label }}</label>
       <div class="flex min-h-13 min-w-0 flex-1 cursor-text flex-wrap items-center gap-1.5 py-2.75" @click.self="focus">
@@ -243,10 +288,14 @@ onBeforeUnmount(() => clearTimeout(timer))
           class="inline-flex h-7.5 max-w-full min-w-0 items-center gap-1.5 rounded-full border ps-0.75 text-[13px]"
           :class="[
             c.valid ? 'border-default bg-elevated text-highlighted' : 'border-error/40 bg-error/10 text-error',
-            touch && picked !== c.raw ? 'pe-2.5' : 'pe-1'
+            touch && picked !== c.raw ? 'pe-2.5' : 'pe-1',
+            touch ? '' : 'cursor-grab'
           ]"
           :title="c.valid ? c.raw : $t('app.composer.invalidAddress', { address: c.raw })"
+          :draggable="!touch"
           @click="touch && (picked = picked === c.raw ? null : c.raw)"
+          @dragstart="carry($event, c.raw)"
+          @dragend="endCarry"
         >
           <MailAvatar :address="c.address" class="size-6! text-[9px]!" />
           <span class="truncate">{{ c.label }}</span>

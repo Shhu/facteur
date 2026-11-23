@@ -848,6 +848,7 @@ defineShortcuts({
               v-model="draft.to"
               :label="$t('app.composer.to')"
               :placeholder="$t('app.composer.toPlaceholder')"
+              @carry="showCopies = true"
             >
               <template v-if="!showCopies" #trailing>
                 <button type="button" class="h-7.5 shrink-0 rounded-lg px-2.5 text-[13px] font-semibold text-primary hover:bg-primary/10" @click="showCopyRows">

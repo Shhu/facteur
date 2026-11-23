@@ -4085,6 +4085,14 @@ impl Store {
 
     /// Messages whose body is cached but not analysed yet (links); the bodies are then read one by
     /// one, not all in memory at once.
+    /// Messages with a cached body whose preview starts with markup.
+    pub fn markup_previews(&self) -> Result<Vec<i64>> {
+        let db = self.read();
+        let mut st = db.prepare("SELECT m.id FROM messages m JOIN bodies b ON b.message_id = m.id WHERE m.preview LIKE '<%'")?;
+        let rows = st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
     pub fn ids_without_links(&self, limit: usize) -> Result<Vec<i64>> {
         let db = self.read();
         let mut st = db.prepare(

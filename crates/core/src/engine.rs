@@ -4128,6 +4128,31 @@ impl Engine {
         Ok(completed)
     }
 
+    /// Previews and search text taken from HTML written in a text part, before it was read as
+    /// HTML: made again from the cached body, once.
+    fn reread_markup_previews(self: &Arc<Self>) {
+        const DONE: &str = "markup_previews_reread";
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            if this.store.setting(DONE).ok().flatten().is_some() {
+                return;
+            }
+            let ids = match this.store.markup_previews() {
+                Ok(ids) => ids,
+                Err(e) => return tracing::warn!("previews read again: {e}"),
+            };
+            for id in ids {
+                let Some(raw) = this.store.body(id).ok().flatten() else { continue };
+                if let Err(e) = this.store.store_body(id, &raw, &mime::body_info(&raw)) {
+                    return tracing::warn!("preview of message {id} read again: {e}");
+                }
+            }
+            if let Err(e) = this.store.set_setting(DONE, "1") {
+                tracing::warn!("previews read again: {e}");
+            }
+        });
+    }
+
     /// Analyses the bodies cached before link extraction existed.
     fn backfill_links(self: &Arc<Self>) {
         // Once done, never again: every body stored since writes its links, and the empty query scans
@@ -7338,6 +7363,7 @@ impl Engine {
 
     pub fn start_background(self: &Arc<Self>, interval: Duration) {
         self.backfill_links();
+        self.reread_markup_previews();
         self.start_scheduler();
         let pool = self.clone();
         self.spawn(async move {
