@@ -170,7 +170,8 @@ cp "$out/$versioned" "$out/facteur.exe"
 
 # ── Android (optional) ──────────────────────────────────────────────────
 if [[ $android == 1 ]]; then
-  FACTEUR_ANDROID_SIGNING="$signing" npx -y pnpm@11.1.1 tauri android build --apk --target aarch64
+  # No local AI on Android: llama.cpp needs CMake, and a phone would not run the models.
+  FACTEUR_ANDROID_SIGNING="$signing" npx -y pnpm@11.1.1 tauri android build --apk --target aarch64 -- --no-default-features
   cp src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk "$out/facteur-$version.apk"
 fi
 
