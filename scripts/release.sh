@@ -3,7 +3,8 @@
 #
 #   scripts/release.sh 0.2.0                     → Windows exe, signed for updates, and the
 #                                                  Linux Flatpak bundle
-#   scripts/release.sh 0.2.0 --android           → plus the Android APK, signed with
+#   scripts/release.sh 0.2.0 --android           → plus the Android APK and the Play bundle
+#                                                  (target/play), signed with
 #                                                  ~/.tauri/facteur-android.properties
 #   scripts/release.sh 0.2.0 --notes notes.md    → release notes (else a one-line default)
 #
@@ -171,8 +172,11 @@ cp "$out/$versioned" "$out/facteur.exe"
 # ── Android (optional) ──────────────────────────────────────────────────
 if [[ $android == 1 ]]; then
   # No local AI on Android: llama.cpp needs CMake, and a phone would not run the models.
-  FACTEUR_ANDROID_SIGNING="$signing" npx -y pnpm@11.1.1 tauri android build --apk --target aarch64 -- --no-default-features
+  FACTEUR_ANDROID_SIGNING="$signing" npx -y pnpm@11.1.1 tauri android build --apk --aab --target aarch64 -- --no-default-features
   cp src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk "$out/facteur-$version.apk"
+  # The bundle is for the Play Console, uploaded by hand: kept out of $out, which goes to GitHub.
+  mkdir -p target/play
+  cp src-tauri/gen/android/app/build/outputs/bundle/universalRelease/app-universal-release.aab "target/play/facteur-$version.aab"
 fi
 
 # ── Linux Flatpak ───────────────────────────────────────────────────────
