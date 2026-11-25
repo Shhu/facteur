@@ -7,10 +7,25 @@ use std::time::Duration;
 use crate::avatars::{PublicOnly, allowed};
 use crate::error::{Error, Result};
 
+/// Every HTTP client starts here. reqwest is built without a crypto provider: the engine's is
+/// installed. On Android, reqwest's platform verifier would need its Java side set up first, or
+/// it panics on the first https request: the built-in roots instead, as for IMAP and SMTP.
+pub(crate) fn builder() -> reqwest::ClientBuilder {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let builder = reqwest::Client::builder();
+    #[cfg(target_os = "android")]
+    let builder = {
+        use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+        let roots = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+        let mut tls = ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        builder.use_preconfigured_tls(tls)
+    };
+    builder
+}
+
 /// `follow`: follow redirects (still https only, still public addresses only).
 fn client(follow: bool) -> Result<reqwest::Client> {
-    // reqwest is built without a default crypto provider: install the engine's.
-    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let policy = if follow {
         reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= 3 || !allowed(attempt.url()) { attempt.stop() } else { attempt.follow() }
@@ -18,7 +33,7 @@ fn client(follow: bool) -> Result<reqwest::Client> {
     } else {
         reqwest::redirect::Policy::none()
     };
-    reqwest::Client::builder()
+    crate::http::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15))
         .dns_resolver(Arc::new(PublicOnly))

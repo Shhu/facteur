@@ -110,9 +110,7 @@ pub async fn discover(email: &str) -> Result<Discovered> {
 const AUTOCONFIG_MAX: usize = 256 * 1024;
 
 fn http_client() -> Result<reqwest::Client> {
-    // reqwest is built without a default crypto provider: install the engine's.
-    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
-    reqwest::Client::builder()
+    crate::http::builder()
         .connect_timeout(Duration::from_secs(3))
         .timeout(HTTP_TIMEOUT)
         // An https answer redirected to plain http is no https answer: someone on the network

@@ -189,8 +189,7 @@ pub fn is_gguf(path: &Path) -> bool {
 pub async fn download(model: &Model, dest: &Path, cancel: &std::sync::atomic::AtomicBool, mut progress: impl FnMut(u64)) -> Result<()> {
     use sha2::Digest;
     use std::io::Write;
-    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
-    let http = reqwest::Client::builder()
+    let http = crate::http::builder()
         .connect_timeout(std::time::Duration::from_secs(20))
         .read_timeout(std::time::Duration::from_secs(60))
         .user_agent("facteur")

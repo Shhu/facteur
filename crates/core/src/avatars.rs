@@ -125,9 +125,7 @@ pub(crate) fn allowed(url: &reqwest::Url) -> bool {
 }
 
 fn client() -> Option<reqwest::Client> {
-    // reqwest is built without a default crypto provider: install the engine's.
-    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
-    reqwest::Client::builder()
+    crate::http::builder()
         .connect_timeout(Duration::from_secs(4))
         .timeout(Duration::from_secs(8))
         .dns_resolver(Arc::new(PublicOnly))

@@ -52,9 +52,8 @@ pub struct Available {
 }
 
 fn http() -> Result<reqwest::Client> {
-    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     // No client-wide timeout: it would cover the whole body. Each request bounds itself.
-    reqwest::Client::builder()
+    crate::http::builder()
         .connect_timeout(Duration::from_secs(20))
         .build()
         .map_err(|e| Error::Other(e.to_string()))

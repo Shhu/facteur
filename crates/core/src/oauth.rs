@@ -308,9 +308,8 @@ fn unreachable(e: reqwest::Error) -> Error {
 }
 
 async fn token_request(app: &App, body: &[(&str, &str)]) -> Result<Tokens> {
-    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let form: Vec<String> = body.iter().map(|(k, v)| format!("{k}={}", urlencode(v))).collect();
-    let resp = reqwest::Client::builder()
+    let resp = crate::http::builder()
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|e| Error::Other(e.to_string()))?
@@ -362,13 +361,12 @@ fn revoked(status: u16, error: Option<&str>) -> bool {
 /// Returned as a data URL for the local cache: shown offline, without calling the provider on
 /// each display.
 pub async fn fetch_picture(url: &str) -> Result<String> {
-    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     // Google serves the size asked for by the `=sNN-c` suffix: 128 px is enough.
     let url = match url.rsplit_once("=s") {
         Some((base, _)) if url.contains("googleusercontent.com") => format!("{base}=s128-c"),
         _ => url.to_string(),
     };
-    let resp = reqwest::Client::builder()
+    let resp = crate::http::builder()
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| Error::Other(e.to_string()))?
@@ -395,8 +393,7 @@ pub async fn fetch_picture(url: &str) -> Result<String> {
 }
 
 pub async fn google_picture(access_token: &str) -> Result<Option<String>> {
-    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
-    let resp = reqwest::Client::builder()
+    let resp = crate::http::builder()
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| Error::Other(e.to_string()))?

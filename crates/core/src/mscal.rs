@@ -11,8 +11,7 @@ const MAX_PAGES: usize = 40;
 const MAX_PAGE: usize = 16 * 1024 * 1024;
 
 fn client() -> Result<reqwest::Client> {
-    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
-    reqwest::Client::builder()
+    crate::http::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(60))
         .user_agent("facteur")

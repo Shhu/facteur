@@ -367,6 +367,7 @@ defineShortcuts(computed(() => ({
     storage="local"
     storage-key="facteur"
     unit="px"
+    class="pt-[env(safe-area-inset-top)]"
     :class="accounts.length && !messageOpen ? 'max-lg:bottom-[calc(4.5rem+env(safe-area-inset-bottom))]' : ''"
   >
     <UDashboardSidebar
@@ -381,7 +382,7 @@ defineShortcuts(computed(() => ({
       :max-size="420"
       :ui="{
         root: 'bg-(--surface-side)',
-        content: 'bg-(--surface-side)',
+        content: 'bg-(--surface-side) pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]',
         header: 'h-auto px-3.5 pt-4 pb-3',
         body: 'gap-0 px-2.5 py-1',
         footer: 'border-t border-default px-3.5 py-3'

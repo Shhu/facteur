@@ -284,8 +284,7 @@ pub struct Client {
 
 impl Client {
     pub fn new(username: &str, password: &str) -> Result<Self> {
-        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
-        let http = reqwest::Client::builder()
+        let http = crate::http::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
             // Followed by hand: reqwest turns a redirected PROPFIND into a GET.
