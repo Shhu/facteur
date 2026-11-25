@@ -8,7 +8,9 @@ const uiLocale = computed(() => (locale.value === 'en' ? en : fr))
 
 // Small screens: toasts at the top, clear of the bottom tab bar and of the reply bar.
 const wide = useMediaQuery('(min-width: 1024px)')
-const toaster = computed(() => ({ position: wide.value ? 'bottom-right' as const : 'top-center' as const }))
+const toaster = computed(() => wide.value
+  ? { position: 'bottom-right' as const }
+  : { position: 'top-center' as const, ui: { viewport: 'top-[calc(1rem+env(safe-area-inset-top))]' } })
 
 const { enabled: perfEnabled } = usePerf()
 
