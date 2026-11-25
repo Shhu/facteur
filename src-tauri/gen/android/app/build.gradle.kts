@@ -27,6 +27,11 @@ val signingProperties = Properties().apply {
 android {
     compileSdk = 37
     namespace = "dev.facteur.mail"
+    // The NDK the Rust library is built with: without it, nothing is stripped or extracted.
+    System.getenv("NDK_HOME")?.let { home ->
+        ndkPath = home
+        ndkVersion = Properties().apply { file("$home/source.properties").inputStream().use { load(it) } }.getProperty("Pkg.Revision")
+    }
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
         applicationId = "dev.facteur.mail"
@@ -60,12 +65,6 @@ android {
             isDebuggable = true
             isJniDebuggable = true
             isMinifyEnabled = false
-            packaging {
-                jniLibs.keepDebugSymbols.add("*/arm64-v8a/*.so")
-                jniLibs.keepDebugSymbols.add("*/armeabi-v7a/*.so")
-                jniLibs.keepDebugSymbols.add("*/x86/*.so")
-                jniLibs.keepDebugSymbols.add("*/x86_64/*.so")
-            }
         }
         getByName("release") {
             signingConfigs.findByName("release")?.let { signingConfig = it }
@@ -89,6 +88,14 @@ android {
     }
     buildFeatures {
         buildConfig = true
+    }
+}
+
+// Debug builds keep the native debug info. Written inside a build type, `packaging` is the
+// module's and kept it in release builds too: nothing stripped, no symbols for the Play Console.
+androidComponents {
+    onVariants(selector().withBuildType("debug")) { variant ->
+        variant.packaging.jniLibs.keepDebugSymbols.addAll("*/arm64-v8a/*.so", "*/armeabi-v7a/*.so", "*/x86/*.so", "*/x86_64/*.so")
     }
 }
 

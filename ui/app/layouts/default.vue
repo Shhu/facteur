@@ -368,7 +368,7 @@ defineShortcuts(computed(() => ({
     storage-key="facteur"
     unit="px"
     class="pt-[env(safe-area-inset-top)]"
-    :class="accounts.length && !messageOpen ? 'max-lg:bottom-[calc(4.5rem+env(safe-area-inset-bottom))]' : ''"
+    :class="!accounts.length ? 'pb-[env(safe-area-inset-bottom)]' : messageOpen ? '' : 'max-lg:bottom-[calc(4.5rem+env(safe-area-inset-bottom))]'"
   >
     <UDashboardSidebar
       v-if="accounts.length"
